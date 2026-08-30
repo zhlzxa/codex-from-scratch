@@ -1,0 +1,88 @@
+# The second tier, added in chapter 9.
+#
+# Chapter -1 put a guard on the blocking suite -- at most six steps, "the
+# blocking suite is meant to stay fast" -- and it is what stopped the step
+# below from being added to ci.yml. That guard was written to prevent exactly
+# this: a CI file that grows one justified step at a time until nobody waits
+# for it. Raising the number to seven would have been the easy answer and the
+# wrong one, because the honest reason this check exists is not "it must pass
+# before merge".
+#
+# What it does: applies twelve one-line mutations to chapter 9's code and
+# fails if the test suite does not notice. With all 43 of that chapter's tests
+# green, replacing `stderr=PIPE` with `stderr=DEVNULL` in mcp.py turned
+# nothing red -- the test whose name says it covers that case asserted the
+# process exit code, which comes from `returncode` and not from stderr at all.
+# That shape (a test whose name claims more than its assertions) has now
+# appeared in chapters 5, 6 and 9.
+#
+# Why it does not block a merge: it measures the *quality of the tests*, not
+# the correctness of the change. A pull request that leaves the code correct
+# and a mutation uncaught should be reported and looked at, not held. It has
+# no `pull_request:` trigger for that reason, which is asserted in
+# tests/test_packaging.py rather than left as a comment.
+name: postmerge
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - name: Mutation check (chapter 9)
+        run: uv run python probe_mutations_ch09.py
+
+      # Chapter 10 adds its own thirteen. One of them survived the first run:
+      # "the child writes into its parent's session file" left every chapter 10
+      # test green, because the test asserted "one file exists and its parent
+      # field is right" without building a parent writer at all. Reconstructing
+      # the real situation -- the parent holding its own lock -- is what made
+      # the mutation fail.
+      - name: Mutation check (chapter 10)
+        run: uv run python probe_mutations_ch10.py
+
+      # Chapter 11's nineteen. The step is here as of chapter 12, and the
+      # gap is worth recording rather than quietly closing: chapter 11's own
+      # text says "these run in postmerge.yml, like chapter 9's", and the
+      # workflow had steps for 9 and 10 only. Nothing was wrong with the
+      # script and nothing was wrong with the prose -- they were simply never
+      # connected, which is the failure mode a written promise has and an
+      # assertion does not. `test_F_1_05_every_mutation_script_runs_somewhere`
+      # is the assertion.
+      - name: Mutation check (chapter 11)
+        run: uv run python probe_mutations_ch11.py
+
+      # Chapter 12's twenty-three. Three survived the first run, and the most
+      # useful of the three was not a missing test: `wait_for` and the loop
+      # both enforced the attempt count, so deleting either one changed
+      # nothing. The repair was to delete the duplicate.
+      - name: Mutation check (chapter 12)
+        run: uv run python probe_mutations_ch12.py
+
+      # `probe_mutations.py` -- chapter 5's original, generic script, present in
+      # every step directory since and, until this line, wired into none of
+      # them.
+      #
+      # This is the chapter's own lesson landing on the chapter. The section
+      # above added `test_F_1_05_every_mutation_script_runs_somewhere` under the
+      # heading "a promise written in prose is not a mechanism", ran it, and
+      # reported in the tutorial that it named *two* files rather than one. Only
+      # one of the two was then wired in. The finding was written down and not
+      # acted on -- which is the failure the check exists to prevent, committed
+      # in the commit that introduced the check, and it left this step shipping
+      # a red test.
+      #
+      # Chapter 13 hit the same assertion while running a full suite and
+      # repaired step 13 onward; this line is that repair backported to the step
+      # where the check was born, so that this step passes its own tests.
+      - name: Mutation check (chapter 5, generic)
+        run: uv run python probe_mutations.py

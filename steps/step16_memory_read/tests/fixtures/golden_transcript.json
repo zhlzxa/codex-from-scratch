@@ -1,0 +1,113 @@
+{
+  "requests": [
+    [
+      {
+        "role": "user",
+        "content": "change x to 2 in a.py"
+      }
+    ],
+    [
+      {
+        "role": "user",
+        "content": "change x to 2 in a.py"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_a1",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": "{\"path\": \"a.py\"}"
+            }
+          },
+          {
+            "id": "call_a2",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": "{\"path\": \"missing.py\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_a1",
+        "content": "x = 1\n"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_a2",
+        "content": "Error: no such file in the repository You sent: missing.py Use run_shell with ls or find to see what exists, then try again."
+      }
+    ],
+    [
+      {
+        "role": "user",
+        "content": "change x to 2 in a.py"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_a1",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": "{\"path\": \"a.py\"}"
+            }
+          },
+          {
+            "id": "call_a2",
+            "type": "function",
+            "function": {
+              "name": "read_file",
+              "arguments": "{\"path\": \"missing.py\"}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_a1",
+        "content": "x = 1\n"
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_a2",
+        "content": "Error: no such file in the repository You sent: missing.py Use run_shell with ls or find to see what exists, then try again."
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "id": "call_b1",
+            "type": "function",
+            "function": {
+              "name": "apply_patch",
+              "arguments": "{\"edits\": [{\"path\": \"a.py\", \"old_text\": \"x = 1\", \"new_text\": \"x = 2\"}]}"
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_b1",
+        "content": "Applied 1 edit(s) to a.py."
+      },
+      {
+        "role": "system",
+        "content": "You have 2 tool-calling turn(s) left. Do not start new work. Finish or abandon what is in progress, then answer: what you did, what is left, and the one next step."
+      }
+    ]
+  ],
+  "final_text": "Changed x to 2.",
+  "stop_reason": "completed",
+  "turns_used": 3,
+  "file_after": "x = 2\n"
+}

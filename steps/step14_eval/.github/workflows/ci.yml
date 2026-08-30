@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # A hung job blocks every pull request queued behind it.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # --frozen refuses to re-resolve: if uv.lock disagrees with
+        # pyproject.toml the job fails instead of quietly installing something
+        # different from what the author tested.
+        run: uv sync --frozen --all-extras
+
+      - name: Lint
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          # Interlude B. In this step and not a step of its own: chapter -1's
+          # guard caps the blocking workflow at six steps, and a static check
+          # that finishes in three seconds is what a lint step is. Chapter 9
+          # answered the same question the other way (a second workflow),
+          # because a mutation run measures the tests and not the change.
+          #
+          # What it stops: an import cycle, including the one an ordinary
+          # convenience import in __init__.py creates, and including one
+          # deferred into a function body so that startup still works.
+          # `import minicodex` -- the obvious smoke test -- exits 0 on a
+          # package whose modules cannot import each other, which is why this
+          # imports every module in its own interpreter.
+          uv run python scripts/check_layers.py --quiet
+
+      - name: Test
+        run: uv run pytest
+
+      # Added in chapter 6, and only in chapter 6, because this is the first
+      # module whose interesting input is a *shape* rather than a value: a
+      # history can be legal or illegal in ways no example test enumerates.
+      #
+      # It runs separately from the suite above with a much larger case count.
+      # The local default (200) is small enough that nobody skips it; 2000 here
+      # is cheap because CI is not waiting for a human. The bug this exists for
+      # -- compaction that makes a history *bigger* -- first appeared at seed
+      # 235, which the local default does not reach.
+      - name: Property tests
+        env:
+          MINICODEX_PROPERTY_CASES: "2000"
+        run: uv run pytest tests/test_properties.py
+

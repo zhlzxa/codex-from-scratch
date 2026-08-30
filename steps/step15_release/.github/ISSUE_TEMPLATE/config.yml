@@ -1,0 +1,13 @@
+# `blank_issues_enabled: false` is the half of CONTRIBUTING.md that executes.
+# The document says what this project accepts; this is what happens when
+# somebody does not read it.
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/example/minicodex/blob/main/SECURITY.md
+    about: Do not open an issue. Mail security@example.invalid.
+  - name: Pull requests
+    url: https://github.com/example/minicodex/blob/main/CONTRIBUTING.md
+    about: >
+      Not accepted, and the reasoning is worth two minutes. A recording and a
+      measurement are more useful here than a patch.

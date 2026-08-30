@@ -1,0 +1,6 @@
+{
+  "servers": {
+    "files": {"command": ["python", "mcp_servers/files_server.py"]},
+    "notes": {"command": ["python", "mcp_servers/notes_server.py"]}
+  }
+}

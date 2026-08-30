@@ -1,0 +1,19 @@
+# Python build and cache artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Virtual environments -- rebuildable from uv.lock, never committed
+.venv/
+venv/
+
+# Secrets.  A key that reaches git history is in git history: `git rm` does not
+# remove it from past commits, forks, or anyone's existing clone.
+.env
+.env.*
+*.key
+*.pem

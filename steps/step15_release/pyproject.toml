@@ -1,0 +1,120 @@
+# ---------------------------------------------------------------------------
+# [project] -- the metadata a package manager reads.  Standardised by PEP 621,
+# so every tool (pip, uv, poetry, hatch) understands this exact table.
+# ---------------------------------------------------------------------------
+[project]
+name = "minicodex"
+# Read from src/minicodex/__init__.py -- see [tool.hatch.version] below.  It
+# was a literal here *and* there for seventeen chapters, and nothing in 1656
+# tests compared them.
+dynamic = ["version"]
+description = "A Codex-like coding agent, built from scratch, one failure at a time."
+# Not the step README.  That one opens "chapter 17: memory, part two", which is
+# the right first sentence for a reader of this book and the wrong one for a
+# stranger who has just run `pip install minicodex` and wants to know what they
+# have.  The long description is the artefact's front page.
+readme = "PACKAGE.md"
+license = "MIT"
+license-files = ["LICENSE"]
+# A claim, not a note.  It was `>=3.10` for seventeen chapters and CI only ever
+# ran the latest -- so chapter 15 ran the suite on 3.10 for the first time and
+# found a sub-agent timeout that does not fire there (F15-02).  The floor is
+# now in the CI matrix, which is what makes this line true rather than hopeful.
+requires-python = ">=3.10"
+# Where a stranger holding only the wheel goes to report something.  Absent
+# until chapter 15, which meant the artefact contained no way to reach its
+# author -- and "file an issue" is the entire support policy (F15-05).
+urls = { Homepage = "https://github.com/example/minicodex", Issues = "https://github.com/example/minicodex/issues", Changelog = "https://github.com/example/minicodex/blob/main/CHANGELOG.md" }
+dependencies = [
+    # The first runtime dependency of the project.  Chapter -1 had none; talking
+    # to a model over HTTP is what finally justified one.
+    "httpx>=0.27",
+    # The second, and it arrived by deleting code rather than adding it.
+    # Chapter 9 first hand-rolled JSON-RPC 2.0 over a subprocess's stdio -- a
+    # framing loop, a pending-futures table, a request-id counter -- and that
+    # was never what codex does: its workspace pins the official Rust SDK
+    # (`rmcp = "=3.0.0"`, `codex-rs/Cargo.toml:393`).  Same rule as `httpx`
+    # above: hand-roll what you are teaching, depend on what you are not.
+    # This project is teaching tool-name collisions, schema budgets and
+    # trusting somebody else's process -- not message framing.
+    "mcp>=2.1",
+]
+
+# Installed only when asked for: `uv sync --all-extras` or `pip install '.[dev]'`.
+# Users of the package do not get, and do not need, the test runner.
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "pyyaml>=6.0",
+    # Environment marker: tomllib entered the stdlib in 3.11, so only older
+    # interpreters need the backport.  One dependency list, every Python.
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+# Creates an executable called `minicodex` that calls minicodex.__main__.main().
+[project.scripts]
+minicodex = "minicodex.__main__:main"
+
+# ---------------------------------------------------------------------------
+# [build-system] -- who turns this directory into an installable artefact.
+# Omitting it means every tool silently falls back to setuptools, and the
+# fallback is not identical across tools.  Say it out loud.
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# hatchling would infer this from src/minicodex, but an inferred build is one
+# that changes when you rename a directory.  State it.
+packages = ["src/minicodex"]
+
+# One version literal, in the module, read from here.  The other direction --
+# a module that reads `importlib.metadata.version("minicodex")` -- also gives
+# one source, and was rejected: it makes `__version__` unavailable in a tree
+# that has not been installed, which is the tree a contributor has after
+# `git clone` and before anything else.
+[tool.hatch.version]
+path = "src/minicodex/__init__.py"
+
+# ---------------------------------------------------------------------------
+# ruff -- formatter and linter in one binary.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+# Chapter 14's eval workspaces. An A/B run leaves 36 directories of Python
+# **written by the model**, inside the tree, and `ruff format --check .` walks
+# them: 21 of the 23 files it wanted to reformat were the agent's homework.
+# `.gitignore` does not help -- ruff only honours it inside a git repository,
+# and a step directory here is not one. F14-08's shape at a smaller scale: an
+# eval workspace that sits inside the system under test ends up inside the
+# system under test's tooling.
+extend-exclude = [".probe"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle + pyflakes: the classic errors
+    "I",             # import sorting
+    "UP",            # rewrite to modern syntax
+    "B",             # bugbear: real bugs, not style
+    "ASYNC",         # async footguns; nothing async yet, see chapter 0
+    "RUF",
+]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# --strict-markers: a typo like @pytest.mark.slwo becomes an error instead of
+# a decorator that silently does nothing.
+addopts = "-q --strict-markers"
+asyncio_mode = "auto"
+# A forgotten `await` raises nothing and returns nothing: the coroutine is
+# built, dropped, and its body never runs.  The only signal is a RuntimeWarning
+# at garbage-collection time, invisible in a green run.  Promote it.
+filterwarnings = ["error::RuntimeWarning"]

@@ -1,0 +1,187 @@
+# The second tier, added in chapter 9.
+#
+# Chapter -1 put a guard on the blocking suite -- at most six steps, "the
+# blocking suite is meant to stay fast" -- and it is what stopped the step
+# below from being added to ci.yml. That guard was written to prevent exactly
+# this: a CI file that grows one justified step at a time until nobody waits
+# for it. Raising the number to seven would have been the easy answer and the
+# wrong one, because the honest reason this check exists is not "it must pass
+# before merge".
+#
+# What it does: applies twelve one-line mutations to chapter 9's code and
+# fails if the test suite does not notice. With all 43 of that chapter's tests
+# green, replacing `stderr=PIPE` with `stderr=DEVNULL` in mcp.py turned
+# nothing red -- the test whose name says it covers that case asserted the
+# process exit code, which comes from `returncode` and not from stderr at all.
+# That shape (a test whose name claims more than its assertions) has now
+# appeared in chapters 5, 6 and 9.
+#
+# Why it does not block a merge: it measures the *quality of the tests*, not
+# the correctness of the change. A pull request that leaves the code correct
+# and a mutation uncaught should be reported and looked at, not held. It has
+# no `pull_request:` trigger for that reason, which is asserted in
+# tests/test_packaging.py rather than left as a comment.
+name: postmerge
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+      - name: Mutation check (chapter 9)
+        run: uv run python probe_mutations_ch09.py
+
+      # Chapter 10 adds its own thirteen. One of them survived the first run:
+      # "the child writes into its parent's session file" left every chapter 10
+      # test green, because the test asserted "one file exists and its parent
+      # field is right" without building a parent writer at all. Reconstructing
+      # the real situation -- the parent holding its own lock -- is what made
+      # the mutation fail.
+      - name: Mutation check (chapter 10)
+        run: uv run python probe_mutations_ch10.py
+
+      # Chapter 11's nineteen. The step is here as of chapter 12, and the
+      # gap is worth recording rather than quietly closing: chapter 11's own
+      # text says "these run in postmerge.yml, like chapter 9's", and the
+      # workflow had steps for 9 and 10 only. Nothing was wrong with the
+      # script and nothing was wrong with the prose -- they were simply never
+      # connected, which is the failure mode a written promise has and an
+      # assertion does not. `test_F_1_05_every_mutation_script_runs_somewhere`
+      # is the assertion.
+      - name: Mutation check (chapter 11)
+        run: uv run python probe_mutations_ch11.py
+
+      # Chapter 12's twenty-three. Three survived the first run, and the most
+      # useful of the three was not a missing test: `wait_for` and the loop
+      # both enforced the attempt count, so deleting either one changed
+      # nothing. The repair was to delete the duplicate.
+      - name: Mutation check (chapter 12)
+        run: uv run python probe_mutations_ch12.py
+
+      # Found while adding the step below, not while writing chapter 13:
+      # running the *whole* suite (not just this chapter's) turned up
+      # `test_F_1_05_every_mutation_script_runs_somewhere` failing on
+      # `probe_mutations.py` -- chapter 5's original, generic script, present
+      # in every step directory since and never once wired into this file.
+      # The assertion chapter 12 added to catch exactly this had been true
+      # from the day it was written; running the full suite is what a single
+      # chapter's own tests cannot do for themselves.
+      - name: Mutation check (chapter 5, generic)
+        run: uv run python probe_mutations.py
+
+      # Chapter 13's ten. Two survived the first run and neither was a gap in
+      # the code, both were gaps in what had been measured: a byte ceiling
+      # that only failed between two files, not within one, and a dead
+      # branch (`REMOVAL_NOTICE if had_content else None`) that mutation
+      # testing proved could never be `False` -- deleted rather than tested,
+      # chapter 8's shape again.
+      - name: Mutation check (chapter 13)
+        run: uv run python probe_mutations_ch13.py
+
+      # Chapter 14's fourteen, and two of them are the reason this chapter
+      # exists: `instructions=None` in `__main__` and `COMPACT_AT = 0.95`
+      # both survived the whole 1525-test suite. The first switches off
+      # chapter 5's permission block, chapter 11's plan paragraph and chapter
+      # 13's system prompt in one line; the second moves the point at which a
+      # session starts paying for compaction. Every test of `_instructions`
+      # calls `_instructions`; none of them checked that anything else did.
+      #
+      # Two more survived the first run of this script, both in tests written
+      # for the mutations they missed: one computed its thresholds from the
+      # constant it was checking, and one built results whose checks all
+      # passed or all failed, so "nothing failed" and "something passed" were
+      # indistinguishable.
+      - name: Mutation check (chapter 14)
+        run: uv run python probe_mutations_ch14.py
+
+      # Chapter 16. Nineteen mutations, and the one that survived the first
+      # run was in a *test*, not in the code: the assertion that
+      # `memory_search` ranks a matching heading above a passing mention used
+      # a fixture where the winning entry matched on both, so deleting the
+      # ranking rule changed nothing. Sixth chapter in which a test's name
+      # claimed more than its assertions.
+      - name: Mutation check (chapter 16)
+        run: uv run python probe_mutations_ch16.py
+
+      # Chapter 17. Thirty-eight mutations, and the two that survived the
+      # first run were both defences with no caller in the tests: the
+      # rate-limit headers were only ever parsed by a test that called the
+      # parser (chapter 6's "a test that reimplements the code under test
+      # measures the copy", exactly), and the writer's summary cap was tested
+      # through the function rather than through the write. Fixing the second
+      # one turned up a real fault behind it -- the writer trimmed to 400
+      # tokens with its own ruler while the reader budgets 400 over the
+      # summary *and* the heading index, so a memory this program wrote came
+      # back truncated by the program that reads it. Chapter 6's F06-12: the
+      # fault is not that one ruler was wrong, it is that there were two.
+      - name: Mutation check (chapter 17)
+        run: uv run python probe_mutations_ch17.py
+
+      # Chapter 18. Twenty-three mutations; eight survived the first run and
+      # six of those were real holes. The one worth naming here is the
+      # security test: `read_skill` looks a skill up by name in an
+      # already-parsed tuple instead of rebuilding a path, and the test for
+      # that passed against a version that *did* rebuild the path -- because
+      # the rebuilt path did not happen to exist. A test that passes against
+      # the insecure implementation is not testing anything. The replacement
+      # puts a real file where the traversal would land.
+      - name: Mutation check (chapter 18)
+        run: uv run python probe_mutations_ch18.py
+
+      # Chapter 14 again, and a different kind of check: run the suite five
+      # times with a different property-test seed each time and fail if any
+      # test does not decide the same way every time. F14-02 -- flakiness is a
+      # defect, and the way it stops being one is that something reports it
+      # with a name instead of somebody re-running the job.
+      - name: Flake check
+        run: uv run python probe_flaky.py --runs 5
+
+      # Chapter 19. Thirty-two mutations across the console, and three more in
+      # `scripts/check_layers.py` itself -- the first time this script has
+      # mutated a *check* rather than the code. That is the chapter's own
+      # finding turned into a guard: the layer checker had been globbing one
+      # level deep since interlude B, which was correct until the package grew
+      # a subdirectory, and then it silently covered nothing new while still
+      # reporting success on every pull request. A repaired check that nothing
+      # would notice regressing is the same fault waiting to happen again.
+      - name: Mutation check (chapter 19)
+        run: uv run python probe_mutations_ch19.py
+
+      # Chapter 20's mutations are mostly argv assertions, which is what makes
+      # them runnable here at all: this runner has bubblewrap, but the point of
+      # testing the command line rather than the kernel is that "did anyone
+      # remove --unshare-net" is answerable on a machine where no sandbox could
+      # run. The two mutations that attack the *seam* in shell.py needed a fake
+      # sandbox to catch -- they survived the first run, on the same shape of
+      # hole chapter 19 shipped three of.
+      - name: Mutation check (chapter 20)
+        run: uv run python probe_mutations_ch20.py
+
+      # Chapter 21's mutations attack the parts of remote MCP this project
+      # actually wrote: config dispatch, header/token wiring, the OAuth
+      # TokenStorage, and the sandboxed stdio spawn. Deliberately not the
+      # SDK's own transport or OAuth flow -- mutating a dependency's source
+      # is not this repository's job, and there would be nothing here to
+      # revert.
+      - name: Mutation check (chapter 21)
+        run: uv run python probe_mutations_ch21.py
+
+      # Chapter 22's mutations attack the console's own additions: the
+      # dual-shape validation `add_mcp` repeats at the web layer, the
+      # record-to-config translation `routes.py` and `runtime.py` share, the
+      # pending-attempt table's state lookup and expiry, and the turn-time
+      # dispatch that refuses to attempt an interactive OAuth login from
+      # inside a turn. Not the SDK's own OAuth machinery, same rule as
+      # chapter 21's.
+      - name: Mutation check (chapter 22)
+        run: uv run python probe_mutations_ch22.py

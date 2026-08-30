@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # A hung job blocks every pull request queued behind it.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # --frozen refuses to re-resolve: if uv.lock disagrees with
+        # pyproject.toml the job fails instead of quietly installing something
+        # different from what the author tested.
+        run: uv sync --frozen --all-extras
+
+      - name: Lint
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+
+      - name: Test
+        run: uv run pytest

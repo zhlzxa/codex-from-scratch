@@ -1,0 +1,78 @@
+# ---------------------------------------------------------------------------
+# [project] -- the metadata a package manager reads.  Standardised by PEP 621,
+# so every tool (pip, uv, poetry, hatch) understands this exact table.
+# ---------------------------------------------------------------------------
+[project]
+name = "minicodex"
+version = "0.0.1"
+description = "A Codex-like coding agent, built from scratch, one failure at a time."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # The first runtime dependency of the project.  Chapter -1 had none; talking
+    # to a model over HTTP is what finally justified one.
+    "httpx>=0.27",
+]
+
+# Installed only when asked for: `uv sync --all-extras` or `pip install '.[dev]'`.
+# Users of the package do not get, and do not need, the test runner.
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "pyyaml>=6.0",
+    # Environment marker: tomllib entered the stdlib in 3.11, so only older
+    # interpreters need the backport.  One dependency list, every Python.
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+# Creates an executable called `minicodex` that calls minicodex.__main__.main().
+[project.scripts]
+minicodex = "minicodex.__main__:main"
+
+# ---------------------------------------------------------------------------
+# [build-system] -- who turns this directory into an installable artefact.
+# Omitting it means every tool silently falls back to setuptools, and the
+# fallback is not identical across tools.  Say it out loud.
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# hatchling would infer this from src/minicodex, but an inferred build is one
+# that changes when you rename a directory.  State it.
+packages = ["src/minicodex"]
+
+# ---------------------------------------------------------------------------
+# ruff -- formatter and linter in one binary.
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle + pyflakes: the classic errors
+    "I",             # import sorting
+    "UP",            # rewrite to modern syntax
+    "B",             # bugbear: real bugs, not style
+    "ASYNC",         # async footguns; nothing async yet, see chapter 0
+    "RUF",
+]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# --strict-markers: a typo like @pytest.mark.slwo becomes an error instead of
+# a decorator that silently does nothing.
+addopts = "-q --strict-markers"
+asyncio_mode = "auto"
+# A forgotten `await` raises nothing and returns nothing: the coroutine is
+# built, dropped, and its body never runs.  The only signal is a RuntimeWarning
+# at garbage-collection time, invisible in a green run.  Promote it.
+filterwarnings = ["error::RuntimeWarning"]

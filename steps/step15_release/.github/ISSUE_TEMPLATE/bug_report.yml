@@ -1,0 +1,63 @@
+# The form is a mechanism, not a courtesy.
+#
+# Every field below exists because a report arrived without it and could not be
+# acted on.  The first two are the whole thing: `minicodex --version` prints
+# the environment *and* names the recording, and `minicodex replay <file>`
+# turns that recording into a deterministic offline reproduction.  A report
+# with both is a test by the afternoon; a report with neither is a
+# conversation.
+#
+# `tests/test_faults_ch15.py` asserts that the fields asked for here are the
+# ones `--version` prints.  A form that drifts from the program asks people for
+# something the program no longer produces, and nothing else would notice.
+name: Bug report
+description: Something did the wrong thing
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Before you post:** the recording contains the contents of every file
+        the agent read. Credentials are redacted by key name; your source code
+        is not. Open it first.
+
+  - type: textarea
+    id: version
+    attributes:
+      label: minicodex --version
+      description: Paste the whole block. "0.0.1" alone is not a version — fourteen builds said that.
+      render: text
+    validations:
+      required: true
+
+  - type: input
+    id: recording
+    attributes:
+      label: Recording
+      description: >
+        The last line of the block above names it. Attach the file, or say why
+        you cannot. `minicodex replay <file>` re-runs it offline with no API key.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+
+  - type: dropdown
+    id: silent
+    attributes:
+      label: How did you notice?
+      description: >
+        Roughly half the faults in this program's history produced no error at
+        all. Which kind this is changes where to look first.
+      options:
+        - It crashed or printed an error
+        - No error — the result was wrong
+        - It never finished
+        - It did something it should have asked about first
+    validations:
+      required: true

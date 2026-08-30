@@ -1,0 +1,73 @@
+# The fourth tier, and the only one that produces something a stranger can
+# install.  It runs on a tag, and the ordering of its steps is the whole
+# design: everything that can refuse happens **before** the upload, because
+# publishing is the one step in this repository that cannot be undone.  A file
+# on PyPI is immutable; yanking hides it from resolvers and does not take it
+# back from anybody who already has it, and the version number is burnt either
+# way.
+#
+# Which is also why the smoke test installs the built wheel into an empty
+# environment rather than testing the checkout.  `ci.yml` runs 1656 tests
+# inside a `uv sync --all-extras` tree, and every one of them would pass on a
+# package whose wheel is missing a data file, imports a dev-only dependency, or
+# has no entry point -- chapter -1 built the first version of this check for
+# that reason and chapter 15 generalised it, after finding that the artefact's
+# metadata had no licence and no way to reach its author for seventeen
+# chapters.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # Trusted publishing: PyPI verifies the workflow's identity instead of
+      # this repository holding a long-lived token that can publish anything
+      # forever. A secret that never expires is a secret nobody rotates.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+
+      # The tag and the version, and the changelog. Two facts that do not
+      # exist until somebody types a tag, so they cannot be tests.
+      - name: Release checks
+        run: uv run python scripts/check_release.py "${{ github.ref_name }}"
+
+      # The same suite the blocking CI runs. Not "it passed on the pull
+      # request": the thing being published is this commit, and a tag can be
+      # put on any commit at all, including one that was never in a PR.
+      - name: Test
+        run: uv run pytest
+
+      - name: Build
+        run: uv build
+
+      # The step that is not a test, because a test runs inside the
+      # environment the tests were written in.
+      - name: Install the artefact somewhere empty and run it
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --quiet dist/*.whl
+          /tmp/smoke/bin/minicodex --version
+          # Import every module in the *installed* package. `import minicodex`
+          # alone exits 0 on a package whose modules cannot import each other
+          # -- interlude B's finding, and the reason check_layers.py exists.
+          /tmp/smoke/bin/python -c "import importlib, pkgutil, minicodex; [importlib.import_module('minicodex.' + m.name) for m in pkgutil.iter_modules(minicodex.__path__)]"
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+# Honest note about this repository: no package named `minicodex` is published
+# anywhere, and this workflow has never run. It is written out in full because
+# the ordering is the lesson and a three-line sketch would not show it -- but a
+# workflow that has never run is a draft, and saying so costs nothing.
+# `nightly.yml` carries the same note for the same reason.

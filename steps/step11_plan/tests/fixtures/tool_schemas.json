@@ -1,0 +1,109 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "Read a UTF-8 text file from the repository and return its contents.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file, relative to the repository root. Example: src/minicodex/model.py"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "apply_patch",
+      "description": "Edit files by replacing exact blocks of text. Every edit is checked before any file is written: if one fails, nothing is written.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "edits"
+        ],
+        "properties": {
+          "edits": {
+            "type": "array",
+            "description": "The edits to apply, in any order.",
+            "items": {
+              "type": "object",
+              "required": [
+                "path",
+                "old_text",
+                "new_text"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "Path to the file, relative to the repository root. Example: src/minicodex/model.py"
+                },
+                "old_text": {
+                  "type": "string",
+                  "description": "The text to replace, copied from the file. It must appear exactly once -- include whole surrounding lines until it does. Do not write line numbers or diff markers."
+                },
+                "new_text": {
+                  "type": "string",
+                  "description": "What to put in its place."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_shell",
+      "description": "Run a shell command and return its combined stdout and stderr. The working directory persists across calls within one session (cd changes it for subsequent calls). Backgrounded commands (trailing '&') are not supported. Long-running or silent commands are killed after 30 seconds.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The shell command to run."
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "request_permissions",
+      "description": "Ask the user to grant permissions this session does not have. Use this after a 'Permission denied:' response, when the task cannot be finished within the current permissions. Do not use it for a command that merely failed -- that is not a permissions problem.",
+      "parameters": {
+        "type": "object",
+        "required": [
+          "needs",
+          "why"
+        ],
+        "properties": {
+          "needs": {
+            "type": "string",
+            "enum": [
+              "unrestricted",
+              "write-files"
+            ],
+            "description": "write-files: edit files in this repository. unrestricted: no restrictions at all."
+          },
+          "why": {
+            "type": "string",
+            "description": "One sentence, shown to the user verbatim, saying what you need it for. Example: the test suite writes to .pytest_cache."
+          }
+        }
+      }
+    }
+  }
+]

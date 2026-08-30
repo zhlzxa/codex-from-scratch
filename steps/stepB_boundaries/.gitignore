@@ -1,0 +1,34 @@
+# Python build and cache artefacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Virtual environments -- rebuildable from uv.lock, never committed
+.venv/
+venv/
+
+# Secrets.  A key that reaches git history is in git history: `git rm` does not
+# remove it from past commits, forks, or anyone's existing clone.
+.env
+.env.*
+*.key
+*.pem
+
+# Recorded sessions.  Every `minicodex ask` writes one, and it contains the
+# whole conversation: the prompt, the model's replies, and the contents of
+# every file the agent read.  The recorder redacts credentials (chapter -1,
+# F-1-04) but it does not redact the source code, and none of it belongs in
+# the repository.  Found in interlude A, by running the thing and looking at
+# what appeared on disk.
+.minicodex/
+
+# Written by the chapter 9 notes MCP server when `remember` is called without
+# MCP_NOTES_DB.  Interlude A's lesson, one chapter later: the things that need
+# ignoring are the ones a program creates by itself, not the ones you thought
+# of while writing .gitignore.
+notes.json
+tests/_notes_*.json

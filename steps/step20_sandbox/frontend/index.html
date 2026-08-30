@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Without this the mobile layout never applies: the old console shipped a
+         whole `@media (max-width: 860px)` drawer that a phone rendered at
+         desktop width, because the page had no viewport meta and no doctype at
+         all.  Neither omission produces a warning anywhere. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>minicodex Console</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

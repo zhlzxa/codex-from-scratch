@@ -1,0 +1,23 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "minicodex --version",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "minicodex",
+      "args": ["--version"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "pytest: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["${file}", "-vv"],
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}
