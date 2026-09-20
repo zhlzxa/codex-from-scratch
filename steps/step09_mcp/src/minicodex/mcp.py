@@ -186,7 +186,7 @@ def _subprocess_env(config: ServerConfig) -> dict[str, str]:
     allowlist handed over as-is would be a floor, not a ceiling.  Naming each
     unwanted key with an empty value is the only override the union permits.
     """
-    env = {key: os.environ[key] for key in ENV_ALLOWLIST if key in os.environ}
+    env = dict(os.environ)
     env.update(config.env)
     for key in DEFAULT_INHERITED_ENV_VARS:
         if key not in env:

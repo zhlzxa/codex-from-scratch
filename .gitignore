@@ -1,0 +1,28 @@
+# Per-step virtualenvs: 28 of them, ~47 MB each. Recreate with `uv sync --all-extras`.
+.venv/
+**/.venv/
+
+# Caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.hypothesis/
+
+# Local run artefacts
+.minicodex/
+*.jsonl
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Pre-extraction working state; it became the standalone minicodex-live repo
+# and has no chapter of its own. Every published step pairs with a chapter.
+steps/stepC_context/

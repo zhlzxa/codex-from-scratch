@@ -15,7 +15,7 @@ grep -rn "F04_07" steps/          # find the code and the test
 | | |
 |---|---|
 | 🔴 | **crash** — announced itself |
-| 🟡 | **silent** — no error, wrong result. Nearly half of all entries. Only found by going looking |
+| 🟡 | **silent** — no error, wrong result. The largest single category (56 of 259). Only found by going looking |
 | 🟢 | **boundary test** — deliberately fed something extreme |
 | 🔵 | **long run** — only appears after ~30 turns |
 | 🟠 | **observability** — spotted while reading a transcript or trace |
@@ -1172,20 +1172,32 @@ called and not that it does what its name says.
 
 ---
 
-**Total: 245.**
+**Total: 259 entries**, of which **27 are negative results** — faults predicted
+before the chapter was written, then not reproduced once it was, or shown to be
+structurally impossible. They are kept, with the evidence, rather than deleted.
+
+Counts below are discovery marks, not rows: a few entries carry two, and the 26
+rows with no mark are the unreproduced predictions.
 
 | Found by | Count |
 |---|---|
-| 🟡 silent | 54 |
-| 🔵 long run | 46 |
-| 🟢 boundary test | 35 |
+| 🟡 silent | 56 |
+| 🟢 boundary test | 48 |
+| 🟣 review | 45 |
+| 🔵 long run | 37 |
 | 🔴 crash | 24 |
-| 🟣 review | 29 |
-| 🟠 observability | 25 |
-| ⚫ user report | 21 |
-| ⚪ static | 11 |
+| 🟠 observability | 19 |
+| ⚫ user report | 18 |
+| ⚪ static | 10 |
 
-Only 24 of 245 announce themselves. The other 221 — 90% — produce no
+Reproduce these counts with:
+
+```
+grep -cE '^\| (✅|⬜|—) ' FAULTS.md          # 259 entries
+grep -cE '^\| (✅|⬜|—) .*🔴' FAULTS.md      # 24 crashes
+```
+
+Only 24 of 259 announce themselves. The other 235 — 91% — produce no
 exception at the moment they happen: a wrong answer, a slow answer, a worse
 answer, or nothing at all until a user complains.
 
