@@ -1,0 +1,146 @@
+# minicodex-live: one service, one volume, and two options that are not
+# decoration.
+#
+#   * network_mode: bridge + 127.0.0.1 binding on the host side means the
+#     console is reachable ONLY from the machine it runs on.  To put it on the
+#     internet, put a TLS-terminating proxy in front (a Caddy example is at
+#     the bottom) and change this mapping deliberately, not by accident.
+#
+#   * security_opt seccomp:unconfined is required by bubblewrap: bwrap needs
+#     to create user namespaces and clone with namespaces that Docker's
+#     default seccomp profile blocks.  Without it the server starts, the
+#     startup gate passes (bwrap is installed), and the FIRST command fails
+#     with "the sandbox could not be built".  This is the documented,
+#     deliberate loosening; the alternative is running on the host without a
+#     container at all.  userns:host is the userns-remap counterpart of the
+#     same sentence.
+#
+#   If your kernel supports unprivileged user namespaces and you run Docker
+#   with a seccomp profile that allows clone(CLONE_NEWUSER) -- e.g. Docker
+#   24+ with `defaultNickname` profiles or a custom profile -- tighten these
+#   back.  Check with:
+#     docker compose exec minicodex bwrap --ro-bind / / --unshare-net true
+#   which must print nothing and exit 0.
+
+services:
+  minicodex:
+    build: .
+    image: minicodex-live:latest
+    container_name: minicodex-live
+    restart: unless-stopped
+    ports:
+      # Host loopback only.  The console binds 0.0.0.0 *inside* the container
+      # because the container's interface is not the host's; the boundary is
+      # this mapping.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - minicodex-data:/data
+    environment:
+      # Model keys go here, one per provider -- they reach the *server*, and
+      # from there the model client; they are never written to disk and never
+      # enter a subprocess env (the shell allowlist in shell.py decides).
+      # ollama needs no key at all.
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - MINICODEX_DATA_DIR=/data/console
+      - MINICODEX_HOME=/data/home
+      # Trust X-Forwarded-* from this compose network only.  uvicorn reads
+      # this natively; without it the login throttle would throttle the
+      # proxy's address and the Secure cookie flag would never turn on.
+      - FORWARDED_ALLOW_IPS=172.16.0.0/12,192.168.0.0/16,10.0.0.0/8
+    security_opt:
+      - seccomp:unconfined
+    # AppArmor on Ubuntu 24.04 also blocks unprivileged userns by default;
+    # this unconfines the container's profile for bwrap.  Remove on hosts
+    # without AppArmor.
+    cap_drop:
+      - ALL
+    # bwrap does not need privileges; it needs namespace creation, which
+    # seccomp/apparmor gate.  Nothing here runs as root (Dockerfile USER).
+    stop_grace_period: 30s
+
+  # -------------------------------------------------------------------------
+  # TLS proxy, optional profile:
+  #
+  #   SERVER_IP=203.0.113.10 docker compose --profile tls up
+  #   docker compose up                       # console only, loopback, no TLS
+  #
+  # The console itself will never terminate TLS -- that is a one-off job for
+  # a purpose-built proxy, and the cookie's Secure flag is already wired to
+  # the request scheme.  This profile exists so "put it on the network" is
+  # one command with the three load-bearing details (WebSocket upgrades,
+  # long stream timeouts, Host/Forwarded passthrough) already correct
+  # instead of rediscovered from a browser bug report.
+  #
+  # Certificates, since Let's Encrypt's IP-address GA (2026-01-15): the
+  # certbot sidecar below requests a *six-day* certificate for SERVER_IP --
+  # IP identifiers exist only in the `shortlived` profile, that is a
+  # Let's Encrypt rule, not a preference -- and renews it every 12 hours
+  # (nginx/renew.sh).  nginx/entrypoint.sh watches the stamp volume certbot
+  # touches on each renewal and reloads, so swaps never drop connections
+  # (including the /ws/ streams).  ACME_STAGING=1 (the default) runs against
+  # Let's Encrypt's staging endpoint: flip it to 0 only after a staging cert
+  # has come through, then delete nginx/certs-stamp/renew to force a real
+  # issuance -- production rate limits are per-IP and a broken loop can burn
+  # them in a day.
+  #
+  # Bringing your own certs instead (mkcert, an existing CA): skip the
+  # certbot service and drop fullchain.pem/privkey.pem into
+  # nginx/certs/live/<SERVER_IP>/ -- the entrypoint only requires the file
+  # to exist.  See nginx/nginx.conf.template for why the /ws/ block is the
+  # one that matters.
+  # -------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: minicodex-tls
+    profiles: ["tls"]
+    depends_on:
+      - minicodex
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # Rendered into nginx.conf by the entrypoint (envsubst).
+      - SERVER_IP=${SERVER_IP:-}
+    volumes:
+      - ./nginx/nginx.conf.template:/etc/nginx/nginx.conf.template:ro
+      - ./nginx/entrypoint.sh:/entrypoint.sh:ro
+      - ./nginx/certs:/etc/nginx/certs
+      - ./nginx/webroot:/var/www/certbot
+      - certbot-stamp:/letsencrypt-stamp
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+
+  certbot:
+    image: certbot/certbot:v5.4.0
+    container_name: minicodex-certbot
+    profiles: ["tls"]
+    depends_on:
+      - nginx
+    restart: unless-stopped
+    volumes:
+      - ./nginx/renew.sh:/renew.sh:ro
+      - ./nginx/certs:/etc/letsencrypt
+      - ./nginx/webroot:/var/www/certbot
+      - certbot-stamp:/letsencrypt-stamp
+    environment:
+      - SERVER_IP=${SERVER_IP:-}
+      - ACME_STAGING=${ACME_STAGING:-1}
+    entrypoint: ["/bin/sh", "/renew.sh"]
+
+volumes:
+  minicodex-data:
+  certbot-stamp:
+
+# ---------------------------------------------------------------------------
+# Putting it on the internet, bare-metal alternative (no container):
+#
+#   your.domain {
+#       reverse_proxy 127.0.0.1:8000
+#   }
+#
+# Caddy terminates TLS and proxies to the loopback mapping above; it obtains
+# and renews certificates by itself.  Either path is fine; running none of
+# them and exposing port 8000 directly is not -- the console has
+# authentication but no TLS, and a password sent in cleartext is not a
+# credential, it is a broadcast.
+# ---------------------------------------------------------------------------

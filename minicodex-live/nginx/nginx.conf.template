@@ -1,0 +1,96 @@
+# Terminates TLS for the minicodex console and proxies into the compose
+# network.  Three things here are load-bearing, not boilerplate:
+#
+#   * `/ws/` gets WebSocket upgrade headers AND long timeouts -- the event
+#     stream is a socket held open for a whole turn (model output, shell
+#     commands), and nginx's default 60s proxy_read_timeout would silently
+#     kill it mid-turn.  The browser would then reconnect into a thread that
+#     is still answering, and see nothing.
+#
+#   * `Host` is passed through unchanged: the console's cross-site WebSocket
+#     defence compares the handshake's Origin against Host (web/auth.py
+#     `same_origin`).  Rewriting Host here would fail every handshake at
+#     exactly the layer that is supposed to be transparent.
+#
+#   * `X-Forwarded-For` and `X-Forwarded-Proto` are passed because the app
+#     behind this proxy is configured to trust them from THIS container only
+#     (FORWARDED_ALLOW_IPS in compose.yaml).  That is what makes the login
+#     throttle see the real client address instead of this proxy's, and what
+#     makes the session cookie's Secure flag turn on for https requests.
+#
+# This file is a TEMPLATE: entrypoint.sh substitutes ${SERVER_IP} with
+# envsubst before nginx reads it.  Edit nginx.conf.template, not a
+# rendered copy.
+#
+# Certificates are issued and renewed by the certbot sidecar in compose.yaml
+# (--ip-address, shortlived profile -- six days, renewed every 12h by
+# nginx/renew.sh).  The path below is certbot's live directory for the
+# server IP; nginx/entrypoint.sh watches the stamp volume certbot touches
+# on renewal and reloads this process, so a swap never drops connections.
+# If you bring your own certs instead, put fullchain.pem / privkey.pem at
+# /etc/nginx/certs/live/<your-ip>/ (or edit the two lines below) -- the
+# entrypoint only refuses to start while the file is missing.
+
+worker_processes 1;
+
+events {
+    worker_connections 256;
+}
+
+http {
+    # Patches and provider settings travel in request bodies; 1m (the
+    # default) has been known to eat large apply_patch calls.
+    client_max_body_size 10m;
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ""      "";
+    }
+
+    # ACME http-01 challenges land here (certbot --webroot writes into the
+    # mounted webroot); everything else is redirected to https.
+    server {
+        listen 80;
+        location /.well-known/acme-challenge/ {
+            root /var/www/certbot;
+        }
+        location / {
+            return 301 https://$host$request_uri;
+        }
+    }
+
+    server {
+        listen 443 ssl;
+        server_name _;
+
+        # certbot's per-IP live directory (SERVER_IP is baked into the
+        # rendered config at container start -- see entrypoint in compose).
+        ssl_certificate     /etc/nginx/certs/live/${SERVER_IP}/fullchain.pem;
+        ssl_certificate_key /etc/nginx/certs/live/${SERVER_IP}/privkey.pem;
+
+        # Plain API calls: short-lived, one round trip each.
+        location / {
+            proxy_pass http://minicodex:8000;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 300s;
+        }
+
+        # The event stream: one socket per open thread tab, alive as long as
+        # the turn (and then held for the next one).  An idle-looking socket
+        # is normal here, not dead.
+        location /ws/ {
+            proxy_pass http://minicodex:8000;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+    }
+}

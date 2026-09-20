@@ -1,0 +1,301 @@
+/* Chapter 19's additions to the design system in theme.css.
+ *
+ * Kept in a second file rather than merged in, so that `git diff` against the
+ * reviewed original shows nothing: everything the console looked like before
+ * is still exactly what theme.css says, and everything new is here.
+ *
+ * Every colour is a token from theme.css's :root. Nothing below hardcodes a
+ * hex value, which is what makes dark mode work without a second copy of any
+ * of these rules.
+ */
+
+.boot {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+  padding: 24px 32px;
+}
+
+.sidebar-error {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--danger);
+  padding: 4px 8px 0;
+  overflow-wrap: anywhere;
+}
+
+/* A quiet dot next to a thread that is answering, so a background turn in
+   another thread is visible without opening it. */
+.t-busy {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: t-pulse 1.4s ease-in-out infinite;
+}
+@keyframes t-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
+}
+
+/* -- chat header: what this session is allowed to do, always visible ------- */
+
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+}
+.chat-header-right {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.mode-chip,
+.conn-chip {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  padding: 3px 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.mode-chip { background: var(--surface); color: var(--ink-dim); }
+/* Escalating colour with escalating permission: `full-access` should not look
+   like a neutral setting, because it is not one. */
+.mode-read-only { border-color: var(--border); }
+.mode-workspace-write { color: var(--info); border-color: var(--info); background: var(--info-soft); }
+.mode-full-access { color: var(--danger); border-color: var(--danger); background: var(--danger-soft); }
+
+.conn-open { color: var(--ok); border-color: var(--ok); background: var(--ok-soft); }
+.conn-connecting, .conn-retrying { color: var(--info); border-color: var(--info); background: var(--info-soft); }
+.conn-closed { color: var(--ink-faint); }
+
+/* -- chat body: transcript beside the plan -------------------------------- */
+
+.chat-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+}
+.chat-body .chat-scroll { flex: 1; min-width: 0; }
+
+.plan-panel {
+  width: 250px;
+  flex: none;
+  border-left: 1px solid var(--border);
+  background: var(--surface-2);
+  padding: var(--sp-4);
+  overflow-y: auto;
+}
+.plan-panel ul { list-style: none; margin: var(--sp-2) 0 0; padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+.plan-step { display: flex; gap: var(--sp-2); font-size: 12.5px; line-height: 1.45; color: var(--ink-dim); }
+.plan-box {
+  width: 12px; height: 12px; flex: none; margin-top: 3px;
+  border: 1.5px solid var(--ink-faint); border-radius: 3px;
+}
+.plan-in_progress { color: var(--ink); }
+.plan-in_progress .plan-box { border-color: var(--accent); background: var(--accent-soft); }
+.plan-completed { color: var(--ink-faint); text-decoration: line-through; }
+.plan-completed .plan-box { border-color: var(--ok); background: var(--ok); }
+
+@media (max-width: 1100px) {
+  .plan-panel { display: none; }
+}
+
+/* -- marks: the three things the old console dropped ---------------------- */
+
+.msg-mark {
+  align-self: center;
+  max-width: 90%;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--info);
+  background: var(--info-soft);
+  border: 1px dashed var(--info);
+  border-radius: var(--r-sm);
+  padding: 6px 12px;
+  text-align: center;
+}
+
+.run-reports {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  line-height: 1.7;
+  border-top: 1px dashed var(--border);
+  padding-top: var(--sp-3);
+  overflow-wrap: anywhere;
+}
+
+.tc-spin {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent);
+  margin-left: auto;
+  animation: t-pulse 1.1s ease-in-out infinite;
+}
+.toolcall-head { cursor: pointer; }
+
+/* -- session settings drawer --------------------------------------------- */
+
+.settings-drawer {
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  padding: var(--sp-5) var(--sp-6);
+  max-height: 52vh;
+  overflow-y: auto;
+}
+.settings-form { display: flex; flex-direction: column; gap: var(--sp-5); max-width: 660px; }
+.settings-group { display: flex; flex-direction: column; gap: var(--sp-2); }
+.settings-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--ink-faint);
+}
+.settings-help { font-size: 12.5px; color: var(--ink-dim); margin: 0; line-height: 1.5; }
+.settings-input {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--ink);
+  max-width: 260px;
+}
+
+.radio-row { display: flex; gap: var(--sp-2); flex-wrap: wrap; }
+.radio-pill {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 6px 13px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink-dim);
+  cursor: pointer;
+}
+.radio-pill:hover:not(:disabled) { border-color: var(--accent); color: var(--ink); }
+.radio-pill.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.radio-pill:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.check-row {
+  display: flex;
+  gap: var(--sp-3);
+  align-items: flex-start;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-dim);
+  cursor: pointer;
+  padding: 5px 0;
+}
+.check-row input { margin-top: 3px; flex: none; accent-color: var(--accent); }
+.check-row strong { color: var(--ink); }
+
+.confirm-box {
+  border: 1px solid var(--info);
+  border-left-width: 3px;
+  background: var(--info-soft);
+  border-radius: var(--r-md);
+  padding: var(--sp-4);
+  margin-top: var(--sp-2);
+}
+.confirm-title { font-weight: 600; font-size: 13.5px; color: var(--ink); margin-bottom: var(--sp-2); }
+.confirm-box p { font-size: 12.5px; line-height: 1.55; color: var(--ink-dim); margin: 0 0 var(--sp-2); }
+
+/* -- extensions: skills, memory, rules ----------------------------------- */
+
+.skill-body,
+.memory-summary {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--surface-3);
+  border-radius: var(--r-sm);
+  padding: var(--sp-3);
+  margin-top: var(--sp-3);
+  max-height: 340px;
+  overflow-y: auto;
+}
+.skill-card { align-items: flex-start; }
+
+.pop-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 8px 11px;
+  border: none;
+  background: none;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--ink);
+  text-align: left;
+}
+.pop-row:hover { background: var(--surface-2); }
+.pop-row.on { background: var(--accent-soft); color: var(--accent); }
+.pop-sub { font-family: var(--font-mono); font-size: 10.5px; color: var(--ink-faint); }
+
+textarea.settings-input,
+.add-form textarea {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--ink);
+  resize: vertical;
+  width: 100%;
+}
+
+/* Chapter 23: the sign-in screen.
+
+   Its own centred layout rather than a modal over the console, because there
+   is nothing behind it to look at: before a session exists every panel on this
+   page would be empty and every button would 401. A dialog over a blank app
+   implies there is an app under it. */
+.signin-screen {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+}
+
+.signin-card {
+  width: min(26rem, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 28px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.signin-title {
+  margin: 0;
+  font-size: 1.25rem;
+  letter-spacing: -0.01em;
+}
+
+.signin-lede {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ink-dim);
+}

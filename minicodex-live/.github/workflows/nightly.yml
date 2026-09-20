@@ -1,0 +1,50 @@
+# The third tier, added in chapter 14.
+#
+# Everything in `ci.yml` and `postmerge.yml` is offline: recorded bytes, a stub
+# server, a scripted model. That is deliberate (F14-05) -- a suite that needs a
+# provider is slow, costs money and fails for reasons that have nothing to do
+# with the change, and the end state of all three is a suite people switch off.
+#
+# But a program whose whole job is talking to a model cannot be tested entirely
+# without one. The eval task set is the part that must meet the real thing, so
+# it lives here: on a schedule, where nobody is waiting for it, with a total
+# that is *reported* rather than enforced.
+#
+# There is no pass/fail threshold on the score, on purpose. A threshold on a
+# non-deterministic measurement is a coin that lands red often enough to be
+# ignored, and F14-02 is the entry about what an ignored red does to every
+# other red. What this job produces is a number and a per-task table; a human
+# compares it with last week's.
+#
+# Honest note about this repository: `OPENAI_API_KEY` is not set here, so this
+# workflow has never run to completion in CI. It has run from a laptop, which
+# is where every number in chapter 14 comes from. A workflow that has never
+# run is a draft, and calling it one costs nothing.
+name: nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Without a key there is nothing to measure, and a red X on a scheduled
+    # job every morning trains everybody to stop reading the mail.
+    if: ${{ github.repository_owner != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --all-extras
+
+      # One sample per task is enough to notice that something has broken
+      # outright; it is not enough to see a one-in-five effect, which is what
+      # `probe_eval.py focus` is for and why that one is run by hand.
+      - name: Eval task set (openai)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: uv run python probes/probe_eval.py cost --provider openai

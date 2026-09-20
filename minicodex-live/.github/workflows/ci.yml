@@ -1,0 +1,112 @@
+name: ci
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # A hung job blocks every pull request queued behind it.
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: minicodex_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      MINICODEX_TEST_DATABASE_URL: postgresql://postgres:ci-only-password@127.0.0.1:5432/minicodex_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        # --frozen refuses to re-resolve: if uv.lock disagrees with
+        # pyproject.toml the job fails instead of quietly installing something
+        # different from what the author tested. --all-extras is what installs
+        # chapter 19's `web` extra, and therefore what lets `check_layers.py`
+        # import `minicodex.web.app` at all.
+        #
+        # `npm ci`, not `npm install`, for exactly the reason `--frozen` is
+        # here: it installs the lockfile or it fails, and it refuses when
+        # package-lock.json and package.json disagree.
+        #
+        # No `actions/setup-node` step, and that is a real constraint rather
+        # than a preference: chapter -1 caps this workflow at six steps and
+        # this is the sixth. The runner image ships Node, so the frontend is
+        # built against whatever the image has -- which is worth knowing, and
+        # is why `engines` in package.json is the thing that would catch a
+        # runner moving out from under this.
+        run: |
+          uv sync --frozen --all-extras
+          npm --prefix frontend ci
+
+      - name: Lint
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          # Interlude B. In this step and not a step of its own: chapter -1's
+          # guard caps the blocking workflow at six steps, and a static check
+          # that finishes in three seconds is what a lint step is. Chapter 9
+          # answered the same question the other way (a second workflow),
+          # because a mutation run measures the tests and not the change.
+          #
+          # What it stops: an import cycle, including the one an ordinary
+          # convenience import in __init__.py creates, and including one
+          # deferred into a function body so that startup still works.
+          # `import minicodex` -- the obvious smoke test -- exits 0 on a
+          # package whose modules cannot import each other, which is why this
+          # imports every module in its own interpreter.
+          uv run python scripts/check_layers.py --quiet
+
+          # Chapter 19. `tsc --noEmit` is a static check over the console's
+          # source and belongs in the step that runs static checks. Not a
+          # nicety: the reconnect logic and the `ServerEvent` union are the
+          # two places where the browser and the backend agree about a shape,
+          # and a type error there is the same class of fault as a forbidden
+          # import is here.
+          npm --prefix frontend run typecheck
+
+      - name: Test
+        # The frontend build is in this step rather than one of its own, for
+        # the six-step reason above. After pytest, deliberately:
+        # `test_faults_ch19.py` asserts against the committed frontend
+        # *sources* -- that a close handler exists, that every mark has a
+        # branch -- so those hold whether or not anything has been built, and
+        # a build failure lands after the cheaper signal rather than in front
+        # of it.
+        run: |
+          uv run pytest
+          # Chapter 22 added four vitest tests and did not add this line, so
+          # they passed on a laptop and had never run on a pull request --
+          # F23-10, found by chapter 23 looking for its own wiring. Before the
+          # build, for the same reason pytest is: the cheaper signal first.
+          npm --prefix frontend test
+          npm --prefix frontend run build
+
+      # Added in chapter 6, and only in chapter 6, because this is the first
+      # module whose interesting input is a *shape* rather than a value: a
+      # history can be legal or illegal in ways no example test enumerates.
+      #
+      # It runs separately from the suite above with a much larger case count.
+      # The local default (200) is small enough that nobody skips it; 2000 here
+      # is cheap because CI is not waiting for a human. The bug this exists for
+      # -- compaction that makes a history *bigger* -- first appeared at seed
+      # 235, which the local default does not reach.
+      - name: Property tests
+        env:
+          MINICODEX_PROPERTY_CASES: "2000"
+        run: uv run pytest tests/test_properties.py
+
