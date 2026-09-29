@@ -125,7 +125,20 @@ def test_F_1_02_build_backend_is_declared(repo_root: Path) -> None:
 # ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("pattern", [".env", "__pycache__/", "*.key", ".venv/"])
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        ".env",
+        "__pycache__/",
+        "*.key",
+        ".venv/",
+        # Added in chapter 0. The chapter -1 list covered the things that are
+        # obviously secret; this one is a directory the agent creates by itself,
+        # on every run, full of everything it read. `git status` showed it the
+        # first time the recorder wrote there.
+        ".minicodex/",
+    ],
+)
 def test_F_1_03_gitignore_covers_the_usual_accidents(repo_root: Path, pattern: str) -> None:
     assert pattern in (repo_root / ".gitignore").read_text(encoding="utf-8")
 
