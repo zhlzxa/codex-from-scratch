@@ -160,6 +160,42 @@ class ShellSession:
                 # parent watching it, as measured directly with `sleep 3600`
                 # outliving a timeout.
                 os.killpg(proc.pid, signal.SIGKILL)
+
+                # ...and then close the pipe we have stopped reading, before
+                # waiting.  `proc.wait()` does not resolve when the process
+                # dies; it resolves when the process has died AND every pipe
+                # has reached EOF.  From CPython's base_subprocess.py:
+                #
+                #     def _try_finish(self):
+                #         if self._returncode is None:
+                #             return
+                #         if all(p is not None and p.disconnected
+                #                for p in self._pipes.values()):
+                #             self._call(self._call_connection_lost, None)
+                #
+                # and `_call_connection_lost` is the only place the futures
+                # behind `wait()` are ever resolved.  Giving up on the ceiling
+                # leaves unread bytes in the pipe, so stdout never reaches EOF,
+                # so `wait()` blocks forever on a process that is already dead.
+                #
+                # Measured, 12 samples per interpreter, `yes | head -c 2000000`
+                # against a 1,000,000-character ceiling:
+                #
+                #     python 3.10.20   0/12 hang
+                #     python 3.11.15  12/12 hang
+                #     python 3.12.3    4/12 hang
+                #     python 3.13.13   4/12 hang
+                #
+                # Chapter 2 was first written on 3.10, where this never shows,
+                # which is how it went unnoticed.  A read-timeout ceiling on
+                # `wait()` was tried and rejected: it still "hung" 3-12 times
+                # out of 12, it just capped the damage, and it paid the full
+                # timeout every time it fired.  Closing the pipe fixes the
+                # cause -- 0/12 on every interpreter, and `wait()` returns in
+                # 0.00s.
+                pipe = proc._transport.get_pipe_transport(1)  # type: ignore[attr-defined]
+                if pipe is not None:
+                    pipe.close()
             await proc.wait()
         finally:
             # `asyncio.subprocess.Process` has no public close(); without
