@@ -10,7 +10,9 @@ Two recordings, two shapes for the same tool call:
   OLLAMA_*  one chunk, arguments complete
   OPENAI_*  fourteen chunks, and only the first carries the id and the name
 
-Run with `minicodex serve-stub [--openai]`, or point at the real thing:
+Run with `minicodex serve-stub`.  A request picks its recording with the
+`stub_mode` key (`narrate`, `three`, `openai`), which tests send through
+`extra_body`.  Or point at the real thing:
 
     minicodex ask "..." --base-url http://localhost:11434/v1 --model qwen3
     minicodex ask "..." --provider openai --model gpt-4o-mini
