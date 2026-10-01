@@ -260,11 +260,17 @@ async def test_F12_01_a_hanging_server_runs_out_of_budget_without_sleeping(
     )
 
     began = time.monotonic()
-    with pytest.raises(ModelFailed):
+    with pytest.raises(ModelFailed) as excinfo:
         await agent.run("go")
     elapsed = time.monotonic() - began
 
     assert elapsed < 2.0, "the budget must bound a hang, not only a backoff"
+    # The seconds alone do not pin it. Eight attempts at 0.1s each is under a
+    # second on a fast machine, so with the budget counting only sleep this
+    # test stayed green on Linux and went red on Windows, where an abandoned
+    # connection costs more. Counting attempts does not depend on the machine:
+    # a 0.4s budget cannot have paid for all eight.
+    assert excinfo.value.attempts < 8, "every attempt was made; the budget bounded nothing"
 
 
 def test_F12_01_an_unrecognised_exception_is_fatal_not_retryable() -> None:
@@ -995,3 +1001,209 @@ def test_a_body_that_is_not_json_does_not_break_the_error_handling() -> None:
     assert error.code is None
     assert classify(error).disposition == "retry"
     assert "502 Bad Gateway" in str(error)
+
+
+# ---------------------------------------------------------------------------
+# found when the chapter was rewritten
+# ---------------------------------------------------------------------------
+
+
+async def test_F12_05_a_refusal_corrects_the_raw_estimate_not_the_corrected_one() -> None:
+    """Chapter 6 fixed this once: the ruler has to be fed the estimate *before*
+    correction, or the ratio it learns is the error of the last correction.
+
+    `_shrink` was written afterwards and fed it the corrected one. With the
+    ruler already reading x1.5 and a refusal stating exactly twice the raw
+    estimate, it came out at x1.33 -- neither the old value nor the true one.
+    Every test of this path started from an uncalibrated agent, where raw and
+    corrected are the same number, so none of them could see it.
+    """
+
+    async def summarise(request: SummaryRequest) -> str:
+        return "## Done\nx\n"
+
+    class NeverCalled:
+        tools = ()
+
+    agent = Agent(NeverCalled(), TOOLS, context_window=8000, summariser=summarise)
+    history = long_history()
+    wire = history.to_wire("chat_completions")
+    raw = agent._raw_estimate(wire)
+
+    agent.calibration.observe(estimated=100, actual=150)  # the ruler already reads x1.5
+    estimated = agent._sizer().messages(wire)  # ...so this is about 1.5 x raw
+    assert estimated > raw
+
+    told = Failure("shrink", "context_length", "too long", stated_tokens=(8000, raw * 2))
+    await agent._shrink(history, told, estimated, shrunk=False)
+
+    assert agent.calibration.ratio == pytest.approx(2.0, rel=0.01)
+
+
+async def test_F12_06_the_attempt_timeout_bounds_silence_not_the_length_of_a_stream() -> None:
+    """What `DEFAULT_ATTEMPT_TIMEOUT` is, pinned so nobody relies on what it is not.
+
+    The first version of this chapter said a turn ends within `budget +
+    attempt`, 210 seconds. That is true of a server that has gone quiet. It is
+    not true of one that keeps sending: `httpx` applies the timeout to each
+    read, so a stream that delivers a chunk every 0.15 seconds outlives a
+    0.4-second timeout by as long as it likes. That is the right behaviour -- a
+    long answer is not a failure -- and it means a slow, live stream is bounded
+    by the sub-task deadline or by nothing.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Trickle(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for index in range(6):
+                chunk = {"choices": [{"index": 0, "delta": {"content": f"{index} "}}]}
+                self.wfile.write(b"data: " + json.dumps(chunk).encode() + b"\n\n")
+                self.wfile.flush()
+                time.sleep(0.15)
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Trickle)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        model = ChatCompletionsModel(
+            base_url=f"http://127.0.0.1:{server.server_address[1]}/v1", timeout=0.4
+        )
+        agent = Agent(model, {}, retry_policy=RetryPolicy(attempts=1))
+        began = time.monotonic()
+        result = await agent.run("go")
+        elapsed = time.monotonic() - began
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result.stop_reason == "completed"
+    assert elapsed > 0.4, "the stream ran past the timeout and was not cut"
+
+
+async def test_F12_07_a_wait_is_said_out_loud(stub_url: str) -> None:
+    """A backoff nobody is told about is indistinguishable from a hang."""
+    said: list[str] = []
+    agent = Agent(
+        failing(stub_url, "t16", BARE_429), TOOLS, retry_policy=NO_WAIT, announce=said.append
+    )
+
+    await agent.run("What does __init__.py define?")
+
+    assert said == ["[rate_limit: waiting 0s, attempt 2 of 4]"]
+
+
+def test_wiring_passes_the_retry_policy_and_the_announcer_to_the_agent() -> None:
+    """The two fields this chapter added to `Wiring` are only worth having if
+    `Wiring.agent` hands them on. Dropping either line left the suite green:
+    the test that pins `Wiring` checks which fields exist, not where they go."""
+    from minicodex.agent import Wiring
+    from minicodex.agent_types import ToolSet
+
+    class NeverCalled:
+        tools = ()
+
+    said: list[str] = []
+    policy = RetryPolicy(attempts=2)
+    agent = Wiring(retry_policy=policy, announce=said.append).agent(NeverCalled(), ToolSet({}, []))
+
+    assert agent.retry_policy is policy
+    agent._say("waiting")
+    assert said == ["waiting"]
+
+
+def test_the_cli_says_when_it_is_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """`__main__` is the one place with a terminal, and the one line that
+    connects a wait to it is `announce=print`. Without it a real run sits
+    silent through whatever the provider asked for -- 46 seconds, measured."""
+    from minicodex.__main__ import main
+    from minicodex.model import Completed, TextDelta
+
+    calls = {"n": 0}
+
+    async def stream(self: Any, messages: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("connection refused")
+        yield TextDelta("hello")
+        yield Completed("stop")
+
+    monkeypatch.setattr(ChatCompletionsModel, "stream", stream)
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["ask", "hi", "--yes", "--session-dir", str(tmp_path / "s")]) == 0
+
+    out = capsys.readouterr().out
+    assert "[transport: waiting" in out
+    assert "hello" in out
+
+
+async def test_F12_05_a_forced_compaction_is_said_out_loud(stub_url: str) -> None:
+    """A run that quietly threw away most of its conversation because the
+    provider refused it is a run whose user should be told."""
+
+    async def summarise(request: SummaryRequest) -> str:
+        return "## Done\nlooked at the modules\n"
+
+    said: list[str] = []
+    agent = Agent(
+        failing(stub_url, "t17", stub.CONTEXT_LENGTH_EXCEEDED),
+        TOOLS,
+        context_window=8000,
+        summariser=summarise,
+        retry_policy=NO_WAIT,
+        resume_from=long_history(),
+        announce=said.append,
+    )
+    await agent.run("What does __init__.py define?")
+
+    assert any(line.startswith("[context too long for the provider; compacted") for line in said)
+
+
+def test_F12_08_the_explanation_says_how_the_run_ended() -> None:
+    """Two endings that are not the provider's fault and not the user's: the
+    attempts ran out, or the server asked for longer than the whole budget.
+    Each has one sentence, and each could be deleted with the suite green."""
+    gave_up = explain(
+        Failure("retry", "server_error", "The server had an error"), waited=12.0, attempts=4
+    )
+    assert "gave up after 4 attempts and 12s of waiting" in gave_up
+
+    too_long = explain(classify(http(stub.RATE_LIMITED)))
+    assert "the server asked for 45s, longer than this run waits" in too_long
+
+
+async def test_F12_08_a_failed_child_says_why_and_is_counted(stub_url: str, tmp_path: Path) -> None:
+    """The `error` outcome has to carry the reason, and the child has to appear
+    in the end-of-run listing like any other -- a sub-agent that failed and
+    left no line behind is the hardest kind to go looking for."""
+    from minicodex.agent import Wiring
+    from minicodex.approval import AllowAll, Session
+    from minicodex.composition import child_tools_builder
+    from minicodex.shell import ShellSession
+    from minicodex.subagent import SubAgentContext, TaskSpec, run_task
+
+    session = Session(mode="workspace-write", approver=AllowAll())
+    ctx = SubAgentContext(
+        build_model=lambda schemas: failing(stub_url, "t18", *[BARE_429] * 6),
+        root=tmp_path,
+        session=session,
+        parent_shell=ShellSession(),
+        build_tools=child_tools_builder(tmp_path, session),
+        wiring=Wiring(retry_policy=NO_WAIT),
+    )
+
+    result = await run_task(TaskSpec(task="say hello"), ctx)
+
+    assert "Rate limit reached" in result.render()
+    assert ctx.children == [result]

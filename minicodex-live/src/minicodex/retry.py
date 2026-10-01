@@ -209,11 +209,20 @@ class RetryPolicy:
     It is measured as **wall clock for the whole turn**, not as time spent
     sleeping.  The first version counted only the waits, and against a hanging
     server that bounds nothing at all -- four attempts that each time out spend
-    eight minutes without a single `sleep`.  What that buys is the one
-    arithmetic statement this program can make about how long a turn takes: no
-    new attempt starts after `budget`, and an attempt lasts at most
-    `DEFAULT_ATTEMPT_TIMEOUT`, so a turn ends within `budget + attempt` --
-    90 + 120 = 210 seconds, inside the 300 a sub-task gets.
+    eight minutes without a single `sleep`.  What that buys is one statement
+    about a server that has *stopped talking*: no new attempt starts after
+    `budget`, and a silent attempt is abandoned after `DEFAULT_ATTEMPT_TIMEOUT`,
+    so a turn against a dead server ends within `budget + attempt` -- 90 + 120
+    = 210 seconds, inside the 300 a sub-task gets.
+
+    It is **not** a bound on a server that keeps talking, and this docstring
+    used to say it was.  `DEFAULT_ATTEMPT_TIMEOUT` is handed to `httpx` as a
+    timeout per read, so it limits the silence between two chunks, not the
+    length of the stream: measured, a response that sent a chunk every 0.3
+    seconds for 3 seconds finished normally under a 0.5-second timeout.  A long
+    answer is a legitimate thing for a model to produce, so that is the right
+    behaviour -- and it means the only limit on a slow but live stream is the
+    sub-task deadline for a child, and nothing at all for the top-level run.
 
     The defaults are nested inside the timeouts that already exist:
 

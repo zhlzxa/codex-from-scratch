@@ -169,6 +169,25 @@ MUTATIONS = [
         "    except ModelFailed as exc:",
         "    except _NeverRaised as exc:",
     ),
+    # The next three were added when the chapter was rewritten.
+    (
+        "agent.py",
+        "a refusal corrects the already-corrected estimate, which chapter 6 fixed once",
+        "                self.calibration.observe(estimated=raw, actual=actual)",
+        "                self.calibration.observe(estimated=estimated, actual=actual)",
+    ),
+    (
+        "agent.py",
+        "Wiring.agent keeps the retry policy to itself",
+        "            retry_policy=self.retry_policy,\n",
+        "",
+    ),
+    (
+        "__main__.py",
+        "a wait is not announced on the terminal",
+        "        announce=print,\n        # A client of its own",
+        "        # A client of its own",
+    ),
 ]
 
 SRC = Path("src/minicodex")
@@ -192,7 +211,23 @@ atexit.register(restore)
 signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
 
 
+def refuse_if_already_mutated() -> None:
+    """Do not start on a tree a killed run left dirty (chapter 9's lesson)."""
+    dirty = [
+        f"{name}: looks like {label!r} is still applied"
+        for name, label, before, after in MUTATIONS
+        if after and before not in ORIGINALS[name] and after in ORIGINALS[name]
+    ]
+    if dirty:
+        print("refusing to run: the working tree is already mutated\n")
+        for line in dirty:
+            print(f"  {line}")
+        print("\nRestore it (git checkout / re-copy) before running this again.")
+        raise SystemExit(2)
+
+
 def main() -> None:
+    refuse_if_already_mutated()
     print(f"{len(MUTATIONS)} mutations, {' '.join(SUITES)}\n")
     survivors = []
     for name, label, before, after in MUTATIONS:

@@ -27,17 +27,17 @@ uv run python probe_mutations_ch12.py
 | Path | What it does |
 |---|---|
 | `src/minicodex/retry.py` | `classify()`, `Failure`, `RetryPolicy`, `wait_for()`, `explain()`, `ModelFailed` |
-| `src/minicodex/model.py` | `ModelHTTPError` carries `status` / `code` / `message` / `headers` / `request_id`; one attempt is bounded at 120s, not 300 |
+| `src/minicodex/model.py` | `ModelHTTPError` carries `status` / `code` / `message` / `headers` / `request_id`; one attempt may be silent for 120s, not 300 |
 | `src/minicodex/agent.py` | `_respond()` — the retry loop, around stream *plus* assembly; `_shrink()` for the one failure that is a fact about us; `Wiring.retry_policy` and `Wiring.announce` |
 | `src/minicodex/compaction.py` | a *fatal* provider failure inside the summariser is no longer degraded into a note |
 | `src/minicodex/subagent.py` | outcome `error`: a provider failure inside a child reaches the parent as prose instead of as a traceback |
 | `src/minicodex/__main__.py` | the failure is translated for a human; the session lock is released in a `finally` |
 | `src/minicodex/agent_types.py` | `IncompleteStreamError` moved down so `retry.py` can classify it (fourth application of chapter 1's rule) |
 | `src/minicodex/stub.py` | five recorded failure bodies, and a queue so a test can say "429 twice, then answer" |
-| `tests/test_faults_ch12.py` | 44 tests, F12-01…F12-09 |
+| `tests/test_faults_ch12.py` | 52 tests, F12-01…F12-09 and the command-line wiring |
 | `tests/test_packaging.py` | every `probe_mutations*.py` must be referenced by a workflow |
 | `probe_retry.py` | seven sections, four of them against the real API |
-| `probe_mutations_ch12.py` | 23 mutations across five modules |
+| `probe_mutations_ch12.py` | 26 mutations across six modules |
 
 ## What was measured
 
@@ -108,6 +108,10 @@ Same failure, and only the second one can say what happened.
   measured in this book has ever sent one. An unreadable header falls back to
   the local schedule, which is what a missing one does.
 - **No per-provider policy.** One `RetryPolicy`, and a child gets its parent's.
-- **The attempt budget does not bound a turn exactly.** No new attempt starts
-  after `budget` and an attempt lasts at most `DEFAULT_ATTEMPT_TIMEOUT`, so a
-  turn ends within 90 + 120 = 210 seconds. That is the whole guarantee.
+- **The budget bounds a turn only against a server that has gone quiet.** No
+  new attempt starts after `budget`, and a *silent* attempt is abandoned after
+  `DEFAULT_ATTEMPT_TIMEOUT`, so a turn against a dead server ends within
+  90 + 120 = 210 seconds. The timeout is applied per read, so it does not limit
+  a stream that keeps arriving: a slow, live response is bounded by the
+  sub-task deadline for a child and by nothing for the top-level run. This
+  README used to state the 210 seconds without that condition.
