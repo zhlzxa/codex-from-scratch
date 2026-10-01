@@ -15,7 +15,7 @@ from typing import Any
 from minicodex import __version__
 from minicodex.agent import Wiring
 from minicodex.agent_types import ToolSet
-from minicodex.agents_md import AgentsMdWatcher
+from minicodex.agents_md import AgentsMdWatcher, watch
 from minicodex.approval import AllowAll, CliApprover, Session
 from minicodex.compaction import make_summariser
 from minicodex.composition import (
@@ -207,6 +207,8 @@ async def _ask(
         # is standing in rather than the one the process started in.
         parent_shell=context.shell,
         wiring=wiring,
+        # A child reads AGENTS.md for wherever *its* shell is.
+        on_turn_start_for=lambda shell: watch(root, shell),
         sessions_dir=session_dir,
         parent_session_id=current.session_id,
         provider=provider,
@@ -295,7 +297,11 @@ async def _ask(
             "skills": str(skills.directory) if skills else None,
         },
     )
-    agents_watcher = AgentsMdWatcher(root)
+    # On `--resume` the conversation may already hold a conventions note,
+    # written by a process that has since exited.
+    agents_watcher = AgentsMdWatcher(
+        root, shown=resume_from.developer_notes() if resume_from is not None else ()
+    )
     # Three watchers, one hook: `on_turn_start` takes a single callable, and
     # the three watchers answer different questions -- one re-checks the
     # filesystem every turn, two speak exactly once.  All are asked, and

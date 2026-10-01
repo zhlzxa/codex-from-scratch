@@ -15,7 +15,7 @@ from typing import Any
 from minicodex import __version__, system_prompt
 from minicodex.agent import Wiring
 from minicodex.agent_types import ToolSet
-from minicodex.agents_md import AgentsMdWatcher
+from minicodex.agents_md import AgentsMdWatcher, watch
 from minicodex.approval import AllowAll, CliApprover, Session, permissions_block
 from minicodex.compaction import make_summariser
 from minicodex.composition import sub_context, top_level_tools, watching, with_remote_tools
@@ -236,6 +236,8 @@ async def _ask(
         # is standing in rather than the one the process started in.
         parent_shell=context.shell,
         wiring=wiring,
+        # A child reads AGENTS.md for wherever *its* shell is.
+        on_turn_start_for=lambda shell: watch(root, shell),
         sessions_dir=session_dir,
         parent_session_id=current.session_id,
         provider=provider,
@@ -315,8 +317,6 @@ async def _ask(
     # interlude B this call passed seven keyword arguments and the sub-agent's
     # passed three, and no test compared them because nothing put them next to
     # each other.
-    # Bound to *this* run's shell, not the child's -- see `Wiring.agent`'s
-    # docstring on why a sub-agent gets no watcher of its own.
     # Written before the first request, not after the run: a recording is worth
     # having *because* the process died, and the line saying which model and
     # which sandbox mode produced it is the one a replay cannot do without.
@@ -345,7 +345,11 @@ async def _ask(
             "skills": str(skills.directory) if skills else None,
         },
     )
-    agents_watcher = AgentsMdWatcher(root)
+    # On `--resume` the conversation may already hold a conventions note,
+    # written by a process that has since exited.
+    agents_watcher = AgentsMdWatcher(
+        root, shown=resume_from.developer_notes() if resume_from is not None else ()
+    )
     # Three watchers, one hook. `on_turn_start` takes a single callable, and
     # `AgentsMdWatcher` (chapter 13), `MemoryWatcher` (chapter 16) and
     # `SkillsWatcher` (chapter 18) answer different questions -- one re-checks

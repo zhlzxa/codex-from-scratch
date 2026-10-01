@@ -141,6 +141,15 @@ class History:
     def add_developer_note(self, text: str) -> None:
         self._append(DeveloperNote(text))
 
+    def developer_notes(self) -> tuple[str, ...]:
+        """Every AGENTS.md note on record, oldest first.
+
+        For a resumed session: the watcher that wrote these belonged to a
+        process that has exited, and the new one needs to know what the
+        conversation was already told.
+        """
+        return tuple(item.text for item in self._items if isinstance(item, DeveloperNote))
+
     def add_assistant(self, text: str, tool_calls: Sequence[ToolCall] = ()) -> None:
         if self._unanswered:
             raise HistoryError(

@@ -79,11 +79,13 @@ jobs:
       - name: Mutation check (chapter 5, generic)
         run: uv run python probe_mutations.py
 
-      # Chapter 13's ten. Two survived the first run and neither was a gap in
-      # the code, both were gaps in what had been measured: a byte ceiling
-      # that only failed between two files, not within one, and a dead
-      # branch (`REMOVAL_NOTICE if had_content else None`) that mutation
-      # testing proved could never be `False` -- deleted rather than tested,
-      # chapter 8's shape again.
+      # Chapter 13's thirty-one. It began as ten, and two of those survived
+      # the first run: a byte ceiling that only failed between two files, not
+      # within one, and a dead branch (`REMOVAL_NOTICE if had_content else
+      # None`) that mutation testing proved could never be `False` -- deleted
+      # rather than tested, chapter 8's shape again. The other twenty-one
+      # cover what the first version of the chapter did not have at all:
+      # compaction, sub-agents, `--resume`, and the lines of `__main__.py`
+      # that connect them.
       - name: Mutation check (chapter 13)
         run: uv run python probe_mutations_ch13.py

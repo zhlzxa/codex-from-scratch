@@ -371,12 +371,12 @@ async def test_F10_07_a_hanging_child_is_stopped_and_says_so(tmp_path: Path) -> 
     # one, and a sleeping real tool would mean a real subprocess.
     original = child_tools
 
-    def patched(c: SubAgentContext) -> Any:
+    def patched(c: SubAgentContext, shell: Any = None) -> Any:
         # A schema as well as a handler, because `ToolSet` refuses the pair
         # when they disagree -- including when the disagreement is a test
         # taking a shortcut. Interlude B's invariant found this on its first
         # run: the fake tool went in as a handler alone and was rejected.
-        tools = original(c)
+        tools = original(c, shell)
         return replace(
             tools,
             handlers={**tools.handlers, "sleep": forever},
@@ -445,12 +445,12 @@ async def test_F10_07_cancelling_the_parent_does_not_leave_the_child_running(
     ctx = context_for(tmp_path, model, timeout=60)
     original = child_tools
 
-    def patched(c: SubAgentContext) -> Any:
+    def patched(c: SubAgentContext, shell: Any = None) -> Any:
         # A schema as well as a handler, because `ToolSet` refuses the pair
         # when they disagree -- including when the disagreement is a test
         # taking a shortcut. Interlude B's invariant found this on its first
         # run: the fake tool went in as a handler alone and was rejected.
-        tools = original(c)
+        tools = original(c, shell)
         return replace(
             tools,
             handlers={**tools.handlers, "sleep": slow},
@@ -702,8 +702,8 @@ async def test_F10_10_a_child_whose_own_tool_was_cancelled_is_not_an_answer(
 
     original = child_tools
 
-    def patched(c: SubAgentContext) -> Any:
-        tools = original(c)
+    def patched(c: SubAgentContext, shell: Any = None) -> Any:
+        tools = original(c, shell)
         return replace(
             tools,
             handlers={**tools.handlers, "sleep": stopped},

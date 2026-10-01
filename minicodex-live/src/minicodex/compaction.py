@@ -41,6 +41,7 @@ from typing import Any
 from minicodex import compaction_prompt
 from minicodex.history import (
     AssistantMessage,
+    DeveloperNote,
     History,
     HistoryItem,
     SystemNote,
@@ -209,7 +210,28 @@ def render_transcript(items: Sequence[HistoryItem]) -> str:
                 lines.append(f"ASSISTANT CALLS {call.name}({call.raw_arguments})")
         elif isinstance(item, ToolResult):
             lines.append(f"RESULT OF {item.name}:\n{item.content}")
+        # A `DeveloperNote` is left out on purpose.  AGENTS.md is not something
+        # that *happened* in the conversation, so it is not summarised; it is
+        # carried across the cut whole (`carried_notes`).
     return "\n".join(lines)
+
+
+def carried_notes(dropped: Sequence[HistoryItem]) -> list[HistoryItem]:
+    """What a person wrote, which the cut must not take with it.
+
+    Chapter 13 added a new kind of history item and this module was not told:
+    the first compaction of a run in any project with an AGENTS.md raised
+    `AssertionError: unreplayable item`.  Teaching `_replay` the new type is
+    not enough.  The watcher that injects AGENTS.md speaks once and is then
+    silent until the file or the directory changes, so a note that is
+    summarised away is gone for the rest of the run -- nothing says it again.
+
+    All of them, in order, not only the newest.  A later note opens with "the
+    conventions shown earlier no longer apply"; kept in sequence, that still
+    reads correctly.  The price is that these notes are never reclaimed, and
+    it is bounded by `agents_md.MAX_BYTES` per change of directory.
+    """
+    return [item for item in dropped if isinstance(item, DeveloperNote)]
 
 
 def _previous_summary(items: Sequence[HistoryItem]) -> tuple[str | None, int]:
@@ -373,9 +395,15 @@ def plan(
     def _do_nothing(fits: bool) -> Plan:
         return Plan(protected_count, protected_count, current, fits=fits, saving=0)
 
+    def _kept(cut: int) -> list[HistoryItem]:
+        # What survives in front of the summary: the protected prefix, plus
+        # the AGENTS.md notes the cut would otherwise have taken.  Sized here
+        # so that the plan and `compact()` agree on what the result contains.
+        return head + carried_notes(items[protected_count:cut])
+
     for cut in candidates:
         tail = [clip_item(i, max_tokens=max_item_tokens) for i in items[cut:]]
-        size = _size(head, tail, sizer) + summary_budget
+        size = _size(_kept(cut), tail, sizer) + summary_budget
         if size <= budget:
             if size >= current and cut > protected_count:
                 return _do_nothing(fits=current <= budget)
@@ -392,7 +420,7 @@ def plan(
     # `fits=False` lets it decide what, with the numbers in hand.
     cut = candidates[-1]
     tail = [clip_item(i, max_tokens=max_item_tokens) for i in items[cut:]]
-    size = _size(head, tail, sizer) + summary_budget
+    size = _size(_kept(cut), tail, sizer) + summary_budget
     if size >= current and cut > protected_count:
         return _do_nothing(fits=False)
     return Plan(protected_count, cut, size, fits=False, saving=max(current - size, 0))
@@ -427,6 +455,8 @@ def _replay(history: History, items: Sequence[HistoryItem]) -> None:
             history.add_assistant(item.text, item.tool_calls)
         elif isinstance(item, ToolResult):
             history.add_tool_result(item.call_id, item.content)
+        elif isinstance(item, DeveloperNote):
+            history.add_developer_note(item.text)
         else:  # pragma: no cover
             raise AssertionError(f"unreplayable item: {item!r}")
 
@@ -562,6 +592,9 @@ async def compact(
 
     rebuilt = History()
     _replay(rebuilt, items[: the_plan.protected])
+    # Before the summary, not after it: the summary describes work done under
+    # these conventions, so the conventions are read first.
+    _replay(rebuilt, carried_notes(dropped))
     rebuilt.add_system_note(note)
     _replay(rebuilt, [clip_item(i, max_tokens=max_item_tokens) for i in items[the_plan.cut :]])
     return CompactionResult(rebuilt, the_plan, summary, generation, degraded)
