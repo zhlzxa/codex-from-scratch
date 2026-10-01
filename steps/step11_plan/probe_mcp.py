@@ -49,9 +49,19 @@ async def _ask(
         "tools": tools,
         "temperature": 1,
     }
-    resp = await client.post(
-        URL, json=body, headers={"Authorization": f"Bearer {_key()}"}, timeout=90
-    )
+    # A dropped connection is not a measurement.  Without this, one failed TLS
+    # handshake forty requests into `selection` throws the whole section away
+    # -- which happened, twice, on the machine these numbers come from.
+    for attempt in range(8):
+        try:
+            resp = await client.post(
+                URL, json=body, headers={"Authorization": f"Bearer {_key()}"}, timeout=90
+            )
+            break
+        except httpx.TransportError:
+            if attempt == 7:
+                raise
+            await asyncio.sleep(2)
     if resp.status_code != 200:
         return [{"__http__": resp.status_code, "__body__": resp.text}]
     message = resp.json()["choices"][0]["message"]

@@ -38,10 +38,10 @@ uv run minicodex ask "search my notes for the one about meetings" \
 | `src/minicodex/registry.py` | `McpRegistry` — namespacing, staged schema exposure, `tool_search`, result normalisation, remote `Footprint`s, elicitation routed to chapter 5's approver |
 | `src/minicodex/__main__.py` | `--mcp CONFIG`: start the servers, merge the tools, shut the servers down |
 | `mcp_servers/` | two real MCP servers, ours, each able to fail on request |
-| `tests/test_faults_ch09.py` | 43 tests, against real MCP servers, none networked |
+| `tests/test_faults_ch09.py` | 47 tests, against real MCP servers, none networked |
 | `mcp_servers/*.py` | two real servers built on the SDK, each with switches that make it misbehave on cue |
 | `probe_mcp.py` | the measurements: token cost, provider name rules, tool selection, round trips |
-| `probe_mutations_ch09.py` | 12 one-line mutations that must turn the suite red |
+| `probe_mutations_ch09.py` | 14 one-line mutations that must turn the suite red |
 
 ## Configuration
 
@@ -67,7 +67,7 @@ measured.
 
 **Schema cost.** Sixty realistic tool schemas are 8187 tokens, 99.6% of a
 short request, re-sent on every turn. The same sixty as a name-plus-one-line
-index: 1399 tokens, 19%.
+index: 1206 tokens, 17%.
 
 **Whether hiding them helps.** It does not:
 
@@ -115,3 +115,7 @@ scheduler already cost what code mode was meant to save.
   the user wrote, not from anything the model said. Their *tools* are called
   by the model, and those results pass through `normalise()`; the sandbox
   modes of chapter 5 do not reach into another process.
+- **A restarted server cannot add tools to a running session.** The loop's
+  handler table is built once; a tool that first appears after a restart is
+  withheld and named in the restart report, rather than shown to the model
+  with nothing behind it.

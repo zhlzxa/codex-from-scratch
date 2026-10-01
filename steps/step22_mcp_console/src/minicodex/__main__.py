@@ -754,12 +754,15 @@ def main(argv: list[str] | None = None) -> int:
             rules=RuleStore(Path(DEFAULT_RULES_PATH)),
             approver=AllowAll() if args.yes else CliApprover(),
         )
-        try:
-            configs_ok = args.mcp is None or load_config(args.mcp)
-        except (OSError, ValueError, McpError) as exc:
-            print(f"--mcp: {exc}", file=sys.stderr)
-            return 1
-        del configs_ok
+        if args.mcp is not None:
+            # Read once here, before anything is started, so that a typo in
+            # the file is one line on stderr rather than a traceback from
+            # inside the event loop.
+            try:
+                load_config(args.mcp)
+            except (OSError, ValueError, McpError) as exc:
+                print(f"--mcp: {exc}", file=sys.stderr)
+                return 1
         memory = None
         if args.memory:
             try:
