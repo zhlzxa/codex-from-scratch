@@ -478,19 +478,30 @@ def test_the_plan_is_not_in_the_history_so_compaction_cannot_delete_it() -> None
     """Measured: a history whose only record of the plan is the `update_plan`
     call loses it entirely at the first compaction -- 20 items to 5, and the
     call is in the dropped region. The plan survives because it is an object
-    the run holds, not a message."""
+    the run holds, not a message.
+
+    The first version of this test built a history with no `update_plan` call
+    in it and a plan object nothing ever touched, then asserted the object was
+    still there -- true of any object. This one puts the call in the history
+    the way a real run does, checks that compaction really removes it, and
+    checks that the stop question can still be asked afterwards.
+    """
+    from minicodex.agent_types import ToolCall
+
     plan = TaskPlan()
-    plan.steps = (PlanStep("add divide", "in_progress"),)
+    planned = steps(("add divide", "in_progress"), ("update README", "pending"))
 
     history = History()
     history.add_system_note("You are a coding agent.")
     history.add_user("bring the calculator up to scratch")
+    plan_call = ToolCall("call_1", "update_plan", {"plan": planned}, json.dumps({"plan": planned}))
+    history.add_assistant("Here is the plan.", (plan_call,))
+    history.add_tool_result("call_1", asyncio.run(update_plan(plan, {"plan": planned})))
     for index in range(2, 8):
-        from minicodex.agent_types import ToolCall
-
         read = ToolCall(f"call_{index}", "read_file", {"path": "calc.py"}, "{}")
         history.add_assistant("", (read,))
         history.add_tool_result(f"call_{index}", "x" * 4000)
+    assert "update README" in json.dumps(history.to_wire("chat_completions"))
 
     async def summarise(_request: SummaryRequest) -> str:
         return "## Done\n- work happened"
@@ -498,8 +509,11 @@ def test_the_plan_is_not_in_the_history_so_compaction_cannot_delete_it() -> None
     result = asyncio.run(run_compaction(history, summarise=summarise, budget=1200, sizer=Sizer()))
 
     assert result.plan.drops > 0
-    assert len(result.history.items) < len(history.items)
-    assert plan.outstanding()  # untouched by any of that
+    # The history has forgotten the plan entirely...
+    assert "update README" not in json.dumps(result.history.to_wire("chat_completions"))
+    # ...and the loop can still ask what is left.
+    note = unfinished_note(plan)()
+    assert note is not None and "[ ] update README" in note
 
 
 # ---------------------------------------------------------------------------
@@ -527,8 +541,7 @@ def test_the_allowlist_still_keeps_the_key_out() -> None:
     assert "OPENAI_API_KEY" not in session.env
 
 
-def test_the_plan_is_reported_even_when_the_model_does_not_mention_it(tmp_path: Path) -> None:
-    del tmp_path
+def test_a_plan_describes_and_renders_itself() -> None:
     plan = TaskPlan()
     plan.steps = (PlanStep("a", "completed"), PlanStep("b", "pending"))
     assert plan.describe() == "plan: 1/2 step(s) completed, 0 update(s)"
@@ -561,3 +574,299 @@ def test_the_prompt_paragraph_only_appears_when_the_tool_does() -> None:
     # Volatile last: the permission block is the part `request_permissions`
     # rewrites mid-session, so it stays at the end (F13-07).
     assert with_tool.index(PLAN_INSTRUCTIONS) < with_tool.index("sandbox_mode")
+
+
+def test_watching_keeps_the_exception_for_deferred_tools() -> None:
+    """`watching()` rebuilds the `ToolSet`, so everything the old one carried
+    has to be carried across by hand. Dropping `callable_without_schema` left
+    every test green -- and with sixty MCP tools configured it is a program
+    that refuses to start, because a deferred tool is a handler with no schema
+    (interlude B). Found by mutation."""
+
+    async def handler(_args: dict[str, Any]) -> str:
+        return "ok"
+
+    schema = {"type": "function", "function": {"name": "shown", "parameters": {}}}
+    tools = ToolSet(
+        handlers={"shown": handler, "hidden": handler},
+        schemas=[schema],
+        callable_without_schema=frozenset({"hidden"}),
+    )
+
+    watched = watching(tools, TaskPlan())
+
+    assert watched.callable_without_schema == {"hidden"}
+    assert watched.schemas is tools.schemas  # the registry's live list, not a copy
+
+
+@pytest.mark.asyncio
+async def test_F11_08_a_nudge_is_written_to_the_transcript(tmp_path: Path) -> None:
+    """The nudge is the one message in a run that neither the user nor the
+    model wrote. Without a record of it, a transcript shows a model that
+    stopped and then, for no visible reason, carried on."""
+    from minicodex.recorder import Recorder
+
+    plan = TaskPlan()
+    await call(plan, ("a", "pending"))
+    recorder = Recorder(tmp_path / "rec.jsonl")
+    agent = Agent(
+        ScriptedModel(["stopping"]),
+        {},
+        max_turns=6,
+        recorder=recorder,
+        on_stop=unfinished_note(plan),
+    )
+    await agent.run("do a")
+
+    assert '"nudge"' in recorder.path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_F11_07_a_run_that_was_cut_off_says_so_in_its_session_file(tmp_path: Path) -> None:
+    """A session that ended because the budget ended has to be tellable apart,
+    afterwards, from one that ended because the work did."""
+    from minicodex.rollout import RolloutWriter, SessionMeta, read_rollout
+
+    async def tool(_args: dict[str, Any]) -> str:
+        return "done"
+
+    writer = RolloutWriter(tmp_path / "s.jsonl", SessionMeta(session_id="s", created=0.0))
+    try:
+        agent = Agent(ScriptedModel([[("c1", "t", {})]]), {"t": tool}, max_turns=2, rollout=writer)
+        await agent.run("go")
+    finally:
+        writer.release()
+
+    marks = [mark["mark"] for mark in read_rollout(tmp_path / "s.jsonl").marks]
+    assert "budget_exhausted" in marks
+
+
+# ---------------------------------------------------------------------------
+# found by the resume test below: session ids were not unique within a process
+# ---------------------------------------------------------------------------
+
+
+def test_two_sessions_started_in_the_same_second_get_different_ids() -> None:
+    from minicodex.rollout import new_session_id
+
+    issued = [new_session_id() for _ in range(5)]  # far faster than one a second
+    assert len(set(issued)) == 5
+    # Sessions are listed by sorting *file names*, so that is what has to
+    # come out in creation order -- `-2.jsonl` would sort before `.jsonl`.
+    names = [f"{session_id}.jsonl" for session_id in issued]
+    assert names == sorted(names), "listing a directory should still list a history"
+
+
+@pytest.mark.asyncio
+async def test_two_sub_agents_in_the_same_second_get_a_file_each(tmp_path: Path) -> None:
+    """Second-plus-pid was unique while one process meant one session. Chapter
+    10 ended that, and this function was not looked at again: two children that
+    finished inside one second wrote two sessions into one file, and a child
+    spawned in the second its parent started hit the parent's own lock."""
+    from minicodex.agent import Wiring
+    from minicodex.approval import AllowAll
+    from minicodex.composition import sub_context
+    from minicodex.rollout import RolloutWriter, SessionMeta, new_session_id, rollout_path
+    from minicodex.subagent import TaskSpec, run_task
+
+    sessions = tmp_path / "s"
+    parent_id = new_session_id()
+    parent = RolloutWriter(rollout_path(parent_id, sessions), SessionMeta(parent_id, created=0.0))
+    ctx = sub_context(
+        build_model=lambda _schemas: ScriptedModel(["an answer"]),
+        root=tmp_path,
+        session=Session(mode="read-only", approver=AllowAll()),
+        parent_shell=ShellSession(),
+        wiring=Wiring(),
+        sessions_dir=sessions,
+        parent_session_id=parent_id,
+    )
+    try:
+        first = await run_task(TaskSpec("one", expected_output="x"), ctx)
+        second = await run_task(TaskSpec("two", expected_output="x"), ctx)
+    finally:
+        parent.release()
+
+    assert len({parent_id, first.session_id, second.session_id}) == 3
+    assert len(list(sessions.glob("*.jsonl"))) == 3
+
+
+# ---------------------------------------------------------------------------
+# the command line: where the plan is handed to the two places that need it
+# ---------------------------------------------------------------------------
+
+
+def _scripted_cli(
+    monkeypatch: pytest.MonkeyPatch, turns: Sequence[Any]
+) -> list[list[dict[str, Any]]]:
+    """Make every model client the CLI builds replay `turns` instead of
+    calling a server. Everything else in `main()` -- the loop, the tools, the
+    session file -- runs for real. Returns the list the requests are logged to."""
+    from minicodex.model import ChatCompletionsModel
+
+    requests: list[list[dict[str, Any]]] = []
+
+    async def stream(self: Any, messages: Sequence[dict[str, Any]]) -> Any:
+        requests.append([dict(m) for m in messages])
+        turn = turns[min(len(requests) - 1, len(turns) - 1)]
+        if isinstance(turn, str):
+            yield TextDelta(turn)
+        else:
+            for index, (call_id, name, arguments) in enumerate(turn):
+                yield ToolCallDelta(
+                    call_id=call_id, index=index, name=name, arguments=json.dumps(arguments)
+                )
+        yield Completed("stop")
+
+    monkeypatch.setattr(ChatCompletionsModel, "stream", stream)
+    return requests
+
+
+HALF_DONE = steps(("add subtract", "completed"), ("update README", "pending"))
+
+
+def test_the_cli_prints_the_plan_and_asks_before_stopping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The mechanism tests above each build their own `Agent`. This one runs
+    the program, because five lines in `__main__.py` each connect something
+    this chapter built, and each could be deleted with every other test in
+    this file green: the plan handed to the tool, the tool calls reported to
+    the plan, the stop check handed to the loop, the paragraph that gets the
+    tool used at all, and the list printed at the end."""
+    import minicodex.__main__ as cli
+
+    (tmp_path / "calc.py").write_text("x = 1\n", encoding="utf-8")
+    started = steps(("read calc.py", "in_progress"), ("update README", "pending"))
+    read_it = steps(("read calc.py", "completed"), ("update README", "pending"))
+    requests = _scripted_cli(
+        monkeypatch,
+        [
+            [("c1", "update_plan", {"plan": started})],
+            [("c2", "read_file", {"path": "calc.py"})],
+            [("c3", "update_plan", {"plan": read_it})],
+            "that is everything",
+            "really, everything",
+        ],
+    )
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["ask", "go", "--yes", "--session-dir", str(tmp_path / "s")]) == 0
+
+    out = capsys.readouterr().out
+    # The paragraph without which the tool mostly goes unused reached the model.
+    assert PLAN_INSTRUCTIONS in requests[0][0]["content"]
+    # The second update closed a step, which is only accepted if the read in
+    # between was reported to the plan -- and both updates edited the plan the
+    # end of the run prints.
+    assert "[x] read calc.py\n[ ] update README" in out
+    assert "[plan: 1/2 step(s) completed, 2 update(s)]" in out
+    # Five model calls: plan, read, plan, the attempt to stop, and the answer
+    # to the stop check.
+    assert "completed after 5 turn(s)" in out
+
+
+def test_the_cli_counts_a_remote_tool_call_as_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`watching()` has to wrap the table *after* the MCP tools are merged in.
+
+    That ordering lives in one line of `__main__.py`. Wrapped one step earlier,
+    everything works and a remote call silently stops counting: a step whose
+    only evidence is an MCP call can then never be marked completed. Recorded
+    as an open item when this chapter was first written; this is the test that
+    was missing from it.
+    """
+    import sys
+
+    import minicodex.__main__ as cli
+
+    server = Path(__file__).resolve().parent.parent / "mcp_servers" / "notes_server.py"
+    config = tmp_path / "mcp.json"
+    config.write_text(
+        json.dumps({"servers": {"notes": {"command": [sys.executable, str(server)]}}}),
+        encoding="utf-8",
+    )
+    started = steps(("look in the notes", "in_progress"), ("write it up", "pending"))
+    looked = steps(("look in the notes", "completed"), ("write it up", "pending"))
+    _scripted_cli(
+        monkeypatch,
+        [
+            [("c1", "update_plan", {"plan": started})],
+            [("c2", "mcp__notes__search", {"query": "tool"})],
+            [("c3", "update_plan", {"plan": looked})],
+            "done",
+            "done",
+        ],
+    )
+    monkeypatch.chdir(tmp_path)
+    argv = ["ask", "go", "--yes", "--mcp", str(config), "--session-dir", str(tmp_path / "s")]
+    assert cli.main(argv) == 0
+
+    assert "[x] look in the notes" in capsys.readouterr().out
+
+
+def test_a_resumed_session_still_has_its_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The plan is an object so that compaction cannot delete it. An object
+    does not survive the process either.
+
+    Before `restore_plan`, `--resume` built an empty `TaskPlan`: the model
+    could still read its old plan in the history, and the harness had none --
+    `[plan: none]`, no stop check, and a first update that was not held to the
+    evidence rule because it looked like the first. Found by resuming a
+    session that had a plan and reading the last line.
+    """
+    import minicodex.__main__ as cli
+
+    sessions = str(tmp_path / "s")
+    monkeypatch.chdir(tmp_path)
+    _scripted_cli(monkeypatch, [[("c1", "update_plan", {"plan": HALF_DONE})], "stopping", "stop"])
+    assert cli.main(["ask", "go", "--yes", "--session-dir", sessions]) == 0
+    capsys.readouterr()
+
+    _scripted_cli(monkeypatch, ["nothing more to do", "still nothing"])
+    assert (
+        cli.main(["ask", "carry on", "--yes", "--session-dir", sessions, "--resume", "last"]) == 0
+    )
+
+    out = capsys.readouterr().out
+    assert "[plan: 1/2 step(s) completed, 1 update(s)]" in out
+    assert "[ ] update README" in out
+    assert "completed after 2 turn(s)" in out  # it was asked about the open step
+
+
+def test_restoring_a_plan_replays_only_the_updates_that_were_accepted() -> None:
+    from minicodex.agent_types import ToolCall
+    from minicodex.plan import restore_plan
+
+    def plan_call(call_id: str, *pairs: tuple[str, str]) -> ToolCall:
+        arguments = {"plan": steps(*pairs)}
+        return ToolCall(call_id, "update_plan", arguments, json.dumps(arguments))
+
+    history = History()
+    history.add_user("do it")
+    history.add_assistant("", (plan_call("c1", ("a", "in_progress"), ("b", "pending")),))
+    history.add_tool_result("c1", "Plan updated.\n[>] a\n[ ] b\n2 step(s) to go.")
+    history.add_assistant("", (plan_call("c2", ("a", "completed"), ("b", "in_progress")),))
+    history.add_tool_result("c2", "Error: marking ['a'] completed, but nothing has run ...")
+    read = ToolCall("c3", "read_file", {"path": "x"}, "{}")
+    history.add_assistant("", (read,))
+    history.add_tool_result("c3", "contents")
+
+    plan = TaskPlan()
+    restore_plan(plan, history)
+
+    assert plan.render() == "[>] a\n[ ] b"  # the refused update did not happen
+    assert plan.updates == 1
+    assert plan.work_since_update == 1  # the read after it still counts
+
+
+def test_restoring_from_a_history_with_no_plan_leaves_it_empty() -> None:
+    from minicodex.plan import restore_plan
+
+    history = History()
+    history.add_user("hello")
+    plan = TaskPlan()
+    restore_plan(plan, history)
+    assert plan.steps == () and plan.updates == 0

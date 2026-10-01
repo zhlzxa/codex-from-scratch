@@ -47,7 +47,7 @@ from minicodex.memory_write import (
     run_pipeline,
 )
 from minicodex.model import PROVIDERS, ChatCompletionsModel
-from minicodex.plan import TaskPlan, unfinished_note
+from minicodex.plan import TaskPlan, restore_plan, unfinished_note
 from minicodex.policy import APPROVAL_POLICIES, SANDBOX_MODES
 from minicodex.recorder import Recorder
 from minicodex.registry import (
@@ -261,6 +261,10 @@ async def _ask(
             return 1
         outcome = resume_from_rollout(path, current)
         resume_from = outcome.history
+        # The plan is an object, and this is a new process: put back what the
+        # resumed conversation had agreed on, or the stop check has nothing to
+        # ask about and the run ends `[plan: none]` with steps still open.
+        restore_plan(task_plan, resume_from)
         for line in outcome.notes:
             print(f"[{line}]")
         current = replace(current, forked_from=outcome.meta.session_id)

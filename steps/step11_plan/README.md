@@ -25,25 +25,34 @@ uv run python probe_mutations_ch11.py
 | `src/minicodex/shell.py` | `SYSTEMROOT` added to the environment allowlist |
 | `src/minicodex/__main__.py` | one `TaskPlan` per run; `PLAN_INSTRUCTIONS` in the system message when — and only when — the tool exists; the plan is printed after the answer |
 | `src/minicodex/agent.py` | the last turn no longer runs tool calls, because four budget-exhausted runs in five were delivering an empty string |
-| `tests/test_faults_ch11.py` | 38 tests, F11-01…F11-08 |
+| `tests/test_faults_ch11.py` | 48 tests, F11-01…F11-08, the command-line wiring, resume |
 | `tests/test_schemas.py` | the description snapshot now walks the **assembled** tool set instead of a hand-written list |
 | `probe_plan.py` | the measurements: ten sections, one offline |
-| `probe_mutations_ch11.py` | 21 mutations across five modules |
+| `probe_mutations_ch11.py` | 26 mutations across six modules |
 
 ## What was measured
 
-**A tool being available is not a tool being used.** Three arms, five samples
-each, on a five-requirement task stated as one paragraph rather than as a
-numbered list:
+**A tool being available is not a tool being used — and that is all that was
+shown.** Three arms on a five-requirement task stated as one paragraph rather
+than as a numbered list, measured twice:
 
 ```
-no plan tool    21/30 requirements     3/5 samples complete
-plan, silent    25/30                  3/5      — 2 of 5 samples never called it
-plan, told      30/30                  5/5      — every sample called it
+                first run (5 per arm)    re-measured (15 per arm)    called the tool
+no plan tool        21/30                     71/90                       —
+plan, silent        25/30                     75/90                    4 of 15
+plan, told          30/30                     74/90                   15 of 15
 ```
 
-The middle arm is why a two-arm A/B on availability would have reported "the
-plan tool helps a bit" and been wrong about the mechanism.
+The first run read as "the paragraph is worth nine requirements". With three
+times the samples the arms are indistinguishable: single runs range from 6/6 to
+0/6, so one bad sample moves an arm of five by more than any gap in the first
+column. The paragraph ships because without it there is usually no plan for the
+loop to ask about, not because it raised a score.
+
+**The scorer was wrong twice, both times in the direction of the expected
+result.** First a free point (exit code 0 with the two original tests); then,
+on a terminal that forces colour, *no* run ever counted as green, because the
+pass count was read word by word out of a line full of escape codes.
 
 **The plan does not survive compaction.** Twenty items down to five; the
 `update_plan` call is in the dropped region, no error anywhere:
@@ -95,3 +104,8 @@ in_progress" appears in the tool description and in five system prompts;
   nothing was built here.
 - **`explanation` is not in the schema.** codex has it and it is optional;
   the requirement to say why the plan changed is in the description instead.
+- **A resumed session gets its plan back from its history** (`restore_plan`).
+  If the session was compacted before it stopped, the plan call is gone and
+  nothing is restored.
+- **Session ids are unique within a process from this step on.** Chapter 10's
+  snapshot still has second-plus-pid, which two sub-agents can share.
