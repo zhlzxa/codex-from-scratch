@@ -257,6 +257,9 @@ Twelve faults beyond the thirteen planned. Five of them are in the verification 
 > a 4-arm A/B with a placebo (`probe_resume.py`), 5-19 samples per arm.
 > **The listed crash fault reproduced 20 times out of 20; the listed torn-line
 > fault could not be reproduced at all.**
+> Re-measured 2026-10-01 on Windows and on Linux: 19/20 and 20/20; no torn
+> line on either; two writers lose a third of the records on Windows and none
+> on Linux.
 
 | ID | Fault | Found | Root cause and fix |
 |---|---|---|---|
@@ -279,6 +282,11 @@ Faults found that were not on the list:
 | **A compacted session resumes at its pre-compaction size.** An append-only file cannot express "replaced", so replaying it undoes chapter 6 on every resume — and the symptom is "slower and more expensive", not "broken" | 🟠 | A `compacted` marker followed by the new baseline; the loader restarts its item list at the last marker. The original turns stay in the file, unread by the loader and available to a human — the record and the state are the same file read two ways |
 | Two different error messages for one condition ("first record is not a session header" / "no session header") | ⚪ | Caught immediately by `pytest.raises(match=...)`. One condition, one string, one constant |
 | A docstring that was measured sitting next to one that was not, with nothing to tell them apart | 🟣 | The unmeasured branch of `interrupted_note` says so in a comment. Measured text lends its credibility to whatever is next to it |
+| **The compaction marker was written before the baseline it announced.** A kill after the marker and before the last baseline item left a file saying "forget everything before me" in front of half a replacement: 8 items loaded as 1 system note, the user's question gone, `dropped == 0`, so not even the interrupted note was added. The one position in the file from which a prefix was not a recoverable session. Found while rewriting the chapter, by asking of every position "what if the file ends here" -- 20 real kills never landed in that window | 🟣 | Two markers, `compacting` and `compacted`, with the baseline between them; an unfinished baseline is the part discarded. Files with the old single marker still load |
+| **"Two writers lose records" is the Windows result, asserted as a universal one.** On Linux `O_APPEND` loses nothing (8000/8000) and the test `len(lines) < 8000` fails -- on the platform this project's own CI file names. Found the first time the suite ran on Linux | 🔴 | The test asserts what holds on both: the two writers' records end up interleaved in one file. The lock is justified either way |
+| **The F07-06 test was vacuous, twice.** `sleep 5; touch marker` checked after one second; then `sleep 1; touch marker` checked after two, still green with the kill deleted, because closing the transport kills the shell and a dead shell never reaches its `touch`. The test is skipped on Windows, so on the machine it was written on it had never executed | ⚪ | Mutation run on Linux. The marker is written by a grandchild, and the test waits longer than the command sleeps |
+| Nothing tested that a resumed run does not add the instructions a second time | ⚪ | Mutation run; a test |
+| Two names nothing used: `TurnInterrupted` ("raised nowhere and caught nowhere") and `items_of` | 🟣 | Deleted |
 
 ## Chapter 8 · Concurrent tools ✅
 

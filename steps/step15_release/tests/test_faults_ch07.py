@@ -11,6 +11,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import time
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,6 @@ from minicodex.rollout import (
     fork,
     interrupted_note,
     list_sessions,
-    new_session_id,
     read_rollout,
     resolve,
 )
@@ -404,22 +404,34 @@ async def test_F07_05_a_resumed_run_carries_the_note_into_the_request(
     not hasattr(__import__("os"), "killpg"),
     reason="F02-10: killpg is POSIX-only and the Windows equivalent is not built",
 )
-async def test_F07_06_cancelling_a_command_kills_it() -> None:
-    """A cancelled `run_shell` does not leave the command running.
+async def test_F07_06_cancelling_a_command_kills_it(tmp_path: Path) -> None:
+    """A cancelled `run_shell` does not leave the command's children running.
 
     Chapter 2 killed the process group on timeout, which was the only way out
     of that function at the time.  Cancellation is a second way out.
+
+    The marker is written by a *grandchild* -- a shell started by the shell --
+    and the test waits longer than the command sleeps.  Both halves matter and
+    both were wrong at first, found by deleting the kill and watching nothing
+    go red, twice:
+
+    * `sleep 5; touch marker`, checked after one second: the test looked four
+      seconds before a surviving command would have written anything.
+    * `sleep 1; touch marker`, checked after two: still green, because closing
+      the subprocess transport kills the *shell*, and a dead shell never
+      reaches its `touch`.  The orphan that survives is the shell's child, so
+      that is who has to be holding the marker.
     """
     from minicodex.shell import ShellSession
 
     session = ShellSession(timeout=30)
-    marker = Path(".") / f"f07_06_{new_session_id()}.marker"
-    task = asyncio.ensure_future(session.run(f"sleep 5; touch {marker}"))
-    await asyncio.sleep(0.4)
+    marker = tmp_path / "f07_06.marker"
+    task = asyncio.ensure_future(session.run(f"sh -c 'sleep 1; touch {marker}'; true"))
+    await asyncio.sleep(0.3)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(2.0)
     assert not marker.exists(), "the command outlived the interrupt"
 
 
@@ -490,38 +502,56 @@ def test_F07_08_the_lock_is_released_on_close(tmp_path: Path) -> None:
     RolloutWriter(path, meta("s2")).release()
 
 
-def test_F07_08_two_real_processes_do_corrupt_a_shared_file(tmp_path: Path) -> None:
+def test_F07_08_two_real_processes_leave_one_file_holding_two_sessions(tmp_path: Path) -> None:
     """The measurement the lock exists for, at a size that runs in CI.
 
-    Not a test of minicodex: a test of the assumption underneath it.  If
-    concurrent appends were safe, the lock would be ceremony.
+    Not a test of minicodex: a test of the assumption underneath it.  What two
+    writers do to one file depends on the platform, and it was measured on both
+    (`probe_rollout.py`):
+
+        Windows/NTFS   8000 written, about 5400 on disk -- each process keeps
+                       its own offset and they overwrite each other's records
+        Linux          8000 written, 8000 on disk -- O_APPEND makes each small
+                       write atomic, so nothing is lost
+
+    The first version of this test asserted `len(lines) < 8000`.  That is the
+    Windows result, the machine it was written on; this project's CI runs on
+    Linux, where the assertion fails.  A test of an assumption has to state the
+    part of the assumption that is true everywhere, and that part is the one a
+    session file cares about: the records of two unrelated writers end up
+    interleaved in one file, and no reader can take them apart again.
     """
     path = tmp_path / "shared.jsonl"
     child = (
-        "import json,sys\n"
+        "import json,sys,time\n"
         "tag=sys.argv[2]\n"
         "fh=open(sys.argv[1],'a',encoding='utf-8')\n"
+        # Both children wait for the same wall-clock instant, so that they are
+        # actually writing at the same time rather than one after the other.
+        "time.sleep(max(0.0,float(sys.argv[3])-time.time()))\n"
         "for i in range(4000):\n"
         "    fh.write(json.dumps({'w':tag,'n':i,'p':'x'*200})+'\\n'); fh.flush()\n"
     )
-    procs = [subprocess.Popen([sys.executable, "-c", child, str(path), tag]) for tag in ("A", "B")]
+    start = str(time.time() + 1.0)
+    procs = [
+        subprocess.Popen([sys.executable, "-c", child, str(path), tag, start]) for tag in ("A", "B")
+    ]
     for proc in procs:
         proc.wait(timeout=60)
 
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    writers = set()
-    broken = 0
-    for line in lines:
+    order = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
-            writers.add(json.loads(line)["w"])
+            order.append(json.loads(line)["w"])
         except (json.JSONDecodeError, KeyError):
-            broken += 1
-    # 8000 records were written.  What is on disk is fewer -- the two writers
-    # keep their own file offsets and overwrite each other's records -- and it
-    # is a single file containing two unrelated sessions.  Both are unfixable
-    # after the fact, which is why the writer refuses to be the second one.
-    assert writers == {"A", "B"}
-    assert len(lines) < 8000, "concurrent appends lost nothing; the lock would be ceremony"
+            continue
+    switches = sum(1 for i in range(1, len(order)) if order[i] != order[i - 1])
+    assert set(order) == {"A", "B"}
+    assert len(order) <= 8000
+    # One switch would mean A wrote everything and then B did: two sessions end
+    # to end, which a reader could still split.  More than that is a single
+    # file whose lines alternate between two conversations.
+    assert switches > 1, "the writers did not overlap; the lock would be ceremony"
 
 
 # ---------------------------------------------------------------------------
@@ -710,13 +740,86 @@ async def test_a_resumed_run_appends_to_a_new_file(tmp_path: Path) -> None:
     ]
 
 
-async def test_compaction_writes_a_new_baseline(tmp_path: Path) -> None:
+async def test_a_resumed_run_does_not_repeat_the_instructions() -> None:
+    """The system message is already in the history that came off the disk.
+
+    Adding this run's instructions again would put two permission statements
+    at the front of the request -- and after `--sandbox-mode` changed, two that
+    disagree.  Found by a mutation that added them back and turned nothing red.
+    """
+    restored = History()
+    restored.add_system_note("instructions as recorded")
+    restored.add_user("go")
+    restored.add_assistant("done")
+
+    model = ScriptedModel(["ok"])
+    agent = Agent(model, {}, instructions="instructions for this run", resume_from=restored)
+    await agent.run("carry on")
+
+    system = [m["content"] for m in model.sent[0] if m["role"] == "system"]
+    assert "instructions as recorded" in system
+    assert "instructions for this run" not in system
+
+
+def test_compaction_writes_a_new_baseline(tmp_path: Path) -> None:
     """A compacted session resumes at its compacted size.
 
-    The file is append-only, so a replaced history is expressed by a marker and
-    a new baseline after it.  Without the marker, resuming replays the turns
-    compaction removed and the session comes back at the size that made it
-    compact.
+    The file is append-only, so a replaced history is expressed by two markers
+    with the new baseline between them.  Without them, resuming replays the
+    turns compaction removed and the session comes back at the size that made
+    it compact.
+    """
+    path = tmp_path / "s.jsonl"
+    with RolloutWriter(path, meta()) as writer:
+        history = History(observer=writer.append)
+        history.add_user("go")
+        history.add_assistant("a", [call("call_1")])
+        history.add_tool_result("call_1", "x" * 100)
+        writer.mark("compacting", generation=1, replaced=2)
+        writer.append(UserMessage("go"))
+        writer.append(SystemNote("[compacted transcript | generation 1]"))
+        writer.mark("compacted", generation=1, replaced=2)
+
+    loaded = read_rollout(path)
+    assert [type(i).__name__ for i in loaded.items] == ["UserMessage", "SystemNote"]
+    assert [m["mark"] for m in loaded.marks] == ["compacting", "compacted"]
+
+
+def test_a_kill_inside_the_new_baseline_keeps_what_it_was_replacing(tmp_path: Path) -> None:
+    """Found by reading the file format as "what if it ends *here*", not by a crash.
+
+    The first version wrote one "compacted" marker and then the baseline.  A
+    kill between the marker and the last baseline item left a file whose marker
+    said "forget everything before me" in front of half a replacement: it
+    loaded as one system note, the user's question was gone, and `dropped` was
+    0 -- so not even the "incomplete messages were discarded" note was added.
+    Every other position in the file recovered; this one lost the session.
+
+    With two markers the unfinished replacement is the part that is thrown
+    away, and the session comes back un-compacted.  It will compact again,
+    which costs a model call.  The alternative cost the conversation.
+    """
+    path = tmp_path / "s.jsonl"
+    with RolloutWriter(path, meta()) as writer:
+        history = History(observer=writer.append)
+        for item in three_turn_history().items:
+            _replay(history, item)
+        writer.mark("compacting", generation=1, replaced=4)
+        writer.append(SystemNote("You are a coding agent."))
+        # ...and here the process dies, before the rest of the baseline.
+
+    loaded = read_rollout(path)
+    restored, dropped = loaded.history()
+    assert dropped == 0
+    assert restored.to_wire() == three_turn_history().to_wire()
+
+
+def test_a_file_with_the_old_single_marker_still_loads(tmp_path: Path) -> None:
+    """F07-09 again, one layer up: the marker scheme changed, old files did not.
+
+    A lone "compacted" with no "compacting" before it is a file written by the
+    first version of this chapter, where the marker came *ahead* of the
+    baseline.  It is read the way it was written.
     """
     path = tmp_path / "s.jsonl"
     with RolloutWriter(path, meta()) as writer:
@@ -728,9 +831,45 @@ async def test_compaction_writes_a_new_baseline(tmp_path: Path) -> None:
         writer.append(UserMessage("go"))
         writer.append(SystemNote("[compacted transcript | generation 1]"))
 
+    assert [type(i).__name__ for i in read_rollout(path).items] == ["UserMessage", "SystemNote"]
+
+
+async def test_an_agent_that_compacts_can_be_resumed_from_its_file(tmp_path: Path) -> None:
+    """The whole seam, end to end: what is on disk is what was in memory.
+
+    The two tests above write the markers by hand.  This one lets the agent
+    write them, so swapping the order back -- marker first, baseline second --
+    turns it red.
+    """
+    path = tmp_path / "s.jsonl"
+    model = ScriptedModel(
+        [[delta(f"call_{n}", 0, "big")] for n in range(3)] + ["done"],
+    )
+
+    async def big(args: dict[str, Any]) -> str:
+        return "o" * 4000
+
+    async def summarise(request: Any) -> str:
+        return "## Done\nsome work\n"
+
+    with RolloutWriter(path, meta()) as writer:
+        agent = Agent(
+            model,
+            {"big": big},
+            rollout=writer,
+            context_window=1500,
+            summariser=summarise,
+            max_turns=6,
+        )
+        result = await agent.run("go")
+
+    assert result.compactions, "the window was small enough that this must compact"
     loaded = read_rollout(path)
-    assert len(loaded.items) == 2
-    assert any(m["mark"] == "compacted" for m in loaded.marks)
+    kinds = [m["mark"] for m in loaded.marks]
+    assert kinds == ["compacting", "compacted"] * len(result.compactions)
+    restored, dropped = loaded.history()
+    assert dropped == 0
+    assert restored.to_wire() == result.history.to_wire()
 
 
 def _replay(history: History, item: Any) -> None:
@@ -749,14 +888,15 @@ def test_F07_05_the_wording_is_pinned() -> None:
 
     Chapter 3 learned this the expensive way (F03-10): one word changed in a
     description flipped both providers 3/3 to 0/3, and nothing noticed.  Here
-    the wording moved a model from 0/13 to 11/11.  A snapshot does not stop
+    the wording moved a model from 0/13 to 11/11 (and, measured again two months
+    later, from 0/10 to 9/10).  A snapshot does not stop
     anyone editing it -- it stops them editing it *by accident*, and it puts
     the number they have to beat in the failure message.
     """
     assert interrupted_note(2) == (
         "The previous session ended without finishing its last turn. "
         "2 message(s) were discarded because they were incomplete."
-    ), "measured at 11/11 (probe_resume.py); re-measure before changing it"
+    ), "measured at 11/11 and again at 9/10 (probe_resume.py); re-measure before changing it"
 
 
 def test_F07_02_a_session_with_no_complete_turn_recovers_to_nothing(tmp_path: Path) -> None:

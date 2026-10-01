@@ -21,9 +21,11 @@ Three properties, each of them the answer to something measured:
   written and honestly labelled unmeasured.
 
 * **One writer.**  Two processes appending to one file is the configuration
-  that *did* corrupt it in measurement -- 245 broken lines out of 131,811, and
-  a file whose records belong to two different sessions.  Refused with a lock
-  file rather than tolerated.
+  that *did* corrupt it in measurement (`probe_rollout.py`): two processes
+  appending 4,000 records each.  On Windows about a third of the records
+  were overwritten and gone; on Linux none were lost.  On both, the file
+  ended up holding two different sessions' records interleaved.  Refused
+  with a lock file rather than tolerated.
 
 `History` is not asked to load itself.  It is rebuilt through its own
 `add_*` methods, so a rollout that ends in the middle of a turn cannot become
@@ -36,7 +38,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -398,6 +400,9 @@ def read_rollout(path: Path) -> Rollout:
     items: list[HistoryItem] = []
     marks: list[dict[str, Any]] = []
     truncated_at: int | None = None
+    # Index of the first item of a compaction baseline that is still being
+    # written, or None when no compaction is in progress.
+    baseline_from: int | None = None
 
     with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
         for lineno, line in enumerate(fh, start=1):
@@ -419,18 +424,40 @@ def read_rollout(path: Path) -> Rollout:
                 raise RolloutError(_NO_HEADER.format(path=path))
             if record.get("type") == "mark":
                 marks.append(record)
-                if record.get("mark") == "compacted":
-                    # Everything before this point was replaced in memory by the
-                    # summary that follows it.  Replaying it would undo chapter
-                    # 6 on every resume -- the session would come back at the
-                    # size that made it compact in the first place.
-                    items.clear()
+                kind = record.get("mark")
+                if kind == "compacting":
+                    # A compaction is about to write its replacement history.
+                    # Remember where the replacement starts; nothing is
+                    # discarded until the matching "compacted" says the
+                    # replacement is all there.
+                    baseline_from = len(items)
+                elif kind == "compacted":
+                    if baseline_from is None:
+                        # A file written before there were two markers: a
+                        # single one, placed *ahead* of the baseline.
+                        items.clear()
+                    else:
+                        # Everything before the baseline was replaced in memory
+                        # by the summary inside it.  Replaying it would undo the
+                        # compaction on every resume -- the session would come
+                        # back at the size that made it compact in the first
+                        # place.
+                        del items[:baseline_from]
+                        baseline_from = None
                 continue
             try:
                 items.append(_load_item(_migrate(record, meta.version)))
             except (RolloutError, KeyError):
                 truncated_at = lineno
                 break
+
+    if baseline_from is not None:
+        # The file ends inside a compaction: "compacting" with no "compacted".
+        # The replacement was never finished, so *it* is the part to discard --
+        # what it was replacing is still here, whole.  With a single marker
+        # written first, this same file loaded as one system note and nothing
+        # else, with nothing reported as dropped.
+        del items[baseline_from:]
 
     if meta is None:
         raise RolloutError(_NO_HEADER.format(path=path))
@@ -519,11 +546,12 @@ def interrupted_note(dropped: int | None = None) -> str:
     that vanished, asking what it does first when told to carry on
     (`probe_resume.py`, "verify" = reads the file before touching it):
 
-        no note at all                              0/13
-        "resumed from a file on disk" (placebo)      0/5
-        this text, first version (4 sentences)      10/19
-        one sentence, no count                      10/11
-        one sentence + the count  <- shipped         6/6
+                                                  2026-08   2026-10
+        no note at all                              0/13      0/10
+        "resumed from a file on disk" (placebo)      0/5      0/10
+        this text, first version (4 sentences)      10/19       --
+        one sentence, no count                      10/11      9/10
+        one sentence + the count  <- shipped        11/11      9/10
 
     The placebo arm is what makes the rest mean anything: a system note
     appearing is not the mechanism, the warning is.  And the first version --
@@ -581,7 +609,3 @@ def resolve(reference: str, directory: Path = DEFAULT_DIR) -> Path:
     if candidate.exists():
         return candidate
     raise RolloutError(f"no session {reference!r} (looked in {directory})")
-
-
-def items_of(history: History) -> Sequence[HistoryItem]:
-    return history.items

@@ -387,6 +387,9 @@ def read_rollout(path: Path) -> Rollout:
     items: list[HistoryItem] = []
     marks: list[dict[str, Any]] = []
     truncated_at: int | None = None
+    # Index of the first item of a compaction baseline that is still being
+    # written, or None when no compaction is in progress.
+    baseline_from: int | None = None
 
     with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
         for lineno, line in enumerate(fh, start=1):
@@ -408,18 +411,40 @@ def read_rollout(path: Path) -> Rollout:
                 raise RolloutError(_NO_HEADER.format(path=path))
             if record.get("type") == "mark":
                 marks.append(record)
-                if record.get("mark") == "compacted":
-                    # Everything before this point was replaced in memory by the
-                    # summary that follows it.  Replaying it would undo the
-                    # compaction on every resume -- the session would come back
-                    # at the size that made it compact in the first place.
-                    items.clear()
+                kind = record.get("mark")
+                if kind == "compacting":
+                    # A compaction is about to write its replacement history.
+                    # Remember where the replacement starts; nothing is
+                    # discarded until the matching "compacted" says the
+                    # replacement is all there.
+                    baseline_from = len(items)
+                elif kind == "compacted":
+                    if baseline_from is None:
+                        # A file written before there were two markers: a
+                        # single one, placed *ahead* of the baseline.
+                        items.clear()
+                    else:
+                        # Everything before the baseline was replaced in memory
+                        # by the summary inside it.  Replaying it would undo the
+                        # compaction on every resume -- the session would come
+                        # back at the size that made it compact in the first
+                        # place.
+                        del items[:baseline_from]
+                        baseline_from = None
                 continue
             try:
                 items.append(_load_item(_migrate(record, meta.version)))
             except (RolloutError, KeyError):
                 truncated_at = lineno
                 break
+
+    if baseline_from is not None:
+        # The file ends inside a compaction: "compacting" with no "compacted".
+        # The replacement was never finished, so *it* is the part to discard --
+        # what it was replacing is still here, whole.  With a single marker
+        # written first, this same file loaded as one system note and nothing
+        # else, with nothing reported as dropped.
+        del items[baseline_from:]
 
     if meta is None:
         raise RolloutError(_NO_HEADER.format(path=path))
