@@ -127,11 +127,20 @@ async def _ask(
         # says nothing is a program that looks hung, and the measured wait a
         # real provider asked for was 46 seconds.
         announce=print,
-        # The summariser shares the client, and therefore the provider and the
-        # key, but not the tools: `make_summariser` builds its own history.
-        # Bound below, once `llm` exists -- `replace()` rather than a second
-        # `Wiring`, so there is still exactly one object to pass down.
-        summariser=None,
+        # A client of its own, with no tools.  Two reasons, both found by a
+        # test of this function rather than of the things it calls:
+        #
+        # The summariser used to be attached further down, with `replace()`,
+        # once the agent's own client existed.  By then the `spawn_agent`
+        # handler had been built around *this* object, and `replace()` makes a
+        # new one -- so a sub-agent got a context window and no summariser,
+        # and compaction needs both.  The wiring has to be complete before
+        # anything is handed it.
+        #
+        # And `make_summariser` has said since chapter 6 that the summariser
+        # "must not see the tool schemas".  Handed the agent's client, which
+        # sends its tool list with every request, it always did.
+        summariser=make_summariser(make_model([])) if context_window else None,
     )
     current = SessionMeta(
         session_id=new_session_id(),
@@ -184,9 +193,6 @@ async def _ask(
 
     tools = watching(with_remote_tools(tools, registry), task_plan)
     llm = make_model(tools.schemas)
-    if context_window:
-        wiring = replace(wiring, summariser=make_summariser(llm))
-        sub_ctx = replace(sub_ctx, wiring=wiring)
 
     resume_from = None
     if resume is not None:

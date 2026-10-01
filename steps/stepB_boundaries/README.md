@@ -33,7 +33,7 @@ ok  every module imports alone
 | `src/minicodex/subagent.py` | no longer imports `tools.py`. Takes `build_tools` and `wiring` from its caller |
 | `src/minicodex/registry.py` | `route_footprint` deleted — `ToolSet.plus` routes by ownership |
 | `scripts/check_layers.py` | five architecture rules, in the CI lint step |
-| `tests/test_faults_chB.py` | 22 tests, FB-01…FB-03 |
+| `tests/test_faults_chB.py` | 36 tests, FB-01…FB-03 and the command-line wiring |
 | `probe_boundaries.py` | the measurements: graph, both cycles, four repairs, the drift |
 
 ## What was measured
