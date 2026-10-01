@@ -121,10 +121,10 @@ async def read_file(root: Path, args: dict[str, Any]) -> str:
 async def run_shell(ctx: ToolContext, args: dict[str, Any]) -> str:
     """Run a shell command, if the gate lets it through.
 
-    The gate is first, before the argument is even checked for type, and that
-    order is deliberate: every path from here to a subprocess passes through
-    `gate_command`, and putting anything above it invites a future edit that
-    returns early and skips it.
+    The only thing above the gate is the type check, and all it can do is
+    return an error message.  Everything that can reach a subprocess sits below
+    `gate_command`; keep it that way, because anything that runs before the gate
+    is a way around it.
     """
     command = args.get("command")
     if not isinstance(command, str):

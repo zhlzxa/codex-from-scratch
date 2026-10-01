@@ -171,7 +171,7 @@ class RuleStore:
         return rule
 
     def forget(self, index: int) -> Rule:
-        """Revoke by the number `--list-rules` printed.
+        """Revoke by the number `minicodex rules` printed.
 
         Revocation is not a nicety.  A rule that can only be removed by finding
         and editing a JSON file is a rule that stays.

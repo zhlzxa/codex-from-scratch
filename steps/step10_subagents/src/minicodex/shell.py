@@ -270,4 +270,4 @@ class ShellSession:
 # and leaving it in place would have left a second, shorter route to a
 # subprocess for a future caller to find.  Deleting it is what makes
 # "everything goes through the gate" a fact about the code rather than a
-# convention.  `tests/test_boundaries.py` asserts it stays deleted.
+# convention.  `tests/test_approval.py` asserts it stays deleted.

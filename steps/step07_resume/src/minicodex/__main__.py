@@ -45,10 +45,14 @@ def _instructions(session: Session) -> str:
     """The system message: what the agent is, then what it may currently do.
 
     Permission state goes last, and that is not a layout preference.  It is the
-    only part of this string that changes during a session -- `request_permissions`
-    rewrites it -- and providers cache a prompt by its prefix. Volatile content
-    near the top invalidates the cache on the turn it changes. Chapter 13 has
-    the measurements; the ordering costs nothing to get right now (F13-07).
+    only part of this string that depends on the session's state, and providers
+    cache a prompt by its prefix: volatile content near the top invalidates the
+    cache whenever it changes. Chapter 13 has the measurements; the ordering
+    costs nothing to get right now (F13-07).
+
+    Rendered once, when the run starts.  A later `request_permissions` reports
+    the new state in its tool result, but this message keeps the old one -- a
+    known gap, recorded in FAULTS.md under chapter 5.
     """
     can_request = any(tool["function"]["name"] == "request_permissions" for tool in TOOL_SCHEMAS)
     block = permissions_block(session, can_request=can_request)

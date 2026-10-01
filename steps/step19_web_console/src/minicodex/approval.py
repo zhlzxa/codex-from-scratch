@@ -4,17 +4,16 @@
 agreed.  This module is where they meet a human, and -- more importantly --
 it is the *only* place any of that happens.
 
-That single-entry-point property is the abstraction this chapter pays for, and
-it is the third of the three exceptions from chapter -1: a rule that is not
-enforced in one place is a rule that eight call sites maintain separately.
-`run_shell` and `apply_patch` both need it today; every tool added after this
-chapter will need it too, and the way to make that automatic is to leave no
-second route to the subprocess.
+That single-entry-point property is the abstraction this chapter pays for.
+Chapter 0 listed the cases where a layer earns its keep and said the list
+would grow when a new case turned up; this is one.  "Nothing executes
+unapproved" is a rule, and a rule that is not enforced in one place is a rule
+that every call site maintains separately.  `run_shell` and `apply_patch` both
+need it today; every tool added after this chapter will need it too, and the
+way to make that automatic is to leave no second route to the subprocess.
 
-The other two exceptions apply as well, which is unusual and worth naming:
-the command string is model output crossing a trust boundary (exception 2),
-and "nothing executes unapproved" is an invariant (exception 3).  Three out of
-three is why this is not a premature abstraction at the first call site.
+One of chapter 0's original cases applies as well: the command string is
+model output, and this is where it crosses a trust boundary.
 """
 
 from __future__ import annotations
@@ -310,9 +309,9 @@ def permissions_block(session: Session, *, can_request: bool = True) -> str:
 
     Generated from the same constants the gate uses, never typed out twice.
     Chapter 3 found a defaulted number copied into a description and going
-    stale; a permission state copied into a prompt would go stale the first
-    time `request_permissions` succeeded, and the model would be told it cannot
-    do the thing it just asked for and got.
+    stale; a permission state typed into a prompt by hand would drift from the
+    gate the first time either one changed.  (It is still rendered once per
+    run -- see `_instructions` in `__main__`.)
 
     `can_request` exists because the probe caught this block lying.  The first
     version ended "or call `request_permissions`" unconditionally.  Run against
