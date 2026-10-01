@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import io
 import json
 import threading
 import time
@@ -557,6 +558,42 @@ async def test_F08_05_history_order_follows_submission_not_completion(tmp_path: 
     assert [r.call_id for r in tool_results] == ["call_1", "call_2"]
 
 
+async def test_F08_05_history_order_follows_submission_not_the_batch_plan(tmp_path: Path) -> None:
+    """The test above cannot fail: `asyncio.gather()` hands results back in the
+    order the tasks were given, whichever finished first, so appending them in
+    batch order looks identical.  Found by a mutation that did exactly that.
+
+    The order can only really leak when the plan *reorders* calls.  The model
+    asks for a, b, c; a and b write the same file and c reads another one, so
+    the plan is [[a, c], [b]] -- c runs in the first batch, ahead of b.  The
+    history must still read a, b, c.
+    """
+    (tmp_path / "f.txt").write_text("A = 1\nB = 2\n")
+    (tmp_path / "g.txt").write_text("unrelated\n")
+    calls = [
+        delta(
+            "a",
+            0,
+            "apply_patch",
+            edits=[{"path": "f.txt", "old_text": "A = 1", "new_text": "A = 9"}],
+        ),
+        delta(
+            "b",
+            1,
+            "apply_patch",
+            edits=[{"path": "f.txt", "old_text": "B = 2", "new_text": "B = 9"}],
+        ),
+        delta("c", 2, "read_file", path="g.txt"),
+    ]
+    model = ScriptedModel([calls, "done"])
+    agent = make_agent(model, tmp_path)
+
+    result = await agent.run("go")
+
+    tool_results = [i for i in result.history.items if isinstance(i, ToolResult)]
+    assert [r.call_id for r in tool_results] == ["a", "b", "c"]
+
+
 # ---------------------------------------------------------------------------
 # F08-06  implicit ordering the model assumes but the scheduler does not know
 # ---------------------------------------------------------------------------
@@ -729,3 +766,84 @@ async def test_F08_08_a_concurrent_batch_mate_that_already_finished_keeps_its_re
     outputs = {i.call_id: i.content for i in result.history.items if isinstance(i, ToolResult)}
     assert outputs["c2"] == "finished before the cancel arrived"
     assert "interrupted" in outputs["c1"]
+
+
+# ---------------------------------------------------------------------------
+# not on the list: two calls in one batch that both have to ask the user
+# ---------------------------------------------------------------------------
+
+
+class SlowTyping(io.StringIO):
+    """A terminal whose user takes a moment to answer, like a real one."""
+
+    def readline(self, *args: Any) -> str:
+        time.sleep(0.03)
+        return super().readline(*args)
+
+
+async def test_two_calls_that_both_need_approval_ask_one_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two edits to two different files do not conflict, so they share a batch.
+
+    In a session where editing needs approval, each one asks before it runs --
+    and before `CliApprover` had a lock, both asked at once: two identical
+    prompts on screen before either answer was read, and the answers handed to
+    whichever thread reached `readline()` first.  Measured with the answers
+    "y" then "n": the *second* file was the one edited.  The scheduler was
+    right that the edits do not conflict.  The two questions do -- over the one
+    terminal and the one human reading it.
+    """
+    from minicodex.approval import CliApprover
+
+    (tmp_path / "a.txt").write_text("x\n")
+    (tmp_path / "b.txt").write_text("x\n")
+
+    tracker = PeakTracker()
+    original = CliApprover._ask_blocking
+
+    def tracked(self: Any, request: Any) -> Any:
+        tracker.enter()
+        try:
+            return original(self, request)
+        finally:
+            tracker.exit()
+
+    monkeypatch.setattr(CliApprover, "_ask_blocking", tracked)
+
+    approver = CliApprover(stream_in=SlowTyping("y\nn\n"), stream_out=io.StringIO())
+    session = Session(mode="read-only", policy="on-request", approver=approver)
+    model = ScriptedModel(
+        [
+            [
+                delta(
+                    f"call_{name}",
+                    index,
+                    "apply_patch",
+                    edits=[{"path": name, "old_text": "x", "new_text": "y"}],
+                )
+                for index, name in enumerate(("a.txt", "b.txt"))
+            ],
+            "done",
+        ]
+    )
+    agent = Agent(
+        model,
+        default_tools(root=tmp_path, session=session),
+        footprint_of=functools.partial(footprint_of, root=tmp_path),
+    )
+    plan = batches(
+        [
+            call(f"call_{name}", "apply_patch", edits=[{"path": name}])
+            for name in ("a.txt", "b.txt")
+        ],
+        functools.partial(footprint_of, root=tmp_path),
+    )
+    assert len(plan) == 1, "different files: the scheduler is right to run these together"
+
+    await agent.run("edit both")
+
+    assert tracker.peak == 1, "two approval prompts were waiting on the terminal at once"
+    # The first question shown is the first call's, and "y" was the answer to it.
+    assert (tmp_path / "a.txt").read_text() == "y\n"
+    assert (tmp_path / "b.txt").read_text() == "x\n"

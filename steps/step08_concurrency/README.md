@@ -22,8 +22,9 @@ uv run minicodex ask "read a.py and b.py and summarise both"
 | `src/minicodex/tools.py` | `footprint_of()` — what `read_file`/`apply_patch` touch as resolved paths; everything else is `STATEFUL` |
 | `src/minicodex/agent.py` | the tool-execution loop batches and gathers instead of awaiting one call at a time; a semaphore bounds real concurrency; cancellation answers every call in every batch, not just the current one |
 | `src/minicodex/__main__.py` | binds `footprint_of` to the run's root — the one call site that turns the scheduler on |
-| `tests/test_scheduler.py` | 28 tests: pure scheduling logic, `footprint_of()`, and nine agent-level measurements, one per fault |
-| `probe_scheduler.py` | measures whether F08-01's race needs an artificial delay to reproduce (it does not) |
+| `tests/test_scheduler.py` | pure scheduling logic, `footprint_of()`, agent-level measurements per fault, and the three tests the mutation run asked for |
+| `probe_scheduler.py` | measures whether F08-01's race needs an artificial delay to reproduce (not on Windows; on Linux it does, 4 times in 30) |
+| `src/minicodex/approval.py` | `CliApprover` asks one question at a time — two concurrent edits that both needed approval used to prompt at once |
 
 ## The default is still fully serial
 
@@ -40,17 +41,18 @@ scheduler (`probe_scheduler.py`, 30 trials per configuration):
 
 ```
 === F08-01 / F08-09: does the naive race need a deliberate delay? (n=30) ===
-    read_source delay= 0.000s   edit lost: 30/30
-    read_source delay= 0.001s   edit lost: 30/30
-    read_source delay= 0.050s   edit lost: 30/30
+                                Windows            Linux
+    read_source delay= 0.000s   edit lost: 30/30   26/30
+    read_source delay= 0.001s   edit lost: 30/30   30/30
+    read_source delay= 0.050s   edit lost: 30/30   30/30
 ```
 
 Both calls report `Applied 1 edit(s)`. One of them is lying, and nothing says
-so — the file just quietly has one change in it instead of two. Not "usually
-loses an edit under load": 30/30, with the artificial delay removed entirely.
-The chapter went in assuming this fault would need a widened race window to
-reproduce reliably (F08-09, "only on slow machines"); it did not need one at
-all, at least not for this fault, on this machine.
+so — the file just quietly has one change in it instead of two. The chapter
+went in assuming this fault would need a widened race window to reproduce at
+all (F08-09, "only on slow machines"). It does not — but whether it reproduces
+*every* time without one depends on the machine: 30/30 on Windows, 26/30 on
+Linux. The test keeps its 0.05s delay, and that row is why.
 
 Running the same two edits through `Agent.run()` with the scheduler wired in
 never loses either one: `batches()` puts them in separate batches, and
@@ -74,6 +76,12 @@ since chapter 0, so the coroutine `asyncio.gather()` awaits here never raises
 for a failing tool. Pinned by a test rather than assumed.
 
 ## Deliberately not done
+
+- **The approval prompt for an edit does not name the file.** Two edits to two
+  different files produce two identical prompts ("edit files in <repo>/").
+  They now arrive one at a time, in the order the model issued the calls;
+  before `CliApprover` had a lock they arrived together, and a "y" meant for
+  the first approved the second.
 
 - **No lock-free reader/writer distinction finer than one path.** Two reads
   of the same file could safely overlap and do (`conflicts()` says no); a
