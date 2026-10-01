@@ -14,6 +14,13 @@ next turn provably needs:
     3. decay      -- how many survive after 1, 2, 3, 4, 5 generations
 
     python probe_summary.py [--samples 3] [--model gpt-4o-mini]
+
+The transcript is padded to a realistic size on purpose.  `plan()` refuses to
+compact when the summary would cost more than the region it replaces, and the
+first version of this transcript was small enough to hit that guard once it
+existed: every run then reported "all facts kept" for both prompts, because
+nothing had been compacted at all.  `compacted()` below aborts instead of
+printing a table about a compaction that did not happen.
 """
 
 from __future__ import annotations
@@ -25,7 +32,13 @@ import re
 
 from minicodex import compaction_prompt
 from minicodex.agent_types import ToolCall
-from minicodex.compaction import compact, make_summariser, render_transcript
+from minicodex.compaction import (
+    CompactionResult,
+    SummaryRequest,
+    compact,
+    make_summariser,
+    render_transcript,
+)
 from minicodex.history import History
 from minicodex.model import ChatCompletionsModel
 
@@ -52,7 +65,7 @@ def build_history() -> History:
         (
             "read_file",
             '{"path": "src/net.py"}',
-            "import httpx\n\n\ndef fetch(url):\n    return httpx.get(url)\n",
+            "import httpx\n\n\ndef fetch(url):\n    return httpx.get(url)\n" + NET_PY_REST,
         ),
         (
             "run_shell",
@@ -94,6 +107,28 @@ def build_history() -> History:
     return h
 
 
+# The rest of a plausible src/net.py.  It contains none of the five facts; it
+# is here so the dropped region is big enough to be worth a summary.
+NET_PY_REST = "".join(
+    f"\n\ndef endpoint_{i}(client, payload):\n"
+    f'    """Call service {i} and return the decoded body."""\n'
+    f'    response = client.post("/v1/service/{i}", json=payload, timeout=10)\n'
+    f"    response.raise_for_status()\n"
+    f"    return response.json()\n"
+    for i in range(24)
+)
+
+
+async def compacted(history: History, summariser) -> CompactionResult:
+    result = await compact(history, summarise=summariser, budget=200)
+    if result.plan.drops == 0:
+        raise SystemExit(
+            "nothing was compacted, so there is nothing to measure -- "
+            "the transcript is too small for plan() to consider it worth a summary"
+        )
+    return result
+
+
 def found(summary: str) -> dict[str, bool]:
     return {
         label: any(re.search(p, summary, re.I) for p in patterns)
@@ -102,11 +137,11 @@ def found(summary: str) -> dict[str, bool]:
 
 
 def make_naive_summariser(model):
-    async def summarise(transcript: str, previous: str | None) -> str:
+    async def summarise(request: SummaryRequest) -> str:
         from minicodex.model import Completed, TextDelta
 
         scratch = History()
-        scratch.add_user(f"{transcript}\n\n{NAIVE_PROMPT}")
+        scratch.add_user(f"{request.transcript}\n\n{NAIVE_PROMPT}")
         parts = []
         async for event in model.stream(scratch.to_wire()):
             if isinstance(event, TextDelta):
@@ -166,7 +201,7 @@ async def main() -> int:
         ("structured", make_summariser(llm)),
     ):
         for sample in range(args.samples):
-            result = await compact(history, summarise=summariser, budget=200)
+            result = await compacted(history, summariser)
             hits = found(render_transcript(result.history.items))
             kept[label].append(sum(hits.values()))
             if label == "structured":
@@ -184,7 +219,7 @@ async def main() -> int:
         ("structured", make_summariser(llm)),
     ):
         for sample in range(args.samples):
-            result = await compact(history, summarise=summariser, budget=200)
+            result = await compacted(history, summariser)
             _, calls = await continuation(tooled, result.history)
             redid = any("net.py" in c and "apply_patch" in c for c in calls)
             print(f"{label:<12} {sample:<7} redid={redid!s:<6} {calls[:2]}")
@@ -196,7 +231,7 @@ async def main() -> int:
     summariser = make_summariser(llm)
     current = history
     for generation in range(1, args.generations + 1):
-        result = await compact(current, summarise=summariser, budget=200)
+        result = await compacted(current, summariser)
         hits = found(render_transcript(result.history.items))
         print(
             f"  gen {generation}  {sum(hits.values())}/5  "

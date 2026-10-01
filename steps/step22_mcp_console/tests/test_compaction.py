@@ -126,12 +126,14 @@ async def test_F06_01_rebuilding_an_illegal_cut_raises_locally():
     An orphaned result does not reach a provider and come back as a 400 -- the
     replay refuses it here, naming the id.
     """
+    from minicodex.compaction import _replay
+
     items = history_with(3).items
-    broken = History()
+    assert isinstance(items[3], ToolResult), "index 3 is the cut the server answered 400 to"
     with pytest.raises(HistoryError) as excinfo:
-        broken.add_tool_result(items[3].call_id, "orphan")
-    assert "call_a" not in str(excinfo.value)
+        _replay(History(), items[3:])
     assert "no unanswered call" in str(excinfo.value)
+    assert items[3].call_id in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +325,48 @@ async def test_F06_07_the_agent_feeds_usage_back_into_the_estimate():
     await agent.run("hello")
     assert agent.calibration.calibrated
     assert agent.calibration.ratio > 1
+
+
+async def test_F06_07_the_ratio_is_measured_against_the_uncorrected_estimate():
+    """Found by printing the ratio turn by turn, long after this chapter shipped.
+
+    The agent sized each request with the *corrected* estimate and fed that
+    same number to `Calibration.observe`.  The truth divided by an
+    already-corrected guess is not the correction, it is the correction's
+    error -- so against a server that always charges 1.5x the raw estimate the
+    ratio read 1.50, 1.00, 1.50, 1.00: right on one turn, switched off on the
+    next.  Nothing failed, and the one-turn test above stayed green, because
+    the first observation is the only one made with a ratio of 1.0.
+    """
+    from minicodex.model import ToolCallDelta
+
+    ratios: list[float] = []
+
+    class HalfAgain:
+        tools = ()
+
+        def __init__(self):
+            self.turn = 0
+
+        async def stream(self, messages):
+            self.turn += 1
+            ratios.append(agent.calibration.ratio)
+            if self.turn <= 5:
+                yield ToolCallDelta(f"c{self.turn}", 0, "run_shell", '{"command": "ls"}')
+            else:
+                yield TextDelta("done")
+            yield Usage(int(estimate_messages(messages) * 1.5), 1)
+            yield Completed("stop")
+
+    async def tool(args):
+        return "o" * 400
+
+    agent = Agent(HalfAgain(), {"run_shell": tool})
+    await agent.run("go")
+    assert ratios[0] == 1.0, "nothing has been observed before the first request"
+    assert len(ratios) == 6
+    for ratio in ratios[1:]:
+        assert ratio == pytest.approx(1.5, abs=0.02)
 
 
 # ---------------------------------------------------------------------------

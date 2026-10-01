@@ -139,6 +139,12 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "COMPACT_TO = 0.45",
         "COMPACT_TO = 0.75",
     ),
+    (
+        "agent: calibrate against the corrected estimate",
+        "agent.py",
+        "estimated=self._raw_estimate(messages), actual=turn.usage.prompt_tokens",
+        "estimated=estimated, actual=turn.usage.prompt_tokens",
+    ),
 ]
 
 
