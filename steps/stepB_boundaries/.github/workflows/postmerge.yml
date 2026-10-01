@@ -41,7 +41,7 @@ jobs:
       - name: Mutation check (chapter 9)
         run: uv run python probe_mutations_ch09.py
 
-      # Chapter 10 adds its own thirteen. One of them survived the first run:
+      # Chapter 10 adds its own sixteen. One of them survived the first run:
       # "the child writes into its parent's session file" left every chapter 10
       # test green, because the test asserted "one file exists and its parent
       # field is right" without building a parent writer at all. Reconstructing

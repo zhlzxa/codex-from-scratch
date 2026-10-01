@@ -358,7 +358,11 @@ async def run_task(spec: TaskSpec, ctx: SubAgentContext) -> TaskResult:
         rollout=writer,
     )
 
-    _say(ctx, f"[sub-agent depth {ctx.depth + 1}: {spec.task.splitlines()[0][:70]}]")
+    # The first line of the task, for the terminal.  `split`, not
+    # `splitlines()[0]`: a task that starts with a blank line announced
+    # itself as nothing at all, and an empty one raised IndexError.
+    title = spec.task.strip().split("\n", 1)[0][:70]
+    _say(ctx, f"[sub-agent depth {ctx.depth + 1}: {title}]")
     began = time.monotonic()
     # `ensure_future` + `shield` rather than a bare `wait_for`: `Agent.run`
     # catches `CancelledError` and returns a normal `RunResult`, so a bare

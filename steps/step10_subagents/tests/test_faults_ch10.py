@@ -40,6 +40,7 @@ from minicodex.subagent import (
     TaskResult,
     TaskSpec,
     child_tools,
+    describe_children,
     run_task,
     spawn_agent,
     spawn_spec,
@@ -315,8 +316,13 @@ async def test_F10_06_a_model_that_only_ever_spawns_stops_at_the_limit(tmp_path:
     # model calls for one task -- bounded depth, unbounded width. The shared
     # budget stops the fourth depth-2 child: 8 + 3 * 8 = 32.
     assert calls == 32, calls
-    assert result.outcome in {"ok", "turn_limit"}
-    assert any(child.outcome != "ok" for child in ctx.children) or calls == 32
+    assert result.outcome == "turn_limit"
+    # What ran, in the order it finished: three depth-2 children, then the
+    # depth-1 child that spawned them.  The refusals after that are not in the
+    # list -- nothing ran, so there is nothing to record.  (The line that
+    # stood here before, `assert any(...) or calls == 32`, came straight after
+    # `assert calls == 32` and so could not fail.)
+    assert [(child.outcome, child.turns) for child in ctx.children] == [("turn_limit", 8)] * 4
 
 
 @pytest.mark.asyncio
@@ -643,3 +649,158 @@ def test_F10_12_resume_last_skips_sub_agent_sessions(tmp_path: Path) -> None:
     assert resolve("last", tmp_path).stem == "a"
     # Still reachable by id: excluded from the guess, not from the program.
     assert resolve("c", tmp_path).stem == "c"
+
+
+@pytest.mark.asyncio
+async def test_F10_10_a_child_whose_own_tool_was_cancelled_is_not_an_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one way a child ends `interrupted` while `run_task` itself is not
+    cancelled: a tool inside it raises `CancelledError`.
+
+    `Agent.run` reports that as `stop_reason="interrupted"` with an empty
+    `final_text` -- the same empty string a child that ran out of turns
+    returns. The branch that tells them apart had no test: with it deleted
+    the result became `empty`, whose advice is "split the task" -- said about
+    work that was stopped, not work that was too big. Found by mutation.
+    """
+    import minicodex.subagent as subagent
+
+    async def stopped(args: dict[str, Any]) -> str:
+        raise asyncio.CancelledError
+
+    original = child_tools
+
+    def patched(c: SubAgentContext) -> Any:
+        handlers, schemas = original(c)
+        handlers["stopped"] = stopped
+        return handlers, schemas
+
+    monkeypatch.setattr(subagent, "child_tools", patched)
+    ctx = context_for(tmp_path, ScriptedModel([[("c", "stopped", {})], "done"]))
+    result = await run_task(TaskSpec(task="t"), ctx)
+
+    assert result.outcome == "interrupted"
+    assert "Do not start it again unless asked" in result.render()
+
+
+@pytest.mark.asyncio
+async def test_F10_01_a_child_keeps_the_command_timeout_the_parent_was_given(
+    tmp_path: Path,
+) -> None:
+    """The third thing a child inherits from where the parent stands.
+
+    The child's shell is a new object, so everything not copied on purpose
+    falls back to a default -- here, thirty seconds per command, whatever the
+    parent was configured with. Dropping the copy left every test green.
+    Found by mutation.
+    """
+    import sys
+
+    (tmp_path / "slow.py").write_text("import time\ntime.sleep(3)\n", encoding="utf-8")
+    parent_shell = ShellSession(timeout=0.5)
+    parent_shell.cwd = str(tmp_path)
+    ctx = context_for(tmp_path, ScriptedModel(["done"]), shell=parent_shell)
+    handlers, _schemas = child_tools(ctx)
+
+    # Three seconds of work against half a second of patience. No assertion
+    # on elapsed time: on Windows the command is not actually killed (F02-10),
+    # so the call returns when the command ends -- but it still reports that
+    # the deadline passed, and the deadline is what is being tested.
+    output = await handlers["run_shell"]({"command": f"{sys.executable} slow.py"})
+
+    assert "killed: still running" in output
+
+
+def test_F10_12_every_child_is_listed_with_the_id_that_finds_its_file() -> None:
+    """A session id printed nowhere is a link nobody follows."""
+    lines = describe_children(
+        [
+            TaskResult("ok", "x", turns=2, seconds=1.5, session_id="child-1"),
+            TaskResult("timeout", "", seconds=3.0),
+        ]
+    )
+    assert lines == [
+        "[sub-agent child-1: ok, 2 turn(s), 1.5s]",
+        "[sub-agent (not recorded): timeout, 0 turn(s), 3.0s]",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# the command line: where all of the above is switched on
+# ---------------------------------------------------------------------------
+
+
+def test_the_cli_wires_a_sub_agent_to_the_run_it_belongs_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Everything above builds its own `SubAgentContext`. The program builds
+    exactly one, in `__main__.py`, and none of these tests looked at it.
+
+    Six lines there could each be wrong with every test in this file green:
+    the handler missing from the loop's table, the schema missing from the
+    model's list, a fresh shell instead of the parent's, no session directory
+    (so no child is ever recorded), no parent id (so no child can be traced
+    back), and the end-of-run listing not printed. Chapter 8 and chapter 9
+    each found one line of this kind; this is the same question asked a
+    third time, and it found six.
+    """
+    import minicodex.__main__ as cli
+    from minicodex.agent import RunResult
+    from minicodex.history import History
+
+    seen: dict[str, Any] = {}
+    real_spawn_tools = cli.spawn_tools
+
+    def spy_spawn_tools(ctx: SubAgentContext, context: Any) -> Any:
+        seen["ctx"], seen["context"] = ctx, context
+        return real_spawn_tools(ctx, context)
+
+    class SpyAgent(Agent):
+        def __init__(self, llm: Any, handlers: Any, **kwargs: Any) -> None:
+            seen["llm"], seen["handlers"], seen["rollout"] = llm, handlers, kwargs["rollout"]
+            super().__init__(llm, handlers, **kwargs)
+
+        async def run(self, user_message: str) -> RunResult:
+            # Stand in for one sub-agent having finished during the run.
+            seen["ctx"].children.append(TaskResult("ok", "x", 2, 1.5, "child-1"))
+            return RunResult("ok", "completed", 1, History())
+
+    sessions = tmp_path / "sessions"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "spawn_tools", spy_spawn_tools)
+    monkeypatch.setattr(cli, "Agent", SpyAgent)
+
+    assert cli.main(["ask", "anything", "--session-dir", str(sessions)]) == 0
+
+    # The model is shown the tool, and the loop can run it.
+    assert "spawn_agent" in seen["handlers"]
+    assert any(tool["function"]["name"] == "spawn_agent" for tool in seen["llm"].tools)
+    # A child starts where the parent's shell is, under the parent's permissions.
+    ctx, context = seen["ctx"], seen["context"]
+    assert ctx.parent_shell is context.shell
+    assert ctx.session is context.session
+    # Its session file goes next to the parent's, and names the parent.
+    assert ctx.sessions_dir == sessions
+    assert ctx.parent_session_id == seen["rollout"].meta.session_id
+    # And the run ends by saying where to find it.
+    assert "[sub-agent child-1: ok, 2 turn(s), 1.5s]" in capsys.readouterr().out
+
+
+def test_the_sessions_listing_says_which_ones_are_sub_agents(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The listing is how `--resume last` picking a child was noticed at all."""
+    import minicodex.__main__ as cli
+
+    for session_id, parent in [("a", None), ("b", "a")]:
+        meta = SessionMeta(session_id=session_id, created=time.time(), parent=parent)
+        RolloutWriter(rollout_path(session_id, tmp_path), meta).release()
+
+    assert cli.main(["sessions", "--session-dir", str(tmp_path)]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    (child,) = [line for line in lines if line.strip().startswith("b ")]
+    (parent_line,) = [line for line in lines if line.strip().startswith("a ")]
+    assert "sub-agent of a" in child
+    assert "sub-agent of" not in parent_line

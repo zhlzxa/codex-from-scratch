@@ -185,12 +185,19 @@ def test_F09_01_two_raw_names_that_sanitise_to_one_do_not_silently_merge() -> No
 
 
 async def test_a_notification_is_not_the_answer_to_the_last_request() -> None:
-    """The fault the naive client had, and the reason the reader is a task.
+    """The fault the naive client had, still asserted after the SDK rewrite.
 
     `MCP_LOG_NOISE` makes the server emit a legal `notifications/message`
     before every reply.  A client that reads one line per request reads that
     notification as the result of `initialize`, and every answer after it is
     off by one -- with no exception raised anywhere.
+
+    The *fix* moved and the *property* did not.  Demultiplexing responses from
+    notifications from server-initiated requests used to be `_read_loop` in
+    `mcp.py`; it is the SDK's job now.  The test stayed because a property
+    worth two hundred lines of our own code is worth eight lines of assertion
+    against somebody else's -- a dependency is a claim, and this is the claim
+    being checked.
     """
     client = McpClient(files(MCP_LOG_NOISE="1"))
     await client.start()
