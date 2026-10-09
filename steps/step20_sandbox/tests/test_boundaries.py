@@ -114,7 +114,7 @@ def test_FA_04_tools_does_not_import_the_agent() -> None:
 
 
 # ---------------------------------------------------------------------------
-# F10-06  the cycle chapter 10 actually built
+# The cycle chapter 10 actually built (not on its fault list)
 # ---------------------------------------------------------------------------
 
 

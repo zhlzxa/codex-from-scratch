@@ -94,6 +94,26 @@ MUTATIONS = [
         "parent=ctx.parent_session_id or None,",
         "parent=None,",
     ),
+    # The next three were added when the chapter was rewritten: each is a
+    # line that could be deleted with every test green.
+    (
+        "subagent.py",
+        "an interrupted child is reported as an empty answer",
+        '    elif result.stop_reason == "interrupted":',
+        "    elif False:",
+    ),
+    (
+        "subagent.py",
+        "the child's shell forgets the parent's command timeout",
+        "shell = ShellSession(timeout=ctx.parent_shell.timeout)",
+        "shell = ShellSession()",
+    ),
+    (
+        "subagent.py",
+        "finished children are not recorded, so the shared budget never fills",
+        "    ctx.children.append(result)\n",
+        "    pass\n",
+    ),
     (
         "clip.py",
         "tail-only truncation, which is F02-03",
@@ -118,7 +138,31 @@ atexit.register(restore)
 signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
 
 
+def refuse_if_already_mutated() -> None:
+    """Do not start on a tree a killed run left dirty.
+
+    `atexit` and the `SIGINT` handler restore the source on every graceful
+    exit and neither runs on a `SIGKILL`.  Chapter 9's snapshot shipped with
+    one of its own mutations applied for exactly that reason; this is the
+    guard its script grew afterwards.  Both halves are checked -- the original
+    text missing *and* the mutated text present -- because several mutations
+    replace an expression with a simpler one that occurs elsewhere anyway.
+    """
+    dirty = [
+        f"{name}: looks like {label!r} is still applied"
+        for name, label, before, after in MUTATIONS
+        if before not in ORIGINALS[name] and after in ORIGINALS[name]
+    ]
+    if dirty:
+        print("refusing to run: the working tree is already mutated\n")
+        for line in dirty:
+            print(f"  {line}")
+        print("\nRestore it (git checkout / re-copy) before running this again.")
+        raise SystemExit(2)
+
+
 def main() -> None:
+    refuse_if_already_mutated()
     print(f"{len(MUTATIONS)} mutations, {' '.join(SUITES)}\n")
     survivors = []
     for name, label, before, after in MUTATIONS:

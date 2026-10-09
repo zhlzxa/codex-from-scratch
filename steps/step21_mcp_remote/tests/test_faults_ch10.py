@@ -42,6 +42,7 @@ from minicodex.subagent import (
     TaskResult,
     TaskSpec,
     child_tools,
+    describe_children,
     run_task,
     spawn_agent,
     spawn_toolset,
@@ -328,8 +329,13 @@ async def test_F10_06_a_model_that_only_ever_spawns_stops_at_the_limit(tmp_path:
     # model calls for one task -- bounded depth, unbounded width. The shared
     # budget stops the fourth depth-2 child: 8 + 3 * 8 = 32.
     assert calls == 32, calls
-    assert result.outcome in {"ok", "turn_limit"}
-    assert any(child.outcome != "ok" for child in ctx.children) or calls == 32
+    assert result.outcome == "turn_limit"
+    # What ran, in the order it finished: three depth-2 children, then the
+    # depth-1 child that spawned them.  The refusals after that are not in the
+    # list -- nothing ran, so there is nothing to record.  (The line that
+    # stood here before, `assert any(...) or calls == 32`, came straight after
+    # `assert calls == 32` and so could not fail.)
+    assert [(child.outcome, child.turns) for child in ctx.children] == [("turn_limit", 8)] * 4
 
 
 @pytest.mark.asyncio
@@ -674,3 +680,81 @@ def test_F10_12_resume_last_skips_sub_agent_sessions(tmp_path: Path) -> None:
     assert resolve("last", tmp_path).stem == "a"
     # Still reachable by id: excluded from the guess, not from the program.
     assert resolve("c", tmp_path).stem == "c"
+
+
+@pytest.mark.asyncio
+async def test_F10_10_a_child_whose_own_tool_was_cancelled_is_not_an_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one way a child ends `interrupted` while `run_task` itself is not
+    cancelled: a tool inside it raises `CancelledError`.
+
+    `Agent.run` reports that as `stop_reason="interrupted"` with an empty
+    `final_text` -- the same empty string a child that ran out of turns
+    returns. The branch that tells them apart had no test: with it deleted
+    the result became `empty`, whose advice is "split the task" -- said about
+    work that was stopped, not work that was too big. Found by mutation.
+    """
+    import minicodex.subagent as subagent
+
+    async def stopped(args: dict[str, Any]) -> str:
+        raise asyncio.CancelledError
+
+    original = child_tools
+
+    def patched(c: SubAgentContext) -> Any:
+        tools = original(c)
+        return replace(
+            tools,
+            handlers={**tools.handlers, "sleep": stopped},
+            schemas=[*tools.schemas, _sleep_schema()],
+        )
+
+    monkeypatch.setattr(subagent, "child_tools", patched)
+    ctx = context_for(tmp_path, ScriptedModel([[("c", "sleep", {})], "done"]))
+    result = await run_task(TaskSpec(task="t"), ctx)
+
+    assert result.outcome == "interrupted"
+    assert "Do not start it again unless asked" in result.render()
+
+
+@pytest.mark.asyncio
+async def test_F10_01_a_child_keeps_the_command_timeout_the_parent_was_given(
+    tmp_path: Path,
+) -> None:
+    """The third thing a child inherits from where the parent stands.
+
+    The child's shell is a new object, so everything not copied on purpose
+    falls back to a default -- here, thirty seconds per command, whatever the
+    parent was configured with. Dropping the copy left every test green.
+    Found by mutation.
+    """
+    import sys
+
+    (tmp_path / "slow.py").write_text("import time\ntime.sleep(3)\n", encoding="utf-8")
+    parent_shell = ShellSession(timeout=0.5)
+    parent_shell.cwd = str(tmp_path)
+    ctx = context_for(tmp_path, ScriptedModel(["done"]), shell=parent_shell)
+    handlers = child_tools(ctx).handlers
+
+    # Three seconds of work against half a second of patience. No assertion
+    # on elapsed time: on Windows the command is not actually killed (F02-10),
+    # so the call returns when the command ends -- but it still reports that
+    # the deadline passed, and the deadline is what is being tested.
+    output = await handlers["run_shell"]({"command": f"{sys.executable} slow.py"})
+
+    assert "killed: still running" in output
+
+
+def test_F10_12_every_child_is_listed_with_the_id_that_finds_its_file() -> None:
+    """A session id printed nowhere is a link nobody follows."""
+    lines = describe_children(
+        [
+            TaskResult("ok", "x", turns=2, seconds=1.5, session_id="child-1"),
+            TaskResult("timeout", "", seconds=3.0),
+        ]
+    )
+    assert lines == [
+        "[sub-agent child-1: ok, 2 turn(s), 1.5s]",
+        "[sub-agent (not recorded): timeout, 0 turn(s), 3.0s]",
+    ]

@@ -33,9 +33,9 @@ interactions.
 | `src/minicodex/clip.py` | the head-and-tail clipper, extracted at its third caller |
 | `src/minicodex/tools.py` | `tool_context()` / `bind_all()`; `default_tools` takes a `ShellSession` |
 | `src/minicodex/rollout.py` | `SessionMeta.parent`; `--resume last` skips sub-agent sessions |
-| `tests/test_faults_ch10.py` | 32 tests, no network |
+| `tests/test_faults_ch10.py` | 37 tests, no network |
 | `probe_subagent.py` | the measurements: 12 sections, 8 of them offline |
-| `probe_mutations_ch10.py` | 13 one-line mutations that must turn the suite red |
+| `probe_mutations_ch10.py` | 16 one-line mutations that must turn the suite red |
 
 ## What was measured
 
@@ -103,3 +103,7 @@ five runs. Which of the two edits survives is a coin flip.
 - **`spawn_agent` lives outside `tool_specs()`.** Putting the handler where
   handlers live is a circular import; chapter 10 takes the cheap way out and
   interlude B deals with the case where there is no cheap way out.
+- **A sub-agent has no compaction, no scheduler and no recorder.** `run_task`
+  builds its `Agent` with five arguments where `__main__` passes nine. Measured
+  once as a child that read its way past a 128k window (HTTP 400). Not fixed in
+  this step; it is what the next one is about.

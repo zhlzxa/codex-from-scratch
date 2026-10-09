@@ -43,6 +43,7 @@ from minicodex.model import (
     OPENAI_BASE_URL,
     ChatCompletionsModel,
     Completed,
+    ModelHTTPError,
     TextDelta,
     ToolCallDelta,
 )
@@ -63,13 +64,17 @@ def _key() -> str:
     return key
 
 
-async def _retry(make: Any, attempts: int = 4) -> Any:
-    """Run one sample, surviving a dropped connection.
+async def _retry(make: Any, attempts: int = 6) -> Any:
+    """Run one sample, surviving a dropped connection or a rate limit.
 
     Not a fix for anything -- chapter 12 is where retries are designed.  This
-    is here because a probe that dies on request 40 of 60 wastes the first 39,
-    and `httpx.ConnectError` / `RemoteProtocolError` both happened while these
-    numbers were being collected.
+    is here because a probe that dies on request 40 of 60 wastes the first 39:
+    `httpx.ConnectError` and `RemoteProtocolError` both happened while these
+    numbers were being collected, and so did an HTTP 429 that threw away a
+    whole section.
+
+    `make` is called again from scratch on every attempt, so it must rebuild
+    anything a failed attempt may have half-filled -- see `_fresh`.
     """
     for attempt in range(attempts):
         try:
@@ -79,6 +84,26 @@ async def _retry(make: Any, attempts: int = 4) -> Any:
                 raise
             print(f"    (retrying after {type(exc).__name__})", file=sys.stderr)
             await asyncio.sleep(2 * (attempt + 1))
+        except ModelHTTPError as exc:
+            if "HTTP 429" not in str(exc) or attempt == attempts - 1:
+                raise
+            print("    (rate limited; waiting 30s)", file=sys.stderr)
+            await asyncio.sleep(30)
+
+
+def _fresh(agent: Agent, task: str, *logs: list[str]) -> Any:
+    """One attempt at one sample, with the call logs emptied first.
+
+    A retried sample must not keep the tool calls of the attempt that failed:
+    those logs are what the section counts.
+    """
+
+    async def attempt() -> Any:
+        for log in logs:
+            log.clear()
+        return await agent.run(task)
+
+    return attempt
 
 
 def _model(tools: list[dict] | None = None) -> ChatCompletionsModel:
@@ -125,7 +150,8 @@ async def naive() -> None:
     print(result.final_text)
     print(f"\n[{result.stop_reason} after {result.turns_used} turn(s)]")
     for item in result.history.items:
-        print(f"  {type(item).__name__:18} {len(str(getattr(item, 'text', '') or ''))} chars")
+        body = getattr(item, "text", None) or getattr(item, "content", None) or ""
+        print(f"  {type(item).__name__:18} {len(str(body))} chars")
 
 
 # -- F10-03: what a full history costs, and what is in it --------------------
@@ -157,9 +183,7 @@ def _parent_history() -> History:
 
 def leak() -> None:
     sizer = Sizer(tools=tuple(TOOL_SCHEMAS))
-    history = History()
     parent = _parent_history()
-    del history
 
     task = "Read src/minicodex/model.py and list every place it raises."
     everything = [*parent.to_wire("chat_completions"), {"role": "user", "content": task}]
@@ -490,6 +514,7 @@ async def contract() -> None:
     for label, task, note, with_shell in arms:
         violations = 0
         correct = 0
+        overflowed = 0
         for sample in range(SAMPLES):
             tools, seen = _watch(ROOT)
             if not with_shell:
@@ -500,17 +525,32 @@ async def contract() -> None:
                 max_turns=5,
                 instructions=note,
             )
-            result = await _retry(lambda child=child, task=task: child.run(task))
+            try:
+                result = await _retry(_fresh(child, task, seen))
+            except ModelHTTPError as exc:
+                # A child that reads its way past the model's window.  This
+                # killed the whole section the first time it happened; it is a
+                # result, not a crash, so it is counted.  These children are
+                # bare `Agent`s with no context window -- which is also what
+                # `run_task` builds.
+                if "context_length_exceeded" not in str(exc):
+                    raise
+                overflowed += 1
+                print(f"    overflowed the window after {len(seen)} call(s): {seen[-2:]}")
+                final_text = ""
+            else:
+                final_text = result.final_text
             if any(s.startswith("run_shell") for s in seen):
                 violations += 1
-            if "shell.py" in result.final_text:
+            if "shell.py" in final_text:
                 correct += 1
             if sample == 0:
                 print(f"    calls: {seen}")
-                print(f"    said:  {result.final_text[:160]!r}")
+                print(f"    said:  {final_text[:160]!r}")
+        spilled = f", {overflowed}/{SAMPLES} overflowed the window" if overflowed else ""
         print(
             f"{violations:>2}/{SAMPLES} used the broken shell,"
-            f" {correct}/{SAMPLES} named shell.py  --  {label}"
+            f" {correct}/{SAMPLES} named shell.py{spilled}  --  {label}"
         )
 
 
@@ -531,7 +571,7 @@ async def length() -> None:
         for _ in range(SAMPLES):
             tools, _seen = _watch(ROOT)
             child = Agent(_model(), tools, max_turns=5)
-            result = await _retry(lambda child=child, task=task: child.run(task))
+            result = await _retry(_fresh(child, task))
             sizes.append(len(result.final_text))
         print(f"{label:<24} chars: {sorted(sizes)}  median {sorted(sizes)[len(sizes) // 2]}")
 
@@ -583,8 +623,12 @@ async def failure() -> None:
                 max_turns=4,
             )
             result = await _retry(
-                lambda parent=parent: parent.run(
-                    f"Use spawn_agent for this, then tell me the answer: {BIG_TASK}"
+                _fresh(
+                    parent,
+                    f"Use spawn_agent for this, then tell me the answer: {BIG_TASK}",
+                    parent_seen,
+                    child_seen,
+                    returned,
                 )
             )
             said = result.final_text.lower()
