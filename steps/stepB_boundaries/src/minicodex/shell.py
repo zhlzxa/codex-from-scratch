@@ -212,8 +212,8 @@ class ShellSession:
                 #     python 3.12.3    4/12 hang
                 #     python 3.13.13   4/12 hang
                 #
-                # Chapters 2 to 4 were written on 3.10, which is why this was
-                # invisible for three chapters.  A read-timeout ceiling on
+                # Chapter 2 was first written on 3.10, where this never shows,
+                # which is how it went unnoticed.  A read-timeout ceiling on
                 # `wait()` was tried and rejected: it still "hung" 3-12 times
                 # out of 12, it just capped the damage, and it paid the full
                 # timeout every time it fired.  Closing the pipe fixes the

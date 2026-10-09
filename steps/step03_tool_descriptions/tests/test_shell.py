@@ -11,9 +11,30 @@ import os
 import sys
 import time
 
+import pytest
+
 from minicodex.shell import MAX_OUTPUT_CHARS, ShellSession, _clip
 
 STUBBORN = os.path.join(os.path.dirname(__file__), "fixtures", "stubborn.py")
+
+# F02-10.  `run_shell`
+# kills process groups with `os.killpg` and `start_new_session`, both of which
+# are POSIX-only, and its tests drive a POSIX shell (`sleep`, `cat`, `pwd`,
+# `yes`).  On Windows the killpg call raises AttributeError *after the command
+# has already run*.
+#
+# Marked rather than fixed.  A Windows port means job objects instead of
+# process groups, which is a real piece of work, not a two-line fallback --
+# and a partial fallback (`proc.kill()`) would be worse than the gap, because
+# it kills the shell and silently leaves the grandchildren running, which is
+# the exact orphan bug F02-08 exists to prevent.
+#
+# The point of the marker is that the gap now says its own name in the test
+# output instead of appearing as seven mysterious red tests.
+posix_only = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="F02-10: POSIX process groups and POSIX shell builtins; see FAULTS.md",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -21,6 +42,7 @@ STUBBORN = os.path.join(os.path.dirname(__file__), "fixtures", "stubborn.py")
 # ---------------------------------------------------------------------------
 
 
+@posix_only
 async def test_F02_01_a_hanging_command_is_killed_on_timeout() -> None:
     session = ShellSession(timeout=1)
     start = time.monotonic()
@@ -39,12 +61,47 @@ async def test_F02_01_a_hanging_command_is_killed_on_timeout() -> None:
 # ---------------------------------------------------------------------------
 
 
+async def _bounded(session: ShellSession, command: str, *, limit: float = 20) -> str:
+    """Run a command, but fail rather than hang if it never comes back.
+
+    An assertion on the wall clock placed *after* the call is worth nothing
+    against a call that can hang: the assert never runs, and a hanging test
+    reports nothing at all until someone gets bored and presses Ctrl-C.  The
+    bound has to be on the await itself.  This helper exists because the
+    ceiling bug below hid behind exactly that mistake while tests ran on 3.10.
+    """
+    return await asyncio.wait_for(session.run(command), timeout=limit)
+
+
+@posix_only
 async def test_F02_02_a_firehose_is_capped_not_buffered_whole() -> None:
     session = ShellSession(timeout=10)
-    out = await session.run("yes | head -c 100000000")
+    out = await _bounded(session, "yes | head -c 100000000")
     # _clip() guarantees the upper bound regardless of how much the process
     # produced before the read ceiling stopped it.
     assert len(out) <= MAX_OUTPUT_CHARS + 200
+
+
+@posix_only
+async def test_ceiling_does_not_leave_wait_blocked_on_a_dead_process() -> None:
+    """Hitting the read ceiling must return, not block forever.
+
+    `proc.wait()` resolves when the process has exited AND every pipe has
+    reached EOF.  Giving up on the ceiling leaves unread bytes in stdout, so
+    without closing that pipe the wait never resolves -- on a process SIGKILL
+    has already killed.
+
+    Measured before the fix, 12 samples per interpreter: 0/12 hang on python
+    3.10, 12/12 on 3.11, 4/12 on 3.12 and 3.13.  Chapter 2 was first written
+    on 3.10, where it never shows.
+
+    2,000,000 characters rather than the 100,000,000 above: just past the
+    1,000,000-character ceiling is the smallest input that reaches the bug,
+    and a small one keeps the run fast.
+    """
+    session = ShellSession(timeout=10)
+    out = await _bounded(session, "yes | head -c 2000000")
+    assert "killed" in out
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +128,7 @@ def test_F02_03_short_output_is_not_touched() -> None:
 # ---------------------------------------------------------------------------
 
 
+@posix_only
 async def test_F02_04_a_command_reading_stdin_gets_eof_immediately() -> None:
     """`python3` with no `-c` is a REPL that reads stdin.  Without
     `stdin=DEVNULL` this hangs until the timeout; measured directly at the
@@ -111,6 +169,7 @@ async def test_F02_04_stdin_is_explicitly_devnull(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+@posix_only
 async def test_F02_05_cd_persists_to_the_next_call(tmp_path) -> None:
     session = ShellSession()
     await session.run(f"cd {tmp_path}")
@@ -176,6 +235,7 @@ async def test_F02_07_invalid_utf8_is_replaced_not_raised(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@posix_only
 async def test_F02_08_a_timed_out_command_leaves_no_process_behind() -> None:
     """`shell=True` runs the command as a child of `/bin/sh`.  Killing only
     the `Popen`/`Process` object kills the shell, not what it forked --
@@ -193,11 +253,18 @@ async def test_F02_08_a_timed_out_command_leaves_no_process_behind() -> None:
     assert "NONE" in result
 
 
+@posix_only
 async def test_F02_08_a_stubborn_child_that_ignores_the_pipe_closing_is_still_killed() -> None:
     """A process that catches BrokenPipeError and keeps writing does not
-    stop on its own when the read side gives up -- it has to be killed."""
+    stop on its own when the read side gives up -- it has to be killed.
+
+    Bounded for the same reason as F02-02: this one reaches the give-up path
+    with output still sitting unread in the pipe, so it hangs rather than
+    fails if that pipe is not closed before the wait.  The timeout path and
+    the ceiling path share the defect and therefore share the bound.
+    """
     session = ShellSession(timeout=1)
-    out = await session.run(f"{sys.executable} {STUBBORN}")
+    out = await _bounded(session, f"{sys.executable} {STUBBORN}")
     assert "killed" in out
 
     await asyncio.sleep(0.5)

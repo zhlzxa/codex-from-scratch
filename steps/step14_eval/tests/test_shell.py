@@ -69,7 +69,7 @@ async def _bounded(session: ShellSession, command: str, *, limit: float = 20) ->
     against a call that can hang: the assert never runs, and a hanging test
     reports nothing at all until someone gets bored and presses Ctrl-C.  The
     bound has to be on the await itself.  This helper exists because the
-    ceiling bug below hid behind exactly that mistake for three chapters.
+    ceiling bug below hid behind exactly that mistake while tests ran on 3.10.
     """
     return await asyncio.wait_for(session.run(command), timeout=limit)
 
@@ -93,8 +93,8 @@ async def test_ceiling_does_not_leave_wait_blocked_on_a_dead_process() -> None:
     has already killed.
 
     Measured before the fix, 12 samples per interpreter: 0/12 hang on python
-    3.10, 12/12 on 3.11, 4/12 on 3.12 and 3.13.  Chapters 2 to 4 were written
-    on 3.10, which is why three chapters shipped with this in them.
+    3.10, 12/12 on 3.11, 4/12 on 3.12 and 3.13.  Chapter 2 was first written
+    on 3.10, where it never shows.
 
     2,000,000 characters rather than the 100,000,000 above: just past the
     1,000,000-character ceiling is the smallest input that reaches the bug,
