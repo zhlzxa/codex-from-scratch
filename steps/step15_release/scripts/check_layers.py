@@ -33,7 +33,9 @@ PACKAGE = "minicodex"
 # "rules not written" at the bottom.
 FORBIDDEN: list[tuple[str, str, str]] = [
     ("tools", "agent", "FA-04: the loop is above the tool machinery, not below it"),
-    ("tools", "subagent", "F10-06: putting the spawn handler with the handlers"),
+    # Chapter 10 met this cycle first; it is not on that chapter's list
+    # (F10-06 there is runaway recursion), so it carries interlude B's ID.
+    ("tools", "subagent", "FB-01: putting the spawn handler with the handlers"),
     (
         "subagent",
         "tools",

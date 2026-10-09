@@ -29,7 +29,7 @@ from minicodex.agent_types import STATEFUL, Footprint, ToolCall, ToolSet
 from minicodex.approval import AllowAll, Session
 from minicodex.composition import local_tools, sub_context, top_level_tools
 from minicodex.model import Completed, TextDelta, ToolCallDelta
-from minicodex.recorder import Recorder
+from minicodex.recorder import NULL_RECORDER, Recorder
 from minicodex.shell import ShellSession
 from minicodex.subagent import TaskSpec, child_tools, run_task, spawn_toolset
 
@@ -264,6 +264,155 @@ def test_FB_01_plus_routes_a_footprint_to_the_set_that_owns_it(tmp_path: Path) -
     assert unknown == STATEFUL
 
 
+def _two_slow_tools() -> tuple[ToolSet, dict[str, int]]:
+    """Two tools that take a moment each and are declared to touch different
+    things, plus a count of how many were running at once."""
+    seen = {"now": 0, "peak": 0}
+
+    async def slow(_args: dict[str, Any]) -> str:
+        seen["now"] += 1
+        seen["peak"] = max(seen["peak"], seen["now"])
+        await asyncio.sleep(0.05)
+        seen["now"] -= 1
+        return "ok"
+
+    def schema(name: str) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {"name": name, "description": "wait", "parameters": {"type": "object"}},
+        }
+
+    tools = ToolSet(
+        handlers={"left": slow, "right": slow},
+        schemas=[schema("left"), schema("right")],
+        footprint_of=lambda call: Footprint(reads=frozenset({call.name})),
+    )
+    return tools, seen
+
+
+BOTH_AT_ONCE = [[("c1", "left", {}), ("c2", "right", {})], "done"]
+
+
+def test_FB_01_wiring_passes_the_toolsets_footprints_to_the_agent() -> None:
+    """`ToolSet` carrying a `footprint_of` is half of it. The other half is the
+    one line in `Wiring.agent` that hands it to the `Agent` -- and deleting
+    that line left every test green: both the parent and every child fell back
+    to running one call at a time, which is what chapter 10's children did.
+    Found by mutation.
+    """
+    tools, seen = _two_slow_tools()
+    asyncio.run(Wiring().agent(ScriptedModel(BOTH_AT_ONCE), tools).run("go"))
+    assert seen["peak"] == 2
+
+
+def test_FB_01_wiring_passes_its_concurrency_cap_to_the_agent() -> None:
+    tools, seen = _two_slow_tools()
+    wiring = Wiring(max_concurrent_tools=1)
+    asyncio.run(wiring.agent(ScriptedModel(BOTH_AT_ONCE), tools).run("go"))
+    assert seen["peak"] == 1
+
+
+def test_FB_01_wiring_passes_its_dialect_to_the_agent() -> None:
+    """A child that renders its history for a different provider than its
+    parent talks to is not a subtle failure, but it would be a late one."""
+    tools, _seen = _two_slow_tools()
+    agent = Wiring(dialect="ollama_native").agent(ScriptedModel(["ok"]), tools)
+    assert agent.dialect == "ollama_native"
+
+
+def test_FB_01_plus_keeps_both_sides_footprints() -> None:
+    """Both halves of the routing, with footprints that can be told apart.
+
+    The test above combines local tools with `spawn_agent`, whose footprint is
+    `STATEFUL` -- which is also what `plus` answers for a name it cannot place.
+    So deleting the branch that asks the *other* set left it green. The first
+    mutation run reported that deletion as caught; the test that went red was
+    an unrelated one about killing a subprocess, failing by coincidence. Found
+    on the second run.
+    """
+
+    async def noop(_args: dict[str, Any]) -> str:
+        return ""
+
+    def one(name: str) -> ToolSet:
+        schema = {"type": "function", "function": {"name": name, "parameters": {}}}
+        return ToolSet(
+            handlers={name: noop},
+            schemas=[schema],
+            footprint_of=lambda _call: Footprint(reads=frozenset({f"owned by {name}"})),
+        )
+
+    combined = one("left").plus(one("right"))
+
+    def reads(name: str) -> frozenset[str]:
+        return combined.footprint_of(ToolCall("c", name, {}, "{}")).reads
+
+    assert reads("left") == {"owned by left"}
+    assert reads("right") == {"owned by right"}
+    assert combined.footprint_of(ToolCall("c", "neither", {}, "{}")) == STATEFUL
+
+
+def test_FB_01_plus_remembers_which_names_may_lack_a_schema() -> None:
+    """The named exception has to survive being combined, or the first `plus`
+    after the registry's set is built turns it back into an error."""
+
+    async def noop(_args: dict[str, Any]) -> str:
+        return ""
+
+    def schema(name: str) -> dict[str, Any]:
+        return {"type": "function", "function": {"name": name, "parameters": {}}}
+
+    with_hidden = ToolSet(
+        handlers={"shown": noop, "hidden": noop},
+        schemas=[schema("shown")],
+        callable_without_schema=frozenset({"hidden"}),
+    )
+    other = ToolSet(handlers={"other": noop}, schemas=[schema("other")])
+
+    combined = with_hidden.plus(other)
+    assert combined.callable_without_schema == {"hidden"}
+
+
+def test_FB_01_tools_deferred_behind_tool_search_survive_the_merge(tmp_path: Path) -> None:
+    """Chapter 9's deferred mode, through the new assembly.
+
+    Every other test of `with_remote_tools` uses an empty registry, so the two
+    lines that only matter when tools are deferred -- the `tool_search`
+    handler, and naming the deferred tools as the exception to `ToolSet`'s
+    rule -- could each be deleted with the suite green. With sixty tools
+    configured, either deletion is a program that refuses to start. Found by
+    mutation.
+    """
+    from minicodex.composition import with_remote_tools
+    from minicodex.mcp import RemoteTool
+    from minicodex.registry import McpRegistry
+
+    base = local_tools(tmp_path, Session(mode="read-only", approver=AllowAll()))
+    registry = McpRegistry(local=base.schemas, schema_budget=0)  # nothing fits: defer all
+    registry.add(None, [RemoteTool("notes", "search", "Search notes.", {"type": "object"})])  # type: ignore[arg-type]
+    assert registry.deferred == {"mcp__notes__search"}
+
+    combined = with_remote_tools(base, registry)
+
+    shown = {schema["function"]["name"] for schema in combined.schemas}
+    assert "tool_search" in combined.handlers and "tool_search" in shown
+    assert "mcp__notes__search" in combined.handlers
+    assert "mcp__notes__search" not in shown
+    assert combined.schemas is registry.visible
+
+
+def test_FB_01_a_registry_that_was_not_told_about_the_local_tools_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The ordering rule, in the rule's own words rather than `ToolSet`'s."""
+    from minicodex.composition import with_remote_tools
+    from minicodex.registry import McpRegistry
+
+    base = local_tools(tmp_path, Session(mode="read-only", approver=AllowAll()))
+    with pytest.raises(ValueError, match="local="):
+        with_remote_tools(base, McpRegistry())
+
+
 # ---------------------------------------------------------------------------
 # FB-02  the boundary broken again, three months later
 # ---------------------------------------------------------------------------
@@ -488,3 +637,172 @@ def test_FB_03_the_footprint_type_stayed_where_behaviour_can_use_it() -> None:
     assert scheduler_module.Footprint is Footprint
     assert callable(scheduler_module.conflicts)
     assert "conflicts" not in dir(sys.modules["minicodex.agent_types"])
+
+
+# ---------------------------------------------------------------------------
+# the command line: the one place a real run is put together
+# ---------------------------------------------------------------------------
+
+
+def _cli_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *argv: str) -> dict[str, Any]:
+    """Run `minicodex ask` for real, up to the first model call, and report
+    what the top-level agent was built from.
+
+    Chapters 8, 9 and 10 each found a mechanism that was correct, tested, and
+    not connected in `__main__.py` -- and each wrote a test that spied on the
+    `Agent(...)` call there. Interlude B deleted that call, so those tests went
+    with it; this is what replaces them. The spy sits on `Wiring.agent`, which
+    is now the only way an agent gets built.
+    """
+    import minicodex.__main__ as cli
+    from minicodex.agent import Agent, RunResult
+    from minicodex.history import History
+    from minicodex.registry import McpRegistry
+    from minicodex.subagent import TaskResult
+
+    seen: dict[str, Any] = {"summariser_models": []}
+    real_agent = Wiring.agent
+    real_make_summariser = cli.make_summariser
+    real_sub_context = cli.sub_context
+
+    def spy_sub_context(**kwargs: Any) -> Any:
+        # The context the `spawn_agent` handler is about to be built around.
+        seen["child_ctx"] = real_sub_context(**kwargs)
+        return seen["child_ctx"]
+
+    def spy_agent(self: Wiring, model: Any, tools: ToolSet, **kwargs: Any) -> Any:
+        seen.update(wiring=self, model=model, tools=tools, kwargs=kwargs)
+        return real_agent(self, model, tools, **kwargs)
+
+    def spy_make_summariser(model: Any, **kwargs: Any) -> Any:
+        seen["summariser_models"].append(model)
+        return real_make_summariser(model, **kwargs)
+
+    async def no_run(self: Agent, user_message: str) -> RunResult:
+        # Stand in for one sub-agent having finished during the run.
+        seen["child_ctx"].children.append(TaskResult("ok", "x", 2, 1.5, "child-1"))
+        return RunResult("ok", "completed", 1, History())
+
+    class SpyRegistry(McpRegistry):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            seen["registry"] = self
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(Wiring, "agent", spy_agent)
+    monkeypatch.setattr(Agent, "run", no_run)
+    monkeypatch.setattr(cli, "McpRegistry", SpyRegistry)
+    monkeypatch.setattr(cli, "make_summariser", spy_make_summariser)
+    monkeypatch.setattr(cli, "sub_context", spy_sub_context)
+
+    sessions = tmp_path / "sessions"
+    assert cli.main(["ask", "anything", "--yes", "--session-dir", str(sessions), *argv]) == 0
+    seen["sessions"] = sessions
+    return seen
+
+
+def test_the_cli_switches_the_scheduler_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Chapter 8's finding, re-asked of the new assembly."""
+    (tmp_path / "x.txt").write_text("hi", encoding="utf-8")
+    seen = _cli_run(tmp_path, monkeypatch)
+
+    footprint = seen["tools"].footprint_of(ToolCall("c1", "read_file", {"path": "x.txt"}, "{}"))
+    assert footprint.reads == {str((tmp_path / "x.txt").resolve())}
+
+
+def test_the_cli_hands_the_model_client_the_registrys_own_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chapter 9's finding: `tool_search` appends to one list, and the model
+    client has to be holding that list and not a copy of it."""
+    seen = _cli_run(tmp_path, monkeypatch)
+
+    assert seen["model"].tools is seen["registry"].visible
+    assert seen["tools"].schemas is seen["registry"].visible
+
+
+def test_the_cli_gives_a_sub_agent_the_same_wiring_as_its_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Interlude B's own fix, checked where it is used rather than where it is
+    defined -- and it was not there.
+
+    `__main__` built the `spawn_agent` handler first and attached the
+    summariser to the wiring afterwards, with `replace()`. `replace()` makes a
+    new object; the handler went on holding the old one. So in the real
+    program a child got a context window and no summariser, and compaction
+    needs both: with `--context-window` set, sub-agents still never compacted.
+    Every test of the fix built its own context and passed. Found by writing
+    this test.
+    """
+    seen = _cli_run(tmp_path, monkeypatch, "--context-window", "32000")
+
+    assert seen["wiring"].summariser is not None
+    assert seen["child_ctx"].wiring is seen["wiring"], "the child was handed a different wiring"
+    # And the one wiring has in it what the command line was given.
+    assert seen["wiring"].context_window == 32000
+    assert seen["wiring"].recorder is not NULL_RECORDER
+
+
+def test_the_summariser_is_given_a_client_with_no_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`make_summariser`'s docstring has said since chapter 6 that the
+    summariser "must not see the tool schemas". It was handed the agent's own
+    client, which sends its tool list with every request -- so it always did.
+    """
+    seen = _cli_run(tmp_path, monkeypatch, "--context-window", "32000")
+
+    (model,) = seen["summariser_models"]
+    assert model.tools == []
+
+
+def test_the_cli_wires_a_sub_agent_to_the_run_it_belongs_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chapter 10's finding: where a child starts, where its file goes, and
+    whose child it says it is."""
+    (tmp_path / "sub").mkdir()
+    seen = _cli_run(tmp_path, monkeypatch)
+    tools, child_ctx = seen["tools"], seen["child_ctx"]
+
+    assert "spawn_agent" in tools.handlers
+
+    assert any(s["function"]["name"] == "spawn_agent" for s in seen["model"].tools)
+    # The parent's shell and the one a child is seeded from are one object:
+    # move the parent, and the child's starting point moves with it.
+    asyncio.run(tools.handlers["run_shell"]({"command": "cd sub"}))
+    assert Path(child_ctx.parent_shell.cwd).name == "sub"
+    assert child_ctx.sessions_dir == seen["sessions"]
+    assert child_ctx.parent_session_id == seen["kwargs"]["rollout"].meta.session_id
+
+
+def test_the_cli_lists_each_sub_agent_when_the_run_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A session id printed nowhere is a link nobody follows (F10-12)."""
+    _cli_run(tmp_path, monkeypatch)
+
+    assert "[sub-agent child-1: ok, 2 turn(s), 1.5s]" in capsys.readouterr().out
+
+
+def test_the_sessions_listing_says_which_ones_are_sub_agents(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The listing is how `--resume last` picking a child was noticed at all."""
+    import time
+
+    import minicodex.__main__ as cli
+    from minicodex.rollout import RolloutWriter, SessionMeta, rollout_path
+
+    for session_id, parent in [("a", None), ("b", "a")]:
+        meta = SessionMeta(session_id=session_id, created=time.time(), parent=parent)
+        RolloutWriter(rollout_path(session_id, tmp_path), meta).release()
+
+    assert cli.main(["sessions", "--session-dir", str(tmp_path)]) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    (child,) = [line for line in lines if line.strip().startswith("b ")]
+    (parent_line,) = [line for line in lines if line.strip().startswith("a ")]
+    assert "sub-agent of a" in child
+    assert "sub-agent of" not in parent_line
