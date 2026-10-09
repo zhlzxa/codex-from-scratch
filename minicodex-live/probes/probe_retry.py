@@ -9,7 +9,6 @@ Run one section at a time:
     uv run python probe_retry.py naive        # F12-01, no network
     uv run python probe_retry.py interrupt    # F12-07, no network
     uv run python probe_retry.py nesting      # F12-06, no network
-    uv run python probe_retry.py debris       # F12-09, no network
 
 Anything with "real API" needs OPENAI_API_KEY.
 """
@@ -238,10 +237,21 @@ def _serve() -> tuple[str, Any]:
 
     from minicodex import stub
 
+    class Quiet(HTTPServer):
+        """A client that gives up mid-response is the experiment, not an error.
+
+        The default `handle_error` prints a traceback per abandoned connection;
+        `nesting` abandons twenty of them, and the two lines of result were
+        being printed underneath three screens of `ConnectionAbortedError`.
+        """
+
+        def handle_error(self, request: Any, client_address: Any) -> None:
+            pass
+
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    server = HTTPServer(("127.0.0.1", port), stub._Handler)
+    server = Quiet(("127.0.0.1", port), stub._Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     stub.reset()
     return f"http://127.0.0.1:{port}/v1", server
@@ -262,22 +272,28 @@ def naive() -> None:
     from minicodex import stub
     from minicodex.agent import Agent
     from minicodex.model import ChatCompletionsModel, ModelHTTPError
+    from minicodex.retry import ModelFailed, RetryPolicy
 
     url, server = _serve()
     try:
 
         async def go() -> None:
-            # (a) one 429 in front of a conversation that would have worked.
+            # (a) one 429 in front of a conversation that would have worked,
+            # with the loop told to make one attempt only -- which is what the
+            # program did before this chapter.  This section was first written
+            # against that program and labelled "today"; run against the
+            # finished one it sat silent for 45 seconds and reported success,
+            # which is a different measurement from the one its label claims.
             model = ChatCompletionsModel(
                 base_url=url, model="gemma4:31b", extra_body=_plan("a", stub.RATE_LIMITED)
             )
-            agent = Agent(model, {"read_file": _echo})
-            print("\n--- (a) today, one 429 before a two-turn conversation")
+            agent = Agent(model, {"read_file": _echo}, retry_policy=RetryPolicy(attempts=1))
+            print("\n--- (a) one attempt only: one 429 before a two-turn conversation")
             try:
                 result = await agent.run("What does __init__.py define?")
                 print(f"  {result.stop_reason} after {result.turns_used} turn(s)")
-            except ModelHTTPError as exc:
-                print(f"  {type(exc).__name__}: {str(exc)[:120]}...")
+            except ModelFailed as exc:
+                print(f"  {type(exc).__name__}: {str(exc).splitlines()[0][:110]}...")
             print(f"  requests the server saw: {len(stub.REQUESTS)}")
 
             # (b) the obvious repair: retry anything that is not a 200.

@@ -624,13 +624,23 @@ class Agent:
             # of the truth, so a single turn asking for more than a 4x
             # correction is not new information about the content mix, it is
             # something else -- a proxy, a different model, a lying body.
-            correction = actual / estimated if estimated > 0 else 0.0
+            #
+            # Measured against the *raw* estimate, not `estimated`.  That one
+            # has already been multiplied by the current ratio, and chapter 6
+            # found out what feeding a corrected guess back into the ruler
+            # does: the ratio of the truth to an already-corrected guess is the
+            # correction's error, not the correction.  This site was written
+            # after that fix and repeated the mistake it fixed -- with a ratio
+            # of 1.5 in place and a refusal stating twice the raw estimate, the
+            # ruler was set to 1.33 instead of 2.0.
+            raw = self._raw_estimate(history.to_wire(self.dialect))
+            correction = actual / raw if raw > 0 else 0.0
             if 0 < correction <= MAX_REFUSAL_CORRECTION:
-                self.calibration.observe(estimated=estimated, actual=actual)
+                self.calibration.observe(estimated=raw, actual=actual)
             else:
                 self.recorder.record(
                     "calibration_rejected",
-                    {"estimated": estimated, "stated": actual, "correction": correction},
+                    {"estimated": raw, "stated": actual, "correction": correction},
                 )
 
         result = await compact(

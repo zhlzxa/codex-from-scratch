@@ -37,7 +37,9 @@ import httpx
 OLLAMA_BASE_URL = "http://localhost:11434/v1"
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 
-# How long one attempt may take.  It was 300 seconds, chosen when this was the
+# How long one attempt may go without hearing from the server -- `httpx` applies
+# it per read, so it bounds silence, not the length of a stream that keeps
+# arriving (see `RetryPolicy`).  It was 300 seconds, chosen when this was the
 # only clock in the program, and 300 is also `subagent.DEFAULT_TASK_TIMEOUT` --
 # so a child whose model call hung reached its own deadline and the request's
 # deadline at the same instant, and which of the two fired first decided

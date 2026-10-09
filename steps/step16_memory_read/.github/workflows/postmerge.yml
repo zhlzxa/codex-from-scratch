@@ -50,7 +50,7 @@ jobs:
       - name: Mutation check (chapter 10)
         run: uv run python probe_mutations_ch10.py
 
-      # Chapter 11's nineteen. The step is here as of chapter 12, and the
+      # Chapter 11's twenty-six. The step is here as of chapter 12, and the
       # gap is worth recording rather than quietly closing: chapter 11's own
       # text says "these run in postmerge.yml, like chapter 9's", and the
       # workflow had steps for 9 and 10 only. Nothing was wrong with the
@@ -61,7 +61,7 @@ jobs:
       - name: Mutation check (chapter 11)
         run: uv run python probe_mutations_ch11.py
 
-      # Chapter 12's twenty-three. Three survived the first run, and the most
+      # Chapter 12's twenty-six. Three survived the first run, and the most
       # useful of the three was not a missing test: `wait_for` and the loop
       # both enforced the attempt count, so deleting either one changed
       # nothing. The repair was to delete the duplicate.
