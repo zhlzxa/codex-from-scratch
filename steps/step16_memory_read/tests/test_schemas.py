@@ -51,7 +51,10 @@ def test_F03_02_an_absolute_path_inside_the_repo_is_accepted(tmp_path: Path) -> 
 
 
 def test_F03_02_an_absolute_path_outside_the_repo_is_refused(tmp_path: Path) -> None:
-    got, error = resolve("/etc/hosts", tmp_path)
+    # Built from tmp_path so it is absolute on every platform; "/etc/hosts"
+    # has no drive letter and is not absolute on Windows.
+    outside = tmp_path.parent / "somewhere-else" / "hosts"
+    got, error = resolve(str(outside), tmp_path)
     assert got is None
     assert error is not None
     assert "outside the repository" in error

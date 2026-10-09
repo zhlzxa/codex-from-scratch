@@ -15,8 +15,8 @@ copying the example, not learning the rule.
 Which means this is not a description problem. An absolute path inside the
 repository is unambiguous and can simply be accepted; a name that matches
 exactly one file is unambiguous and can be named in the error. That is
-deterministic work, and chapter -1's rule applies: anything that can be
-settled in code should not be handed to the model.
+deterministic work, and the rule is: anything that can be settled in code
+should not be handed to the model.
 """
 
 from __future__ import annotations
