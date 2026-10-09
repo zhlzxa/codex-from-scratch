@@ -33,17 +33,6 @@ class IncompleteStreamError(RuntimeError):
     """The connection ended before the server sent its `[DONE]` sentinel."""
 
 
-class TurnInterrupted(RuntimeError):
-    """A turn was cancelled from outside and has been closed off cleanly.
-
-    Raised nowhere and caught nowhere: it exists as the name of the state the
-    loop unwinds into, so the two interruption levels have different words.
-    Cancelling a *tool* is recoverable -- the call gets an output saying it was
-    interrupted, and the model can decide what to do.  Cancelling a *turn* ends
-    the run.  Chapter 7 measures what happens when the two are the same thing.
-    """
-
-
 @dataclass(frozen=True)
 class ModelTurn:
     text: str
@@ -286,14 +275,31 @@ class Agent:
                 "fits": result.plan.fits,
             },
         )
-        # The rollout is append-only, so a history that has been *replaced*
-        # cannot be expressed by editing what is already on disk.  It is
-        # expressed by writing a marker and then the new baseline after it;
-        # `read_rollout` restarts its item list at the last marker.  The old
-        # turns stay in the file, unread by the loader and available to anyone
-        # reading it as a record.
-        self.rollout.mark("compacted", generation=result.generation, replaced=result.plan.drops)
-        return self._attach(result.history), result
+        return self._rebaseline(result), result
+
+    def _rebaseline(self, result: CompactionResult) -> History:
+        """Write a compacted history to the rollout as the new baseline.
+
+        The rollout is append-only, so a history that has been *replaced*
+        cannot be expressed by editing what is already on disk.  It is
+        expressed by two markers with the new baseline between them, and
+        `read_rollout` keeps what sits between the last finished pair.  The old
+        turns stay in the file, unread by the loader and available to anyone
+        reading it as a record.
+
+        Two markers, not one.  The first version wrote a single "compacted"
+        marker *ahead* of the baseline, which made this the one place in the
+        chapter where a prefix of the file was not a recoverable session: a
+        kill after the marker and before the last baseline item left a file
+        that said "forget everything before me" in front of half a
+        replacement.  It loaded as one system note, the user's question gone,
+        and nothing reported as dropped.
+        """
+        payload = {"generation": result.generation, "replaced": result.plan.drops}
+        self.rollout.mark("compacting", **payload)
+        attached = self._attach(result.history)
+        self.rollout.mark("compacted", **payload)
+        return attached
 
     def _attach(self, history: History) -> History:
         """Re-point a history at the rollout, writing it out as it goes.

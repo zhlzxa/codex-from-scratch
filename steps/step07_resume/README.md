@@ -24,7 +24,7 @@ uv run minicodex fork last --upto 6
 | `src/minicodex/agent.py` | resumes from a loaded history; answers every issued call when cancelled |
 | `src/minicodex/shell.py` | kills the process group on cancellation, not only on timeout |
 | `src/minicodex/__main__.py` | `--resume`, `sessions`, `fork` |
-| `tests/test_faults_ch07.py` | 34 tests, one per fault plus the shapes around them |
+| `tests/test_faults_ch07.py` | one or more tests per fault, plus the shapes around them |
 
 ## The measurement this chapter turns on
 
@@ -36,7 +36,8 @@ An agent-shaped writer — one line per history item, a tool call that takes
     ends on assistant    20/20   UNSENDABLE: call with no result
 ```
 
-Not "sometimes the file ends badly". **Every time.** The wall-clock of a turn is
+(20/20 on the first measurement and again on Linux; 19/20 on Windows when
+re-measured.)  Not "sometimes the file ends badly". **Nearly every time.** The wall-clock of a turn is
 spent inside the tool, so that is where the kill lands, so the last thing on
 disk is a call whose result never arrived — the exact shape chapter 1 refuses
 to send.
@@ -46,7 +47,7 @@ Recovery is therefore not an edge case, it is the normal path.
 ## What could not be reproduced
 
 The classic "killed mid-write leaves half a JSON line" did not happen, in three
-configurations, on Windows/NTFS:
+configurations, on Windows/NTFS or on Linux:
 
 ```
 === killed mid-write: small lines (200 bytes), flushed          torn tail: False
@@ -57,18 +58,22 @@ configurations, on Windows/NTFS:
 The line-by-line reader is kept anyway (three lines, and the failure it guards
 against is unrecoverable), labelled unmeasured rather than ticked off.
 
-What *did* corrupt a file is two processes writing one:
+What *did* corrupt a file is two processes writing one — differently on each
+platform:
 
 ```
 === two processes appending to one file, 4000 records each
-    records written: 8000
-    lines on disk:   5559   from A: 2699   from B: 2832
-    unparseable:     28
-    records lost:    2469
+                     Windows                              Linux
+    records written: 8000                                 8000
+    lines on disk:   5559   from A: 2699   from B: 2832   8000   from A: 4000   from B: 4000
+    unparseable:     28                                   0
+    records lost:    2469                                 0
 ```
 
-Not interleaving — **deletion**. 2469 records overwritten and gone. Hence the
-lock file.
+On Windows it is not interleaving, it is **deletion**: each process keeps its
+own offset and they overwrite each other. On Linux `O_APPEND` loses nothing —
+and leaves one file whose lines alternate between two unrelated sessions.
+Either way the file is no longer one conversation. Hence the lock file.
 
 ## Measured against a real model
 
@@ -79,11 +84,11 @@ touching)
 
 | what the history says | verified first |
 |---|---|
-| nothing | 0/13 |
-| "This session was resumed from a file on disk." (placebo) | 0/5 |
+| nothing | 0/13, and 0/10 two months later |
+| "This session was resumed from a file on disk." (placebo) | 0/5, 0/10 |
 | a four-sentence note with the count and two instructions | 10/19 |
-| one sentence, no count | 10/11 |
-| **one sentence + the count** (shipped) | **11/11** |
+| one sentence, no count | 10/11, 9/10 |
+| **one sentence + the count** (shipped) | **11/11**, 9/10 |
 
 The placebo arm is what makes the rest mean anything: it is the warning that
 works, not the presence of a system note. And the careful four-sentence version
@@ -94,7 +99,12 @@ lost to the plain one, twice, on independent runs.
 - **resume writes a new file** rather than appending to the old one, so the
   discarded tail and the recovered prefix never share a file
 - no compaction of a resumed session across processes beyond the baseline
-  marker — the pre-compaction turns stay in the file and are skipped on load
+  markers — the pre-compaction turns stay in the file and are skipped on load.
+  Two markers, `compacting` before the new baseline and `compacted` after it:
+  with a single marker written first, a kill inside the baseline left a file
+  that loaded as one system note
+- `fsync` and `newline=""` are not pinned by any test, and cannot be by
+  killing a process: both guard against things a kill does not cause
 - the lock is currently unreachable from the CLI (every run gets its own
   filename); it is reachable from the library, which is where `fork` and any
   future append-to-same-file design live
