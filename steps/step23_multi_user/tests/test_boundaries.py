@@ -1,13 +1,12 @@
 """Boundaries that only stay true if something checks them.
 
-Chapter -1 said an architecture rule written only in prose will rot. These are
+An architecture rule that lives only in prose will rot. These are
 the first two rules cheap enough to encode, so they are encoded.
 """
 
 from __future__ import annotations
 
 import ast
-import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -104,7 +103,7 @@ def test_FA_04_tools_does_not_import_the_agent() -> None:
     be loaded second.  `ToolFn` moved down to `agent_types.py` instead, which
     is the same answer chapter 1 reached for `ToolCall`.
 
-    Encoded as a test because chapter -1 said an architecture rule kept only
+    Encoded as a test because chapter 1 said an architecture rule kept only
     in prose will rot, and this is one line to check.
     """
     imports = imported_modules(SRC / "tools.py")
@@ -153,7 +152,3 @@ def test_subagent_and_tools_import_in_either_order(first: str, second: str) -> N
         text=True,
     )
     assert result.returncode == 0, result.stderr
-
-
-def test_importlib_is_used() -> None:
-    assert importlib.import_module("minicodex.history") is not None

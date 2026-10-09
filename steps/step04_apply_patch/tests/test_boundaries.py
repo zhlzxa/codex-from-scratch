@@ -1,13 +1,12 @@
 """Boundaries that only stay true if something checks them.
 
-Chapter -1 said an architecture rule written only in prose will rot. These are
+An architecture rule that lives only in prose will rot. These are
 the first two rules cheap enough to encode, so they are encoded.
 """
 
 from __future__ import annotations
 
 import ast
-import importlib
 import subprocess
 import sys
 from pathlib import Path
@@ -82,7 +81,3 @@ def test_F01_08_agent_types_depends_on_nothing_of_ours() -> None:
     """The shared module is only a solution while it stays a leaf."""
     ours = {m for m in imported_modules(SRC / "agent_types.py") if m.startswith("minicodex")}
     assert ours == set(), f"agent_types must stay a leaf, but imports {ours}"
-
-
-def test_importlib_is_used() -> None:
-    assert importlib.import_module("minicodex.history") is not None
