@@ -65,11 +65,13 @@ def permission_error(problem: str, *, you_sent: str | None = None, do_this: str)
     A permission decision is not about the command at all. It is about what
     this session is allowed to do, and it will not change because the model
     tried harder. Retrying is guaranteed to fail, and a model that treats it as
-    an ordinary error spends its entire turn budget re-sending the same string.
+    an ordinary error spends its turn budget asking for the same thing in
+    different spellings.
 
     Two things carry the distinction: a prefix that is not the word "Error",
     and a `do_this` that says the retry will fail and names the one action that
-    can change the answer. Both are load-bearing; the wording was measured, and
-    what was measured is in the chapter.
+    can change the answer. The wording alone was measured and did not stop the
+    retrying -- a `request_permissions` tool did; the prefix mostly helps a
+    human reading the transcript tell the two failures apart.
     """
     return _three_part(PERMISSION_PREFIX, problem, you_sent, do_this)
