@@ -317,6 +317,11 @@ class SubAgentContext:
     # Where "[sub-agent ...]" lines go.  A sub-agent that leaves no trace in the
     # terminal is a minute of silence the user cannot interpret.
     announce: Callable[[str], None] | None = None
+    # Given the child's shell, returns the child's `on_turn_start`.  A function
+    # that makes one rather than the hook itself, because the hook has to be
+    # bound to a shell that does not exist until the child is built.  Until
+    # this field existed a sub-agent never saw AGENTS.md at all.
+    on_turn_start_for: Callable[[ShellSession], Callable[[], str | None]] | None = None
     children: list[TaskResult] = field(default_factory=list)
 
 
@@ -325,7 +330,14 @@ def _say(ctx: SubAgentContext, message: str) -> None:
         ctx.announce(message)
 
 
-def child_tools(ctx: SubAgentContext) -> ToolSet:
+def child_shell(ctx: SubAgentContext) -> ShellSession:
+    """A shell of the child's own, starting where the parent is standing."""
+    shell = ShellSession(timeout=ctx.parent_shell.timeout)
+    shell.cwd = ctx.parent_shell.cwd
+    return shell
+
+
+def child_tools(ctx: SubAgentContext, shell: ShellSession | None = None) -> ToolSet:
     """The child's tools: handlers, schemas and footprints, built together.
 
     Together because chapter 4 paid for the version where the first two were
@@ -346,10 +358,7 @@ def child_tools(ctx: SubAgentContext) -> ToolSet:
     happens when a prompt names a tool the policy will not allow: the model
     calls it (2/3) and spends a turn finding out.
     """
-    shell = ShellSession(timeout=ctx.parent_shell.timeout)
-    shell.cwd = ctx.parent_shell.cwd
-
-    tools = ctx.build_tools(shell)
+    tools = ctx.build_tools(shell or child_shell(ctx))
     if ctx.depth + 1 < ctx.max_depth:
         tools = tools.plus(spawn_toolset(replace(ctx, depth=ctx.depth + 1)))
     return tools
@@ -369,7 +378,11 @@ async def run_task(spec: TaskSpec, ctx: SubAgentContext) -> TaskResult:
     if spent >= ctx.child_turn_budget:
         return TaskResult("budget", "")
 
-    tools = child_tools(ctx)
+    # Built here rather than inside `child_tools`, because two things now
+    # need the same object: the tools that run commands in it, and the
+    # AGENTS.md watcher that asks it where it is.
+    shell = child_shell(ctx)
+    tools = child_tools(ctx, shell)
     writer = _writer(ctx)
     # The parent's `Wiring`, not a fresh one: recorder, context window,
     # summariser and concurrency cap all cross the boundary as one object.
@@ -381,6 +394,7 @@ async def run_task(spec: TaskSpec, ctx: SubAgentContext) -> TaskResult:
         max_turns=ctx.max_turns,
         instructions=spec.instructions(),
         rollout=writer,
+        on_turn_start=ctx.on_turn_start_for(shell) if ctx.on_turn_start_for else None,
     )
 
     # The first line of the task, for the terminal.  `split`, not

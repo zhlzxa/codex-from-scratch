@@ -187,9 +187,10 @@ class Wiring:
         `on_turn_start` joins `on_stop` here rather than in `Wiring` itself for
         the same reason: chapter 13's AGENTS.md watcher is bound to *one run's*
         shell, and a `Wiring` value is the object shared between a parent and
-        every child it spawns.  A child gets no watcher at all -- the same
-        absence chapter 10 gave it for MCP tools -- rather than one silently
-        bound to its parent's working directory.
+        every child it spawns.  A child gets a watcher of its own, bound
+        to its own shell (`SubAgentContext.on_turn_start_for`) -- the first
+        version gave it none at all, and a sub-agent sent to add a dependency
+        had never been shown the project's AGENTS.md.
         """
         return Agent(
             model,

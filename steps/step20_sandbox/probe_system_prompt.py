@@ -10,9 +10,17 @@ Run one section at a time:
     uv run python probe_system_prompt.py minimal    # F13-04, real agent, 3 samples/arm
     uv run python probe_system_prompt.py ask        # F13-05, real agent, 3 samples/arm
     uv run python probe_system_prompt.py agentsmd   # F13-09/10/11, no network, filesystem only
+    uv run python probe_system_prompt.py follow     # is AGENTS.md obeyed? real agent
+    uv run python probe_system_prompt.py cost       # does the shipped sentence over-ask?
 
-Ollama sections need `ollama serve` running with gemma4:31b-cloud pulled.
+Three samples per arm by default; `PROBE_SAMPLES=20` asks for more. Three is
+enough to see 0/3 against 3/3 and not enough to tell 1/3 from 2/3.
+
 OpenAI sections need OPENAI_API_KEY and cost a few cents total.
+Ollama arms need `ollama serve` running with gemma4:31b-cloud pulled. If it is
+not reachable those arms are skipped and the output says so -- the first
+version crashed with a connection error halfway through a section, after the
+OpenAI half had already been paid for.
 """
 
 from __future__ import annotations
@@ -29,18 +37,44 @@ import httpx
 
 from minicodex import system_prompt
 from minicodex.agent import Agent
+from minicodex.agents_md import watch
 from minicodex.approval import AllowAll, Session, permissions_block
 from minicodex.model import OLLAMA_BASE_URL, OPENAI_BASE_URL, ChatCompletionsModel
 from minicodex.shell import ShellSession
 from minicodex.tools import TOOL_SCHEMAS, default_tools
 
 ROOT = Path(__file__).resolve().parent
-SAMPLES = 3
+SAMPLES = int(os.environ.get("PROBE_SAMPLES", "3"))
 
 PROVIDERS: dict[str, tuple[str, str, dict[str, Any]]] = {
     "openai": (OPENAI_BASE_URL, "gpt-4o-mini", {}),
     "ollama": (OLLAMA_BASE_URL, "gemma4:31b-cloud", {}),
 }
+
+
+_REACHABLE: tuple[str, ...] | None = None
+
+
+def _providers() -> tuple[str, ...]:
+    """The providers that can be measured on this machine right now.
+
+    Checked once. A provider that is skipped is *reported* as skipped: a table
+    with one provider's rows missing and no explanation reads as if that
+    provider had been measured and had nothing to show.
+    """
+    global _REACHABLE
+    if _REACHABLE is None:
+        found = ["openai"]
+        try:
+            httpx.get(f"{OLLAMA_BASE_URL}/models", timeout=3.0).raise_for_status()
+            found.append("ollama")
+        except httpx.HTTPError as exc:
+            print(
+                f"[ollama not reachable at {OLLAMA_BASE_URL} ({type(exc).__name__}); "
+                "its arms are skipped, not measured]\n"
+            )
+        _REACHABLE = tuple(found)
+    return _REACHABLE
 
 
 def _openai_key() -> str:
@@ -85,7 +119,7 @@ async def _raw(provider: str, messages: list[dict[str, Any]]) -> httpx.Response:
 
 async def roles() -> None:
     print("Sending one message under each role name, both providers.\n")
-    for provider in ("openai", "ollama"):
+    for provider in _providers():
         print(f"== {provider} ==")
         for role in ("developer", "user", "system", "zzz_unknown_role"):
             resp = await _raw(
@@ -124,7 +158,7 @@ def _override_hit(text: str) -> bool:
 
 
 async def _override_variant(system_default: str) -> None:
-    for provider in ("openai", "ollama"):
+    for provider in _providers():
         print(f"== {provider} ==")
         arms = {
             "baked into one system message": [
@@ -285,9 +319,19 @@ def _pytest(work: Path) -> tuple[bool, str]:
     return result.returncode == 0, result.stdout[-1500:]
 
 
-def _instructions(session: Session, extra: str = "") -> str:
+# The prompt as it stood when the candidate sentences were measured: the
+# first paragraph of `system.md` and nothing else.  Every "baseline" arm is
+# built on this, *not* on `system_prompt()`.  The first version used
+# `system_prompt()`, which was the same thing until the ask-vs-guess sentence
+# was shipped into that file -- after which "baseline" contained the sentence
+# under test and `ask` reported 3/3 against 3/3.  A baseline that reads a file
+# the experiment later edits is not a baseline.
+PLACEHOLDER = system_prompt().split("\n\n")[0].strip()
+
+
+def _instructions(session: Session, extra: str = "", *, shipped: bool = False) -> str:
     block = permissions_block(session, can_request=False)
-    head = system_prompt().rstrip()
+    head = system_prompt().rstrip() if shipped else PLACEHOLDER
     if extra:
         head = f"{head}\n\n{extra}"
     return f"{head}\n\n{block}"
@@ -299,6 +343,7 @@ async def _run(
     task: str,
     *,
     extra_instructions: str = "",
+    shipped: bool = False,
     max_turns: int = 8,
 ) -> tuple[Any, list[tuple[str, dict[str, Any]]]]:
     session = Session(mode="workspace-write", approver=AllowAll())
@@ -319,7 +364,10 @@ async def _run(
         _client(provider, TOOL_SCHEMAS),
         watched,
         max_turns=max_turns,
-        instructions=_instructions(session, extra_instructions),
+        instructions=_instructions(session, extra_instructions, shipped=shipped),
+        # The same hook the command line installs, so a workspace that has an
+        # AGENTS.md is shown it the way a real run would be.
+        on_turn_start=watch(work, shell),
     )
     result = await agent.run(task)
     return result, calls
@@ -340,7 +388,7 @@ EXPLORE_SENTENCE = (
 
 
 async def explore() -> None:
-    for provider in ("openai", "ollama"):
+    for provider in _providers():
         print(f"== {provider} ==")
         for label, extra in (("baseline", ""), ("+ explore-first sentence", EXPLORE_SENTENCE)):
             blind = 0
@@ -389,7 +437,7 @@ def _claims_overall_success(text: str) -> bool:
 
 
 async def evidence() -> None:
-    for provider in ("openai", "ollama"):
+    for provider in _providers():
         print(f"== {provider} ==")
         for label, extra in (("baseline", ""), ("+ evidence sentence", EVIDENCE_SENTENCE)):
             false_claims = 0
@@ -429,7 +477,7 @@ MINIMAL_SENTENCE = (
 
 
 async def minimal() -> None:
-    for provider in ("openai", "ollama"):
+    for provider in _providers():
         print(f"== {provider} ==")
         for label, extra in (("baseline", ""), ("+ minimal-change sentence", MINIMAL_SENTENCE)):
             drifted = 0
@@ -460,18 +508,51 @@ ASK_SENTENCE = (
 
 
 async def ask() -> None:
-    for provider in ("openai", "ollama"):
+    for provider in _providers():
         print(f"== {provider} ==")
-        for label, extra in (("baseline", ""), ("+ ask-vs-guess sentence", ASK_SENTENCE)):
+        for label, extra, shipped in (
+            ("baseline", "", False),
+            ("+ ask-vs-guess sentence", ASK_SENTENCE, False),
+            ("system.md as shipped", "", True),
+        ):
             asked = 0
             for i in range(SAMPLES):
                 work = _workspace()
-                result, calls = await _run(provider, work, ASK_TASK, extra_instructions=extra)
+                result, calls = await _run(
+                    provider, work, ASK_TASK, extra_instructions=extra, shipped=shipped
+                )
                 asked_question = not calls and "?" in result.final_text
                 if asked_question:
                     asked += 1
                 print(f"    sample {i}: tool_calls={len(calls)} final={result.final_text[:100]!r}")
             print(f"  {label:<28} asked instead of guessing: {asked}/{SAMPLES}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# What the shipped sentence costs: does an agent told to ask when a request is
+# ambiguous now ask about requests that are not?
+# ---------------------------------------------------------------------------
+
+
+async def cost() -> None:
+    tasks = (("explore", EXPLORE_TASK), ("evidence", EVIDENCE_TASK), ("minimal", MINIMAL_TASK))
+    for provider in _providers():
+        print(f"== {provider} ==")
+        for label, shipped in (("baseline", False), ("system.md as shipped", True)):
+            idle = 0
+            total = 0
+            for name, task in tasks:
+                for i in range(SAMPLES):
+                    work = _workspace()
+                    result, calls = await _run(provider, work, task, shipped=shipped)
+                    total += 1
+                    if not calls:
+                        idle += 1
+                        print(
+                            f"    {name} sample {i}: no tool call; said {result.final_text[:90]!r}"
+                        )
+            print(f"  {label:<28} did nothing but talk: {idle}/{total}")
         print()
 
 
@@ -524,6 +605,60 @@ def agentsmd() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Is an AGENTS.md obeyed? Everything above measures the parts; this is the
+# whole thing, through the real watcher, with a task that does not mention
+# the convention at all.
+# ---------------------------------------------------------------------------
+
+# An arbitrary rule on purpose: something no model does unprompted, so the
+# arm without the file is a real zero.  And an *edit*, not a new file -- the
+# first version asked for `sub.py`, and chapter 4's `apply_patch` cannot
+# create a file, so it would have measured that instead.
+FOLLOW_MARK = "# reviewed-by: agent"
+FOLLOW_CONVENTION = (
+    f"Every new function gets the comment line `{FOLLOW_MARK}` directly above its `def`.\n"
+)
+FOLLOW_TASK = MINIMAL_TASK
+
+
+async def follow() -> None:
+    for provider in _providers():
+        print(f"== {provider} ==")
+        for label, present in (("no AGENTS.md", False), ("AGENTS.md present", True)):
+            followed = 0
+            adjacent = 0
+            for i in range(SAMPLES):
+                work = _workspace()
+                if present:
+                    (work / "AGENTS.md").write_text(FOLLOW_CONVENTION, encoding="utf-8")
+                await _run(provider, work, FOLLOW_TASK)
+                text = (work / "calc.py").read_text(encoding="utf-8")
+                added = "def subtract" in text
+                # Two scores, because the first real run wrote the mark and then
+                # a blank line before the `def`: noticed and applied, but not
+                # "directly above". One strict number would have called that a miss.
+                ok = added and FOLLOW_MARK in text
+                exact = f"{FOLLOW_MARK}\ndef subtract" in text
+                followed += ok
+                adjacent += exact
+                state = (
+                    "marked, directly above"
+                    if exact
+                    else "marked, a blank line away"
+                    if ok
+                    else "added, not marked"
+                    if added
+                    else "not added"
+                )
+                print(f"    sample {i}: subtract {state}")
+            print(
+                f"  {label:<20} mark written: {followed}/{SAMPLES}"
+                f"   directly above the def: {adjacent}/{SAMPLES}"
+            )
+        print()
+
+
+# ---------------------------------------------------------------------------
 
 
 async def _main(argv: list[str]) -> int:
@@ -536,6 +671,8 @@ async def _main(argv: list[str]) -> int:
         "minimal": minimal,
         "ask": ask,
         "agentsmd": agentsmd,
+        "follow": follow,
+        "cost": cost,
     }
     if len(argv) != 1 or argv[0] not in sections:
         print(__doc__)

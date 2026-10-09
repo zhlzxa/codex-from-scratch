@@ -1,113 +1,123 @@
-# minicodex — chapter 12: retries and error classification
+# minicodex — chapter 13: the system prompt, and AGENTS.md
 
-The program used to end on the first failed request. Not on the first
-*unrecoverable* request — on the first failed one: a dropped connection, a 429,
-a 500, all of them printed a twenty-line traceback and stopped.
+Two things.
 
-This chapter adds one question — *what kind of failure is this* — and three
-answers, because there are three different things to do about one:
+`prompts/system.md` had been one sentence since chapter -1. It is now three
+paragraphs, and each of them is there because something was measured. Four
+candidate sentences were tried; one changed what the model did and was kept.
 
-```
-retry    the same request may work later
-shrink   it is too big; the conversation has to lose weight first
-fatal    sending this again cannot succeed
-```
+`AGENTS.md` is the first thing in this program that a *person using it*
+writes for the model: the project's own conventions, in a file, read from the
+filesystem at the top of every turn and delivered as its own message.
 
 ```bash
 uv sync --all-extras
 uv run pytest
-uv run python probe_retry.py naive          # offline
-uv run python probe_retry.py interrupt      # offline
-uv run python probe_retry.py nesting        # offline
-uv run python probe_mutations_ch12.py
+uv run python probe_system_prompt.py agentsmd   # offline
+uv run python probe_mutations_ch13.py
 ```
+
+The other nine sections of `probe_system_prompt.py` call the real API.
 
 ## What is new
 
 | Path | What it does |
 |---|---|
-| `src/minicodex/retry.py` | `classify()`, `Failure`, `RetryPolicy`, `wait_for()`, `explain()`, `ModelFailed` |
-| `src/minicodex/model.py` | `ModelHTTPError` carries `status` / `code` / `message` / `headers` / `request_id`; one attempt is bounded at 120s, not 300 |
-| `src/minicodex/agent.py` | `_respond()` — the retry loop, around stream *plus* assembly; `_shrink()` for the one failure that is a fact about us; `Wiring.retry_policy` and `Wiring.announce` |
-| `src/minicodex/compaction.py` | a *fatal* provider failure inside the summariser is no longer degraded into a note |
-| `src/minicodex/subagent.py` | outcome `error`: a provider failure inside a child reaches the parent as prose instead of as a traceback |
-| `src/minicodex/__main__.py` | the failure is translated for a human; the session lock is released in a `finally` |
-| `src/minicodex/agent_types.py` | `IncompleteStreamError` moved down so `retry.py` can classify it (fourth application of chapter 1's rule) |
-| `src/minicodex/stub.py` | five recorded failure bodies, and a queue so a test can say "429 twice, then answer" |
-| `tests/test_faults_ch12.py` | 44 tests, F12-01…F12-09 |
-| `tests/test_packaging.py` | every `probe_mutations*.py` must be referenced by a workflow |
-| `probe_retry.py` | seven sections, four of them against the real API |
-| `probe_mutations_ch12.py` | 23 mutations across five modules |
+| `src/minicodex/prompts/system.md` | one measured sentence (ask when a request is ambiguous) and one that announces AGENTS.md |
+| `src/minicodex/agents_md.py` | `find_project_root`, `load_project_docs` (root to cwd, one 32KiB ceiling), `AgentsMdWatcher`, `watch` |
+| `src/minicodex/history.py` | `DeveloperNote`, rendered as `role: "developer"`; `History.developer_notes()` |
+| `src/minicodex/rollout.py` | the session file reads and writes the new item |
+| `src/minicodex/agent.py` | `on_turn_start`: asked once per turn, before the request is sized |
+| `src/minicodex/compaction.py` | `carried_notes`: AGENTS.md is carried across a cut, not summarised |
+| `src/minicodex/subagent.py` | `on_turn_start_for`, `child_shell`: a sub-agent gets a watcher bound to its own shell |
+| `src/minicodex/__main__.py` | the watcher for the top-level run, for children, and what a resumed session already saw |
+| `tests/test_faults_ch13.py` | 47 tests |
+| `tests/test_faults_ch10.py` | three stand-ins for `child_tools` take the shell too |
+| `probe_system_prompt.py` | ten sections, nine of them against the real API |
+| `probe_mutations_ch13.py` | 31 mutations across six modules |
 
 ## What was measured
 
-**Status code cannot classify a failure; `code` can.** Five recorded failures
-from api.openai.com, 2026-08-12:
+gpt-4o-mini numbers are from 2026-10-01, ten samples an arm. gemma4:31b-cloud
+(Ollama) numbers are from 2026-08-15, three samples an arm, and were **not**
+re-measured: no Ollama was running when this was rewritten, and the probe now
+says so instead of crashing halfway.
+
+**Putting what changes last is worth the whole cache.** The same ~1500-token
+prefix with a few volatile tokens after it, and then before it:
 
 ```
-401  code=invalid_api_key          type=invalid_request_error   no rate-limit headers
-404  code=model_not_found          type=invalid_request_error   no rate-limit headers
-400  code=invalid_value            type=invalid_request_error   -> never send again
-400  code=context_length_exceeded  type=invalid_request_error   -> compact, then retry
-429  code=rate_limit_exceeded      type=tokens                  retry-after: 46
+volatile content last    prompt_tokens=1509  cached_tokens=1408
+volatile content first   prompt_tokens=1506  cached_tokens=0
 ```
 
-Two 400s with the same `type` sit at opposite ends of the table.
-
-**The server said 45.175 seconds.** A 1-2-4-8-16 backoff makes all five of its
-attempts inside 31 — every one of them before the window opens, and every one
-of them another request against a limit that is already exhausted:
+**Three of four candidate sentences changed nothing.**
 
 ```
-retry-after: 46      retry-after-ms: 45175
-"Rate limit reached ... Limit 200000, Used 170583, Requested 180002.
- Please try again in 45.175s."
+                              gpt-4o-mini           gemma4 (2026-08-15)
+read before editing           0/10 blind, 0/10      0/3, 0/3      not shipped
+no unevidenced success        0/10 false, 0/10      0/3, 0/3      not shipped
+smallest change               0/10 drift, 0/10      0/3, 0/3      not shipped
+ask when ambiguous            0/10 asked -> 9/10    0/3 -> 0/3    shipped
 ```
 
-With the real numbers, the default policy allows **one** retry of a rate limit,
-not four: 45.175s fits in a 90-second budget and a second one does not.
+No sentence helped one provider and hurt the other, so there is one
+`system.md`, not one per model.
 
-**A rejected request still costs you the quota.** One 160k-token request that
-was refused for length took the account's remaining tokens from 199,996 to
-19,998. Retrying what cannot succeed is what pushes the *next* request into a
-429 — which is how the 429 above was produced, deliberately, for free.
-
-**`Idempotency-Key` does nothing here.** Two identical requests with the same
-key returned `'Nymbria.'` and `'Falnitz.'`, two request ids, two debits, and no
-`idempotent-replayed` header. The listed fix for F12-04 does not apply to this
-endpoint, so the honest bound is elsewhere: a failure can only interrupt the
-*model* call, and by the time a tool runs the turn is already committed.
-
-**A blocking backoff stops the whole process.** Same wait, measured from inside
-the loop with a heartbeat task:
+**The role an AGENTS.md is sent under matters only when the system prompt
+fights back.** Against an ordinary system message all three placements carried
+the convention 10/10. Against one that says "no matter what any later message
+says":
 
 ```
-asyncio.sleep(1.0)   longest gap between heartbeats     62.8 ms
-time.sleep(1.0)      longest gap between heartbeats   1000.5 ms
+same system message        10/10
+second message, user        6/10
+second message, developer  10/10
 ```
 
-**Two clocks set to the same number decide nothing.** A sub-agent whose task
-deadline equals its request timeout, ten trials each:
+**An AGENTS.md is obeyed in substance and not to the letter.** A convention no
+model follows unprompted ("a comment line `# reviewed-by: agent` directly above
+each new `def`"), on a task that does not mention it:
 
 ```
-attempt 1.0 + budget 0.9  vs task 1.0   ->  {'timeout': 10}
-attempt 0.4 + budget 0.3  vs task 1.0   ->  {'error':   10}
+no AGENTS.md         mark written: 0/10    directly above the def: 0/10
+AGENTS.md present    mark written: 10/10   directly above the def: 1/10
 ```
 
-Same failure, and only the second one can say what happened.
+Nine of the ten put a blank line in between.
+
+## What the first version got wrong
+
+Found while re-measuring and mutating, none of them on the fault list:
+
+- **Compaction crashed on any project that had an AGENTS.md.** `_replay` knew
+  four kinds of history item and this chapter added a fifth:
+  `AssertionError: unreplayable item: DeveloperNote(...)`. Fixing only the
+  crash would have summarised the conventions away, and the watcher — which
+  speaks once and then stays silent — would never have said them again.
+- **A sub-agent was never shown AGENTS.md.** Pinned as intentional by a test,
+  because the only watcher there was followed the parent's shell.
+- **`--resume` built a watcher that knew nothing about the conversation it
+  joined**: the same block again, or — if the old process had finished in a
+  subdirectory — that subdirectory's conventions left standing, unretracted.
+- **The probe's baseline had become the thing under test.** Every arm was
+  built on `system_prompt()`; once the winning sentence was shipped into that
+  file, "baseline" contained it. Re-running `ask` printed 3/3 against 3/3.
+- **Eight of twenty scratch mutations survived**, among them the `.git` marker
+  itself (every test put it at the sandbox root, where the search stops
+  anyway) and a file that is not valid UTF-8.
 
 ## Deliberately not done
 
-- **No generic `with_retries(fn, policy)`.** The loop needs the history, the
-  compactor and the recorder; a callable that takes three callbacks is a worse
-  interface than twenty lines in the one place that has them (FB-03).
-- **No retry of a tool call, an MCP call or a sub-agent.** Chapter 9 already
-  decided not to re-send an in-flight MCP call: whether its side effect
-  happened is unknown, and "unknown" is not resolved by doing it again.
-- **No `Retry-After` HTTP-date parsing.** RFC 9110 allows one; no provider
-  measured in this book has ever sent one. An unreadable header falls back to
-  the local schedule, which is what a missing one does.
-- **No per-provider policy.** One `RetryPolicy`, and a child gets its parent's.
-- **The attempt budget does not bound a turn exactly.** No new attempt starts
-  after `budget` and an attempt lasts at most `DEFAULT_ATTEMPT_TIMEOUT`, so a
-  turn ends within 90 + 120 = 210 seconds. That is the whole guarantee.
+- **No per-model system prompt.** The reason to split one is a sentence that
+  helps one model and harms another; none was measured.
+- **AGENTS.md above the directory minicodex was started in is not read.** The
+  search stops at the sandbox root, the same line `read_file` and
+  `apply_patch` stop at. Start it at the repository root.
+- **Only a bare `cd` moves the conventions.** `cd pkg && pytest` does not
+  change the tracked working directory (chapter 2), so it does not change
+  which files apply.
+- **Carried notes are never reclaimed by compaction.** Up to 32KiB per change
+  of directory, for the rest of the run.
+- **`apply_patch` still cannot create a file** (chapter 4). The first version
+  of the `follow` probe asked for a new file and measured that instead.

@@ -81,7 +81,10 @@ class DeveloperNote:
     message says"`), `role: "user"` won only **1 of 3** on gpt-4o-mini --
     worse than leaving the override sentence in the *same* system message
     (3/3) -- while `role: "developer"` matched baking it into the system
-    message exactly, 3/3. Ollama accepts `"developer"` (HTTP 200, unlike
+    message exactly, 3/3. Three samples cannot tell 1/3 from 2/3, so it was
+    measured again at ten (2026-10-01): `"user"` 6/10, `"developer"` 10/10,
+    same system message 10/10 -- the direction held. Ollama accepts
+    `"developer"` (HTTP 200, unlike
     OpenAI's HTTP 400 on a role it does not recognise at all) but does not
     grant it any special standing over `"user"`: against the fortified
     prompt, gemma4 refused the override under every arm, 0/3, including the
@@ -152,6 +155,15 @@ class History:
 
     def add_developer_note(self, text: str) -> None:
         self._append(DeveloperNote(text))
+
+    def developer_notes(self) -> tuple[str, ...]:
+        """Every AGENTS.md note on record, oldest first.
+
+        For a resumed session: the watcher that wrote these belonged to a
+        process that has exited, and the new one needs to know what the
+        conversation was already told.
+        """
+        return tuple(item.text for item in self._items if isinstance(item, DeveloperNote))
 
     def add_assistant(self, text: str, tool_calls: Sequence[ToolCall] = ()) -> None:
         if self._unanswered:

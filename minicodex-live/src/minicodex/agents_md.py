@@ -46,8 +46,10 @@ mechanisms already in this codebase that are closest to this one:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 FILENAME = "AGENTS.md"
 ROOT_MARKER = ".git"
@@ -197,10 +199,13 @@ def load_project_docs(sandbox_root: Path, cwd: Path, *, max_bytes: int = MAX_BYT
     return ProjectDocs(text=text, truncated=truncated, sources=tuple(sources))
 
 
+_BLOCK_HEADING = "# Project conventions ("
+
+
 def _block(docs: ProjectDocs) -> str:
     listed = ", ".join(docs.sources)
     return (
-        f"# Project conventions ({listed})\n\n"
+        f"{_BLOCK_HEADING}{listed})\n\n"
         "A person wrote this, not the model that is talking to you now. Where "
         "it conflicts with your general defaults, follow it -- that is what it "
         "is for.\n\n" + docs.text
@@ -232,13 +237,53 @@ class AgentsMdWatcher:
     confuses its own cwd with its parent's.
     """
 
-    def __init__(self, sandbox_root: Path, *, max_bytes: int = MAX_BYTES) -> None:
+    def __init__(
+        self,
+        sandbox_root: Path,
+        *,
+        max_bytes: int = MAX_BYTES,
+        shown: Sequence[str] = (),
+    ) -> None:
         self._root = sandbox_root
         self._max_bytes = max_bytes
         self._last: ProjectDocs = NONE_FOUND
+        # `shown` is for `--resume`: the notes an earlier process already put
+        # into this conversation (`History.developer_notes()`).  Only the last
+        # one that spoke about conventions matters -- it is what the model
+        # currently believes is in force.
+        self._inherited: str | None = None
+        for text in reversed(list(shown)):
+            if _BLOCK_HEADING in text or text.startswith(REMOVAL_NOTICE):
+                self._inherited = text
+                break
+
+    def _first_check_after_resume(self, inherited: str, current: ProjectDocs) -> str | None:
+        """What to say when the conversation already has a conventions note
+        that this object did not write.
+
+        A new process starts its shell at the repository root again, whatever
+        directory the old one finished in.  Without this, a session that ended
+        inside `pkg/` came back with `pkg/`'s conventions still standing and
+        nothing retracting them, and one that had not moved was told the same
+        thing a second time, up to `MAX_BYTES` of it per resume.
+        """
+        was_removed = inherited.startswith(REMOVAL_NOTICE)
+        if not current:
+            return None if was_removed else REMOVAL_NOTICE
+        block = _block(current)
+        if was_removed:
+            return block
+        if block in inherited:
+            return None
+        return f"{REPLACEMENT_NOTICE}\n\n{block}"
 
     def refresh(self, cwd: Path) -> str | None:
         current = load_project_docs(self._root, cwd, max_bytes=self._max_bytes)
+
+        if self._inherited is not None:
+            inherited, self._inherited = self._inherited, None
+            self._last = current
+            return self._first_check_after_resume(inherited, current)
 
         if current.sources == self._last.sources and current.text == self._last.text:
             return None
@@ -268,3 +313,16 @@ class AgentsMdWatcher:
         if not had_content:
             return block
         return f"{REPLACEMENT_NOTICE}\n\n{block}"
+
+
+def watch(sandbox_root: Path, shell: Any) -> Callable[[], str | None]:
+    """A watcher bound to one shell, as the zero-argument function
+    `Agent(on_turn_start=...)` takes.
+
+    `shell` is anything with a `.cwd` -- read on every call, not once here,
+    because the whole point is to follow a `cd`.  One call of this function
+    per agent: the top-level run and each sub-agent get a watcher of their
+    own, since each has a shell of its own.
+    """
+    watcher = AgentsMdWatcher(sandbox_root)
+    return lambda: watcher.refresh(Path(shell.cwd))
