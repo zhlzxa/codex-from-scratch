@@ -280,12 +280,27 @@ def test_several_edits_to_one_file_all_land(tmp_path: Path) -> None:
     )
 
     assert result.startswith("Applied")
-    # Known limit: each edit is validated against the file on disk, so two
-    # edits to one file are planned independently and the last write wins.
-    # Documented rather than fixed -- chapter 4 never observed a model
-    # sending two edits to one file, and guessing at the merge semantics
-    # before seeing one would be inventing a spec.
-    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "A = 1\nB = 20\n"
+    # The first version planned each edit against the file on disk, so the
+    # last write won: this assertion read "A = 1\nB = 20\n" -- the first edit
+    # silently lost, under a test whose name said the opposite.
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "A = 10\nB = 20\n"
+
+
+def test_edits_that_are_only_valid_together_are_accepted(tmp_path: Path) -> None:
+    """The syntax check runs once per file, after all of its edits: checking
+    after each one would refuse the first half of a two-part change."""
+    (tmp_path / "a.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+
+    result = apply_edits(
+        [
+            Edit("a.py", "def f():", "def f(\n"),
+            Edit("a.py", "def f(\n", "def f(\n    x=1,\n):"),
+        ],
+        tmp_path,
+    )
+
+    assert result.startswith("Applied"), result
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "def f(\n    x=1,\n):\n    return 1\n"
 
 
 def test_an_empty_patch_is_refused(tmp_path: Path) -> None:

@@ -149,6 +149,7 @@ Also found, not on the list:
 | Plain substring matching is itself ambiguous under nested indentation — an 8-space line contains a 4-space anchor | 🟢 | Not fixed; the ambiguity is correctly reported. Recorded because "exact match implies unique" is a false intuition |
 | The description snapshot from Ch03 walked only the first level of `properties`, so `apply_patch`'s nested parameter descriptions — including the whole uniqueness requirement — were never pinned | 🟣 | Recurse into `items` |
 | The graded-matching order had no test at all; reversing `_LEVELS` left all 124 tests green | ⚪ | A case with one exact site and two loosely-matching ones (tab-indented, to avoid the substring overlap above) |
+| Two edits to one file: each was planned against the file on disk, so the last write won and the earlier edits vanished while the result said "Applied 2 edit(s)" -- and the test pinning it was named `test_several_edits_to_one_file_all_land`. Originally deferred as "never observed"; fixed in the rewrite because it reports success while losing data | 🟣 | Stage edits per file, each located in the text the previous one produced; parse once per file after all its edits |
 
 ## Interlude A · The first refactor ✅
 

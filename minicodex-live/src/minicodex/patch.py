@@ -141,6 +141,9 @@ def apply_edits(edits: list[Edit], root: Path, audit: Any = None, actor: str = "
     third of five hunks does not match -- a state the model did not ask for
     and cannot see. One failure, nothing written, one error to act on.
 
+    Edits to the same file apply in the order given, each one located in the
+    text the previous one produced.
+
     `audit` is the console's append-only trail, passed from the shell session
     that carries it (see `web/runtime._AuditedShell`).  Written only after
     every edit is on disk -- a refused or failed patch is not a file change,
@@ -155,7 +158,11 @@ def apply_edits(edits: list[Edit], root: Path, audit: Any = None, actor: str = "
             do_this="Send at least one edit with path, old_text and new_text.",
         )
 
-    planned: list[tuple[Path, str, str]] = []
+    # Staged per file: a second edit to the same file is located in the text
+    # the first one produced, not in the file on disk.  Planning every edit
+    # against the disk version meant the last write won -- the earlier edits
+    # to that file vanished while the result still said "Applied 2 edit(s)".
+    staged: dict[Path, tuple[str, str, str]] = {}  # path -> (text, ending, where)
     for index, edit in enumerate(edits, 1):
         where = f"edit {index} of {len(edits)} ({edit.path})" if len(edits) > 1 else edit.path
 
@@ -164,7 +171,10 @@ def apply_edits(edits: list[Edit], root: Path, audit: Any = None, actor: str = "
             return error
         assert path is not None
 
-        content, ending = read_source(path)
+        if path in staged:
+            content, ending, _ = staged[path]
+        else:
+            content, ending = read_source(path)
         span, why = locate(content, edit.old_text)
         if span is None:
             return tool_error(
@@ -177,9 +187,12 @@ def apply_edits(edits: list[Edit], root: Path, audit: Any = None, actor: str = "
             )
 
         start, end = span
-        updated = content[:start] + edit.new_text + content[end:]
+        staged[path] = (content[:start] + edit.new_text + content[end:], ending, where)
 
-        broken = syntax_error(path, updated)
+    # Parsed once per file, after every edit to it has been applied: two edits
+    # that are only valid together must not be refused halfway.
+    for path, (text, _, where) in staged.items():
+        broken = syntax_error(path, text)
         if broken is not None:
             return tool_error(
                 f"{where}: the edit would leave the file unparseable: {broken}",
@@ -189,9 +202,7 @@ def apply_edits(edits: list[Edit], root: Path, audit: Any = None, actor: str = "
                 ),
             )
 
-        planned.append((path, updated, ending))
-
-    for path, text, ending in planned:
+    for path, (text, ending, _) in staged.items():
         write_source(path, text, ending)
 
     names = ", ".join(sorted({e.path for e in edits}))
