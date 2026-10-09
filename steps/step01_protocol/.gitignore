@@ -17,3 +17,11 @@ venv/
 .env.*
 *.key
 *.pem
+
+# Recorded sessions.  Every `minicodex ask` writes one, and it contains the
+# whole conversation: the prompt, the model's replies, and the contents of
+# every file the agent read.  The recorder redacts credentials (chapter -1,
+# F-1-04) but it does not redact the source code, and none of it belongs in
+# the repository.  Found in chapter 0, when `git status` showed the directory
+# right after the recorder first wrote to it.
+.minicodex/

@@ -52,6 +52,12 @@ grep -rn "F04_07" steps/          # find the code and the test
 | ✅ F00-08 | A forgotten `await` does nothing, silently | ⚪ | `filterwarnings = ["error::RuntimeWarning"]` |
 | ✅ F00-09 | Blocking IO inside `async def` serialises the loop | ⚪ | ruff `ASYNC240` → `asyncio.to_thread` |
 
+Found along the way, not on the list:
+
+| Fault | Found | Fix |
+|---|---|---|
+| **`.minicodex/recordings/` was not in `.gitignore`.** Every `minicodex ask` writes one, containing the whole conversation — prompt, replies, and the contents of every file the agent read. F-1-04's redaction covers credentials, not source | 🟠 | Added, and added to F-1-03's guard list. Chapter -1 listed the things that are obviously secret; this is a directory the program creates by itself. Caught by running `git status` before the first commit after the recorder existed (originally missed until interlude A) |
+
 ## Chapter 1 · Protocol before logic ✅
 
 > Every entry measured against both Ollama and OpenAI on 2026-08-06.
@@ -169,7 +175,6 @@ Two faults found that were not on the list, both inherited, both worse than the 
 | Fault | Found | Fix |
 |---|---|---|
 | Every step's `README.md` still says "step 1: the protocol layer" — documentation stopped being updated at chapter 1 and nothing noticed | 🟠 | Not fixed retroactively; written correctly for this step. Nothing tests prose, and this is the cheap reminder of what that costs |
-| **`.minicodex/recordings/` was not in `.gitignore`.** Every `minicodex ask` writes one, containing the whole conversation — prompt, replies, and the contents of every file the agent read. F-1-04's redaction covers credentials, not source | 🟠 | Added, and added to F-1-03's guard list. Chapter -1 listed the things that are obviously secret; this is a directory the program creates by itself. Nobody had run the agent and then looked at `git status` |
 
 ## Chapter 5 · Approval and sandboxing ✅
 

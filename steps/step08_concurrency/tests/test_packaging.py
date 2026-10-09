@@ -132,10 +132,10 @@ def test_F_1_02_build_backend_is_declared(repo_root: Path) -> None:
         "__pycache__/",
         "*.key",
         ".venv/",
-        # Added in interlude A. The chapter -1 list covered the things that are
+        # Added in chapter 0. The chapter -1 list covered the things that are
         # obviously secret; this one is a directory the agent creates by itself,
-        # on every run, full of everything it read. Nothing had noticed because
-        # nothing had run the agent and then looked at `git status`.
+        # on every run, full of everything it read. `git status` showed it the
+        # first time the recorder wrote there.
         ".minicodex/",
     ],
 )
