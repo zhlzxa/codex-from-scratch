@@ -1,6 +1,6 @@
 """What actually happens when you drop the oldest half of a conversation.
 
-Builds a realistic agent history (system note, user, then four assistant/tool
+Builds a realistic agent history (system note, user, then three assistant/tool
 round trips), cuts it three different naive ways, and posts each one to a real
 server.  Prints the status and the first part of the body.
 

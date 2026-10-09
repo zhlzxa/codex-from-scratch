@@ -394,6 +394,19 @@ class Agent:
         tools = tuple(getattr(self.model, "tools", ()) or ())
         return Sizer(tools=tools, ratio=self.calibration.ratio)
 
+    def _raw_estimate(self, messages: Sequence[dict[str, Any]]) -> int:
+        """The estimate before any correction: the number `Calibration` is fed.
+
+        Not `_sizer().messages()`.  That one is already multiplied by the
+        current ratio, and the ratio of the truth to an already-corrected guess
+        is not the correction, it is the correction's *error*.  Feeding it back
+        made the ratio swing between the real factor and 1.0 on alternate
+        turns: against a server that always charged 1.5x the raw estimate it
+        read 1.50, 1.00, 1.50, 1.00.  Nothing failed.  The estimate was simply
+        uncorrected every other turn.
+        """
+        return Sizer(tools=self._sizer().tools).messages(messages)
+
     async def _maybe_compact(self, history: History) -> tuple[History, CompactionResult | None]:
         """Shrink the conversation if the next request would not fit.
 
@@ -506,7 +519,9 @@ class Agent:
                 # a run that never compacts still produces the observation that
                 # tells the next one how wrong its estimator is.
                 if turn.usage is not None:
-                    self.calibration.observe(estimated=estimated, actual=turn.usage.prompt_tokens)
+                    self.calibration.observe(
+                        estimated=self._raw_estimate(messages), actual=turn.usage.prompt_tokens
+                    )
                 return turn, history, estimated, forced
 
             self.recorder.record(

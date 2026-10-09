@@ -74,16 +74,24 @@ into an `IndexError` after the answer has already streamed.
 ## Measured against a real model
 
 Five facts planted in a transcript, checked in the compacted history
-(`probe_summary.py`, gpt-4o-mini, 5 samples):
+(`probe_summary.py`, gpt-4o-mini). Two runs, and they do not agree on the size
+of the effect:
 
 | | naive "summarise this" | the six-section prompt |
 |---|---|---|
-| facts kept | 15/25 | 23/25 |
-| the flag discovered by a failing test | 0/5 | 3/5 |
-| the one remaining task | 0/5 | 5/5 |
+| 2026-08-10, 5 samples: facts kept | 15/25 | 23/25 |
+| 2026-10-01, 10 samples: facts kept | 46/50 | 49/50 |
+| ...the flag discovered by a failing test, second run | 6/10 | 9/10 |
 
-Across six generations of summarising the summary, the surviving four facts
-stayed at four: decay was a single loss at generation 1, not a slide.
+The second run uses a longer transcript: once `plan()` learned to refuse a
+compaction that saves nothing, the original one was too small to be compacted
+at all, and the probe printed "all facts kept" for a compaction that never
+happened. The direction is the same in both runs; the gap is not. The one fact
+either prompt loses is the same one every time.
+
+Across six generations of summarising the summary, a fact that survives
+generation 1 survived all six: decay was a single loss at the first compaction
+or nothing, not a slide.
 
 **F06-05 did not reproduce.** Neither prompt made the model redo finished work
 in 10/10 continuations — it read the file it had already written before doing
@@ -95,6 +103,11 @@ anything else, which is verification, not repetition.
   non-string content rather than counting an image as free
 - the summariser is one model call with no retry; if it fails, the fallback is
   a note telling the model what it just lost
+- nothing stops compaction thrash. If one step of the task needs more than the
+  window holds, compaction replaces what was just read with a summary, the
+  model reads it again, and the run compacts every turn until the turn limit.
+  Measured: a 3000-token window and two source files, 11 compactions in 12
+  turns and no answer. The turn limit is the only bound
 - no cross-session compaction, no reloading a summary from disk (chapter 7)
 - rule of thumb constants (`0.75` trigger, `0.45` target, 700-token summary)
   are not tuned against anything but a handful of sessions
