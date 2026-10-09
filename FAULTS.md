@@ -291,6 +291,8 @@ Faults found that were not on the list:
 ## Chapter 8 · Concurrent tools ✅
 
 > `probe_scheduler.py`, 30 trials per configuration, 2026-08-11.
+> Re-run 2026-10-01 on Windows (30/30 at every delay) and on Linux (26/30 at
+> zero delay, 30/30 otherwise).
 > **The scheduler is list scheduling by declared resource, not locks**: each
 > call's `Footprint` (what it reads, what it writes, or `STATEFUL` if neither
 > question can be answered) decides which batch it lands in, and batch N+1
@@ -317,6 +319,10 @@ Two faults found that were not on the list:
 |---|---|---|
 | **"Preserve submission order" is weaker than it sounds.** The first version of `test_F08_05` assumed a call between two conflicting calls would run strictly between them in time; it does not. List scheduling only pushes a call *later* than something it conflicts with among calls before it — a non-conflicting call in between is free to join the earlier batch. Three calls `[a, b, c]` where `a` and `b` both write the same file and `c` reads an unrelated one schedule as `[[a, c], [b]]`, not `[[a], [b], [c]]` | 🟣 | Not a bug — corrected the test's expectation, not `batches()`. Worth an entry anyway: it is the difference between "the scheduler serialises conflicting work" (true, and all F08-01 needs) and "the scheduler preserves the model's list order" (false, and nobody should rely on it) |
 | `resolve()` (chapter 4) requires the target file to already exist, which `footprint_of()` inherits for free: an `apply_patch` edit naming a file that does not exist yet classifies as `STATEFUL` rather than crashing or guessing a resource key for a file that isn't there. Not a bug — this tool set cannot create files, so the case cannot arise from a real edit, but it is the same "unclassifiable defaults to conservative, not to `Footprint()`" rule stated once and inherited, not special-cased | 🟣 | No fix needed; recorded because it was checked rather than assumed (`test_footprint_of_apply_patch_with_no_path_in_an_edit_is_stateful`) |
+| **Two approval prompts on the terminal at once, and the answers crossed.** Two edits to two different files do not conflict, so they share a batch; in a session where editing needs approval both asked at the same moment. Two identical prompts were printed before either answer was read, and the user's "y" to the first one on screen edited the *second* file. The scheduler was right about the edits; the conflict was over the terminal and the person reading it, which no footprint names. Found while rewriting the chapter, by asking what can now happen at the same time that could not before | 🟣 | An `asyncio.Lock` in `CliApprover`: one question at a time, in the order the calls were issued. **Not fixed**: the prompt for an edit still does not say which file |
+| **The test for "history order follows submission" could not fail.** `asyncio.gather()` returns results in task order whoever finishes first, so appending in batch order looked identical. Order can only leak when the plan reorders calls across batches | ⚪ | Mutation run. A test where the plan is `[[a, c], [b]]` and the history must read a, b, c |
+| **Nothing tested that the CLI switches the scheduler on.** With that one line deleted the whole chapter is correct, tested, and never runs | ⚪ | Mutation run. A test that calls `main()` and inspects the `Agent` it builds (steps 8-10; interlude B moves the wiring) |
+| "Reproduces 30/30 with no delay" was true of one machine. On Linux the same probe loses the edit 26/30 at zero delay | 🟠 | Both columns recorded; the test keeps the delay |
 
 ## Chapter 9 · Too many tools (MCP) ✅
 

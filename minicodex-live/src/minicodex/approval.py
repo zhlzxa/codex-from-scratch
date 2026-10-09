@@ -412,9 +412,20 @@ class CliApprover:
     def __init__(self, *, stream_in=None, stream_out=None) -> None:
         self._in = stream_in
         self._out = stream_out
+        # One question on the terminal at a time.  Chapter 8 lets two calls run
+        # together, and two edits to two different files do not conflict -- so
+        # in a session where editing needs approval, both asked at once.  Two
+        # identical prompts were printed before either answer was read, and the
+        # answers went to whichever thread reached `readline()` first: measured,
+        # the user's "y" to the first question on screen edited the *second*
+        # file.  The lock lives here rather than on the session because the
+        # thing that cannot be shared is the terminal, and every session that
+        # asks through this object shares it.
+        self._one_at_a_time = asyncio.Lock()
 
     async def ask(self, request: ApprovalRequest) -> ApprovalReply:
-        return await asyncio.to_thread(self._ask_blocking, request)
+        async with self._one_at_a_time:
+            return await asyncio.to_thread(self._ask_blocking, request)
 
     def _ask_blocking(self, request: ApprovalRequest) -> ApprovalReply:
         import sys

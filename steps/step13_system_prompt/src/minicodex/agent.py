@@ -242,7 +242,7 @@ class Agent:
         # anything else -- rather than to some real classifier: every test
         # written before this chapter builds an `Agent` without this argument,
         # and "unknown tool means run it alone" is precisely the conservative
-        # rule chapter 3 and chapter 5 already use for input the code cannot
+        # rule chapter 2 and chapter 5 already use for input the code cannot
         # reason about (F02-09's environment allowlist, F05-01's "unknown
         # syntax asks"). A caller opts into real concurrency by passing
         # `tools.footprint_of` bound to its own repository root; nothing here
