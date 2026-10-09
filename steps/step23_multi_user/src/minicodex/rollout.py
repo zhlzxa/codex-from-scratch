@@ -138,14 +138,41 @@ class SessionMeta:
         return f"{self.session_id} | {self.model or '?'} | {self.sandbox_mode or '?'} | {where}"
 
 
+# Ids this process has already handed out.  See `new_session_id`.
+_ISSUED: set[str] = set()
+
+
 def new_session_id() -> str:
     """Sortable, unique enough, and readable in `ls`.
 
     Time first so that listing a directory is listing a history.  The pid is
     what makes two agents started in the same second land in different files --
     which matters because the alternative is the two-writer corruption above.
+
+    "Two agents" meant two processes when chapter 7 wrote that.  Chapter 10
+    put several agents in *one* process, and second-plus-pid stopped being
+    unique without anybody touching this function: a sub-agent spawned in the
+    second its parent started asked for the parent's own file and got
+    `RolloutError: ... already open` -- out of `run_task`, which promises not
+    to raise -- and two sub-agents finishing inside one second wrote two
+    sessions into one file.  A real model takes longer than a second per turn,
+    so it almost never showed; a scripted one in a test does it every time.
+    Found in chapter 11, by a test that ran two sessions back to back and
+    printed the same file name twice.
+
+    So an id this process has already issued gets a counter.  The common case
+    keeps the old shape.  The separator is `_` and not `-` for the sake of the
+    listing: sessions are listed by sorting file names, and `-` sorts *before*
+    the `.` of `.jsonl`, which would put the second session of a second ahead
+    of the first.  `_` sorts after it.
     """
-    return f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+    base = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+    candidate, attempt = base, 1
+    while candidate in _ISSUED:
+        attempt += 1
+        candidate = f"{base}_{attempt}"
+    _ISSUED.add(candidate)
+    return candidate
 
 
 # -- serialising one history item ------------------------------------------

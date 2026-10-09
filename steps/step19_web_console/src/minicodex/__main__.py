@@ -46,7 +46,7 @@ from minicodex.memory_write import (
     run_pipeline,
 )
 from minicodex.model import OLLAMA_BASE_URL, OPENAI_BASE_URL, ChatCompletionsModel
-from minicodex.plan import PLAN_INSTRUCTIONS, TaskPlan, unfinished_note
+from minicodex.plan import PLAN_INSTRUCTIONS, TaskPlan, restore_plan, unfinished_note
 from minicodex.policy import APPROVAL_POLICIES, SANDBOX_MODES
 from minicodex.recorder import Recorder
 from minicodex.registry import (
@@ -297,6 +297,10 @@ async def _ask(
             return 1
         loaded = read_rollout(path)
         resume_from, dropped = loaded.history()
+        # The plan is an object, and this is a new process: put back what the
+        # resumed conversation had agreed on, or the stop check has nothing to
+        # ask about and the run ends `[plan: none]` with steps still open.
+        restore_plan(task_plan, resume_from)
         if loaded.truncated_at is not None:
             print(f"[session file damaged from line {loaded.truncated_at}; using what precedes it]")
         if dropped:

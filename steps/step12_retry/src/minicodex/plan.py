@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
 
 from minicodex.agent_types import ToolSet
+from minicodex.history import AssistantMessage, History, ToolResult
 from minicodex.tool_errors import tool_error
 
 StepStatus = Literal["pending", "in_progress", "completed"]
@@ -225,6 +226,49 @@ async def update_plan(plan: TaskPlan, args: dict[str, Any]) -> str:
     return f"Plan updated.\n{plan.render()}\n{tail}"
 
 
+def restore_plan(plan: TaskPlan, history: History) -> None:
+    """Rebuild a resumed session's plan from the conversation it is resuming.
+
+    The plan is an object rather than a message so that compaction cannot
+    delete it -- and an object does not outlive the process.  `--resume`
+    therefore started every continued session with an empty `TaskPlan`: the
+    model could read its old plan in the history, the harness had none, the
+    stop check had nothing to ask about, and the first update was excused from
+    the evidence rule because it looked like a first update.  The run ended
+    `[plan: none]` on a task with open steps.
+
+    So the history is replayed: every `update_plan` call whose result says it
+    was accepted is applied again, in order, and every other answered call is
+    counted as work, exactly as `watching()` would have counted it live.  A
+    refused update is skipped -- it did not change the plan then and must not
+    now.
+
+    What this cannot do is said here rather than discovered later: if the
+    session was compacted before it stopped, the call is no longer in the
+    history and nothing is restored.  That is this module's own reason for
+    keeping the plan out of the history, met from the other side.
+    """
+    answers = {item.call_id: item.content for item in history.items if isinstance(item, ToolResult)}
+    for item in history.items:
+        if not isinstance(item, AssistantMessage):
+            continue
+        for call in item.tool_calls:
+            if call.call_id not in answers:
+                continue
+            if call.name != "update_plan":
+                plan.record_work(call.name)
+                continue
+            if not answers[call.call_id].startswith("Plan updated."):
+                continue
+            steps, error = _parse((call.arguments or {}).get("plan"))
+            if error is not None or steps is None:
+                continue
+            plan.steps = steps
+            plan.updates += 1
+            plan.work_since_update = 0
+            plan.revisions.append(plan.render())
+
+
 def unfinished_note(plan: TaskPlan) -> Callable[[], str | None]:
     """The loop's second question, asked once, when the model wants to stop.
 
@@ -254,11 +298,20 @@ def unfinished_note(plan: TaskPlan) -> Callable[[], str | None]:
     return check
 
 
-# The paragraph without which the tool is mostly not used.  Measured, three
-# arms of five samples on the same task: 21/30 requirements with no plan tool,
-# 25/30 with the tool and nothing said (**two of the five runs never called
-# it**), 30/30 with this in the system message.  A tool being available and a
-# tool being used are two changes, and only the second one showed up.
+# The paragraph without which the tool is mostly not used.  That is the whole
+# claim, and it took two measurements to cut it down to that.
+#
+# First measurement (five samples per arm): 21/30 requirements met with no plan
+# tool, 25/30 with the tool and nothing said, 30/30 with this paragraph -- and
+# this comment used to say the paragraph was worth nine requirements.  Measured
+# again for the rewrite, fifteen samples per arm: 71/90, 75/90, 74/90.  No
+# difference; the first result was five lucky runs.
+#
+# What both measurements agree on is use: with the tool present and nothing
+# said, 4 of 15 runs called it (2 of 5 never did, the first time); with this
+# paragraph, 15 of 15.  A tool being available and a tool being used are two
+# changes -- and a plan nobody writes gives the loop nothing to ask about when
+# the model stops.  The paragraph is here for the harness, not for the score.
 #
 # It lives here rather than in `prompts/system.md` for F05-10's reason: a
 # prompt that names a tool the current configuration does not have is a prompt
@@ -358,6 +411,7 @@ __all__ = [
     "StepStatus",
     "TaskPlan",
     "plan_toolset",
+    "restore_plan",
     "unfinished_note",
     "update_plan",
 ]

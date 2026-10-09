@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,7 +34,7 @@ import httpx
 from minicodex import system_prompt
 from minicodex.agent import Agent, RunResult
 from minicodex.approval import AllowAll, Session, permissions_block
-from minicodex.model import OPENAI_BASE_URL, ChatCompletionsModel
+from minicodex.model import OPENAI_BASE_URL, ChatCompletionsModel, ModelHTTPError
 from minicodex.shell import ShellSession
 from minicodex.tools import TOOL_SCHEMAS, default_tools
 
@@ -54,7 +55,14 @@ def _model(tools: list[dict[str, Any]]) -> ChatCompletionsModel:
     return ChatCompletionsModel(base_url=OPENAI_BASE_URL, model=MODEL, api_key=_key(), tools=tools)
 
 
-async def _retry(make: Callable[[], Any], attempts: int = 4) -> Any:
+async def _retry(make: Callable[[], Any], attempts: int = 6) -> Any:
+    """Run one sample, surviving a dropped connection or a rate limit.
+
+    Chapter 12 is where retries are designed; this exists so that a probe which
+    dies on run 40 of 60 does not throw the first 39 away.  `make` is called
+    again from scratch, and for these samples "from scratch" has to include the
+    files: see `_restore`, which `_run` calls before every attempt.
+    """
     for attempt in range(attempts):
         try:
             return await make()
@@ -63,6 +71,11 @@ async def _retry(make: Callable[[], Any], attempts: int = 4) -> Any:
                 raise
             print(f"    (retrying after {type(exc).__name__})", file=sys.stderr)
             await asyncio.sleep(2 * (attempt + 1))
+        except ModelHTTPError as exc:
+            if "HTTP 429" not in str(exc) or attempt == attempts - 1:
+                raise
+            print("    (rate limited; waiting 30s)", file=sys.stderr)
+            await asyncio.sleep(30)
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +146,29 @@ def _workspace() -> Path:
     return work
 
 
+# What each workspace held when its sample first started.  A sample that is
+# retried after a dropped connection must not begin with the half-finished
+# edits of the attempt that failed: those files are what the section scores.
+_PRISTINE: dict[Path, dict[Path, bytes]] = {}
+
+
+def _restore(work: Path) -> None:
+    """Remember a workspace the first time it is seen; put it back after that."""
+    if work not in _PRISTINE:
+        _PRISTINE[work] = {
+            path.relative_to(work): path.read_bytes() for path in work.rglob("*") if path.is_file()
+        }
+        return
+    for path in sorted(work.rglob("*"), reverse=True):
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    for relative, content in _PRISTINE[work].items():
+        (work / relative).parent.mkdir(parents=True, exist_ok=True)
+        (work / relative).write_bytes(content)
+
+
 def _score(work: Path) -> dict[str, bool]:
     """Which of the five requirements are true of the files on disk.
 
@@ -144,7 +180,16 @@ def _score(work: Path) -> dict[str, bool]:
     tests = (work / "test_calc.py").read_text(encoding="utf-8")
     readme = (work / "README.md").read_text(encoding="utf-8")
     passing = subprocess.run(
-        [sys.executable, "-m", "pytest", "test_calc.py", "-q", "-p", "no:cacheprovider"],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "test_calc.py",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "--color=no",
+        ],
         cwd=work,
         capture_output=True,
         text=True,
@@ -156,12 +201,17 @@ def _score(work: Path) -> dict[str, bool]:
     # with the fixture pass, so a run that did nothing at all scores it.  The
     # first version of this scorer had that hole and two samples walked
     # straight through it -- one turn, zero tool calls, "green".
-    ran = 0
-    for word in passing.stdout.split():
-        if word == "passed" or word == "passed,":
-            break
-        if word.isdigit():
-            ran = int(word)
+    #
+    # The second version had a different hole.  It read the summary line word
+    # by word, looking for a number followed by "passed" -- and on a machine
+    # that forces coloured output the line is `\x1b[1m4 passed\x1b[0m`, in
+    # which no word is a number.  Every sample scored "not green", including
+    # the ones that were, and the model's "all tests pass" looked like a lie
+    # five times out of five.  Found when the probe was re-run for the rewrite, on a
+    # different terminal.  Colour is now switched off *and* the count is taken
+    # with a pattern that does not care.
+    counted = re.search(r"(\d+) passed", passing.stdout)
+    ran = int(counted.group(1)) if counted else 0
     return {
         "subtract": "def subtract" in calc,
         "divide": "def divide" in calc and "ValueError" in calc,
@@ -281,6 +331,7 @@ async def _run(
     builds, so the second half of the measurements run against the thing that
     ships rather than against the sketch.
     """
+    _restore(work)
     session = Session(mode="workspace-write", approver=AllowAll())
     shell = ShellSession()
     shell.cwd = str(work)

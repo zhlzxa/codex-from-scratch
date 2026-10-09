@@ -143,6 +143,40 @@ MUTATIONS = [
         "            plan.record_work(name)",
         "            pass",
     ),
+    # The next five were added when the chapter was rewritten.
+    (
+        "__main__.py",
+        "a resumed session starts with an empty plan",
+        "        restore_plan(task_plan, resume_from)\n",
+        "",
+    ),
+    (
+        "plan.py",
+        "restoring a plan replays an update that was refused",
+        '            if not answers[call.call_id].startswith("Plan updated."):\n'
+        "                continue\n",
+        "",
+    ),
+    (
+        "agent.py",
+        "a nudge leaves no trace in the transcript",
+        "                        self.recorder.record("
+        '"nudge", {"turn": turn_index, "note": note})\n',
+        "",
+    ),
+    (
+        "composition.py",
+        "watching() forgets which tools may lack a schema",
+        "        footprint_of=tools.footprint_of,\n"
+        "        callable_without_schema=tools.callable_without_schema,\n",
+        "        footprint_of=tools.footprint_of,\n",
+    ),
+    (
+        "rollout.py",
+        "two sessions started in one second by one process share an id",
+        "    while candidate in _ISSUED:\n",
+        "    while False:\n",
+    ),
     (
         "shell.py",
         "SYSTEMROOT is dropped again, so the agent cannot run its own tests",
@@ -171,7 +205,23 @@ atexit.register(restore)
 signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
 
 
+def refuse_if_already_mutated() -> None:
+    """Do not start on a tree a killed run left dirty (chapter 9's lesson)."""
+    dirty = [
+        f"{name}: looks like {label!r} is still applied"
+        for name, label, before, after in MUTATIONS
+        if after and before not in ORIGINALS[name] and after in ORIGINALS[name]
+    ]
+    if dirty:
+        print("refusing to run: the working tree is already mutated\n")
+        for line in dirty:
+            print(f"  {line}")
+        print("\nRestore it (git checkout / re-copy) before running this again.")
+        raise SystemExit(2)
+
+
 def main() -> None:
+    refuse_if_already_mutated()
     print(f"{len(MUTATIONS)} mutations, {' '.join(SUITES)}\n")
     survivors = []
     for name, label, before, after in MUTATIONS:
