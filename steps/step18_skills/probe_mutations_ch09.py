@@ -47,8 +47,8 @@ MUTATIONS = [
     (
         "registry.py",
         "the schema budget ignores this project's own tools",
-        "if not names or estimate_messages((), self.local + schemas) <= self.schema_budget:",
-        "if not names or estimate_messages((), schemas) <= self.schema_budget:",
+        "fits = estimate_messages((), self.local + schemas) <= self.schema_budget",
+        "fits = estimate_messages((), schemas) <= self.schema_budget",
     ),
     (
         "registry.py",
@@ -88,8 +88,20 @@ MUTATIONS = [
     (
         "mcp.py",
         "no startup timeout",
-        "timeout=self.config.startup_timeout,",
-        "timeout=None,",
+        "asyncio.shield(opened), timeout=self.config.startup_timeout",
+        "asyncio.shield(opened), timeout=None",
+    ),
+    (
+        "registry.py",
+        "a restarted server may add tools the loop has no handler for",
+        "returning = [tool for tool in tools if model_name(tool.server, tool.name) in before]",
+        "returning = list(tools)",
+    ),
+    (
+        "registry.py",
+        "a restart may start deferring behind a tool_search nothing answers to",
+        "self._restage(defer=was_deferring)",
+        "self._restage()",
     ),
     (
         "mcp.py",

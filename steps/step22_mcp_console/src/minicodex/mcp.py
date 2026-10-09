@@ -307,8 +307,9 @@ class McpClient:
     and that is deliberate.  `mcp.Client` is an async context manager, which
     is the right shape for a script; a session holds several servers open
     across many turns and closes them when the *session* ends, not when a
-    block exits.  `AsyncExitStack` is the bridge, and it is the whole of the
-    adaptation -- three lines.
+    block exits.  The bridge is one task per connection (`_hold`): it enters
+    the SDK's context, hands the connected client back, and waits to be told
+    to leave.
     """
 
     def __init__(
@@ -337,7 +338,9 @@ class McpClient:
         self._redirect_handler = redirect_handler
         self._callback_handler = callback_handler
         self._client: Client | None = None
-        self._stack: AsyncExitStack | None = None
+        # The task that holds the connection open, and how to ask it to stop.
+        self._owner: asyncio.Task[None] | None = None
+        self._closing: asyncio.Event | None = None
         self._stderr_path: Path | None = None
         # The last thing the server said before it stopped saying anything.
         # Only ever set for a stdio server -- a remote one's stderr is not
@@ -453,41 +456,46 @@ class McpClient:
         failure mode even though one timeout covers both here -- there was
         no measured reason to split it, and the tutorial says why.
         """
-        stack = AsyncExitStack()
         callbacks: dict[str, Any] = {}
         elicit = self.handlers.get("elicitation/create")
         if elicit is not None:
             callbacks["elicitation_callback"] = _as_callback(elicit)
 
+        opened: asyncio.Future[Client] = asyncio.get_running_loop().create_future()
+        closing = asyncio.Event()
+        owner = asyncio.create_task(self._hold(callbacks, opened, closing))
         try:
-            target = await self._target(stack)
+            # `shield`, so that the deadline expiring cancels the *wait* and
+            # not the future the owner task is about to resolve.
             client = await asyncio.wait_for(
-                stack.enter_async_context(
-                    Client(target, read_timeout_seconds=self.config.tool_timeout, **callbacks)
-                ),
-                timeout=self.config.startup_timeout,
+                asyncio.shield(opened), timeout=self.config.startup_timeout
             )
         except (TimeoutError, asyncio.TimeoutError) as exc:
             self.failure = (
                 f"{self.config.name} did not answer initialize within "
                 f"{self.config.startup_timeout:.0f}s"
             )
-            await self._unwind(stack)
+            await self._dismiss(owner)
             raise McpError(self.failure) from exc
         except Exception as exc:
-            await self._unwind(stack)
-            # After the unwind, because that is what reads stderr: a server
-            # that failed to start usually said why on the way out, and the
-            # message without it is "could not start" and nothing else.  Only
-            # ever populated for a stdio server; a remote one's failure is
-            # whatever `httpx2`/the SDK's OAuth flow already said.
+            await self._dismiss(owner)
+            # After the owner has finished, because its unwinding is what reads
+            # stderr: a server that failed to start usually said why on the way
+            # out, and the message without it is "could not start" and nothing
+            # else.
             detail = f"{exc}"
             if self._last_words:
                 detail = f"{detail}: {self._last_words}"
             self.failure = f"could not start {self.config.name}: {detail}"
             raise McpError(self.failure) from exc
+        except BaseException:
+            # Cancelled while starting (a Ctrl-C, say).  The owner must not be
+            # left running with nobody to tell it to stop.
+            owner.cancel()
+            raise
 
-        self._stack = stack
+        self._owner = owner
+        self._closing = closing
         self._client = client
         info = getattr(client, "server_info", None)
         if info is not None:
@@ -496,15 +504,60 @@ class McpClient:
                 "version": getattr(info, "version", "") or "",
             }
 
-    async def _unwind(self, stack: AsyncExitStack) -> None:
-        """Close a stack that may be half-built, without raising from cleanup.
+    async def _hold(
+        self,
+        callbacks: dict[str, Any],
+        opened: asyncio.Future[Client],
+        closing: asyncio.Event,
+    ) -> None:
+        """Enter the connection, hand it over, and leave it -- all in one task.
 
-        A failed `start()` has already decided what went wrong; letting the
-        unwind raise something else on top replaces a diagnosis with an
-        artefact of the tidying-up.
+        This is F09-17, and it was found with two servers connected.  The
+        SDK's `Client` is built on anyio, whose cancel scopes belong to the
+        task that entered them and must be left in the reverse of the order
+        they were entered.  The first version entered every server's context
+        from the caller's task and kept them on separate exit stacks -- so the
+        session's task held files' scope, then notes' scope, and a restart of
+        *files* tried to leave the outer one first.  Measured: the call that
+        triggered the restart raised
+
+            CancelledError: Cancelled via cancel scope ...
+
+        in the agent's own task, which chapter 7 then reported to the model as
+        "interrupted by the user" -- and every later await in that task was
+        cancelled too.  One server never shows it: there is nothing to be out
+        of order with.
+
+        Giving each connection its own task removes the ordering question
+        instead of answering it: a scope entered here is left here, whatever
+        the other connections are doing.  It also makes the startup deadline
+        honest on Python 3.10 and 3.11, where `asyncio.wait_for` runs what it
+        is given in a helper task -- so a context entered inside it would have
+        been entered in one task and left in another.
         """
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(stack.aclose(), timeout=SHUTDOWN_TIMEOUT)
+        try:
+            async with AsyncExitStack() as stack:
+                target = await self._target(stack)
+                client = await stack.enter_async_context(
+                    Client(target, read_timeout_seconds=self.config.tool_timeout, **callbacks)
+                )
+                opened.set_result(client)
+                await closing.wait()
+        except Exception as exc:
+            # Reported through the future while `start()` is still waiting on
+            # it; after that there is nobody to tell, and `close()` deals with
+            # whatever state the connection was left in.
+            if not opened.done():
+                opened.set_exception(exc)
+
+    async def _dismiss(self, owner: asyncio.Task[None]) -> None:
+        """Stop an owner task that never became a connection, and wait for it.
+
+        A failed `start()` has already decided what went wrong; nothing the
+        tidying-up does afterwards is allowed to replace that diagnosis.
+        """
+        owner.cancel()
+        await asyncio.wait({owner}, timeout=SHUTDOWN_TIMEOUT)
 
     async def close(self) -> None:
         """Shut the server down.
@@ -516,13 +569,20 @@ class McpClient:
         anything about agents.  For a remote server this closes the
         `httpx2.AsyncClient` `remote.py` built, by the same exit stack.
         """
-        stack, self._stack = self._stack, None
+        owner, self._owner = self._owner, None
+        closing, self._closing = self._closing, None
         self._client = None
-        if stack is None:
+        if owner is None or closing is None:
             return
-        try:
-            await asyncio.wait_for(stack.aclose(), timeout=SHUTDOWN_TIMEOUT)
-        except (TimeoutError, asyncio.TimeoutError):  # pragma: no cover - slow child
+        # Asked, not cancelled: the owner leaves the SDK's context the ordinary
+        # way, which is what lets the SDK take the child down in its own
+        # stages.  `asyncio.wait` rather than `wait_for`, because `wait_for`
+        # cancels what it was waiting on when the time is up -- and a cleanup
+        # cancelled at second fifteen leaves the child running with nothing
+        # left to kill it (F09-13).
+        closing.set()
+        done, _ = await asyncio.wait({owner}, timeout=SHUTDOWN_TIMEOUT)
+        if not done:  # pragma: no cover - slow child
             # Said out loud rather than swallowed.  Past this point the child
             # is beyond this process's reach, and a session that leaks one
             # should be able to name it -- silence here is how ten of them
@@ -531,8 +591,6 @@ class McpClient:
                 f"{self.config.name} did not shut down within "
                 f"{SHUTDOWN_TIMEOUT:.0f}s and may still be running"
             )
-        except Exception:  # pragma: no cover - the child died on its own
-            pass
 
     # -- the two things anyone actually calls --------------------------------
 

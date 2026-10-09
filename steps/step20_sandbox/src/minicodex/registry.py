@@ -88,7 +88,7 @@ def sanitize(part: str) -> str:
     """Make one name component legal as part of a function name.
 
     Lossy on purpose, and the loss is why `RemoteTool.name` is kept: `a.b` and
-    `a-b` both become `a_b`, so the sanitized name cannot be turned back into
+    `a b` both become `a_b`, so the sanitized name cannot be turned back into
     the name the server knows.  Only the forward direction is ever needed.
     """
     return _UNSAFE.sub("_", part)
@@ -267,8 +267,8 @@ class McpRegistry:
         # failure can be reported once at startup and again -- with the reason
         # -- if the model asks for something that server would have provided.
         self.failures: dict[str, str] = {}
-        # Server name -> the raw tool names it offered, so a call to a tool
-        # that no longer exists can say what happened to it (F09-08).
+        # Model-visible name -> why that tool is not registered, so a call to
+        # a tool that no longer exists can say what happened to it (F09-08).
         self.retired: dict[str, str] = {}
 
     # -- building it ---------------------------------------------------------
@@ -289,7 +289,7 @@ class McpRegistry:
                 continue
             if name in self.registrations:
                 # Same server, same sanitized name, different raw names --
-                # `a.b` and `a-b` both sanitize to `a_b`.  Same rule as above.
+                # `a.b` and `a b` both sanitize to `a_b`.  Same rule as above.
                 self.retired[name] = (
                     f"{tool.server}/{tool.name} was not registered: its name collides "
                     f"with {self.registrations[name].tool.name} after sanitising"
@@ -337,23 +337,42 @@ class McpRegistry:
             self.forget(server, f"the MCP server {server!r} stopped and would not restart: {exc}")
             return f"{server} could not be restarted: {exc}"
         before = {r.model_name for r in registrations}
+        was_deferring = any(s["function"]["name"] == "tool_search" for s in self.visible)
         self.forget(server, f"the MCP server {server!r} restarted without this tool")
-        self.add(client, tools)
+        # Only the names this session already had come back.  The loop's
+        # handler table was built once, when the session started, and nothing
+        # rebuilds it -- so a tool that first appears now would be *shown* to
+        # the model and answer "no tool named ..." when called.  Measured:
+        # exactly that happened, which is the lie `forget()` exists to avoid,
+        # told about a tool that is really there.  A restart may take tools
+        # away; it does not get to add any until the next session.
+        returning = [tool for tool in tools if model_name(tool.server, tool.name) in before]
+        withheld = sorted(
+            name for tool in tools if (name := model_name(tool.server, tool.name)) not in before
+        )
+        self.add(client, returning)
+        # The same reason, one more time: whether there is a `tool_search` is
+        # decided at startup, because that is when its handler is (or is not)
+        # put in the table.  A restart that changes how much the schemas cost
+        # must not flip that under a running session.
+        self._restage(defer=was_deferring)
         after = {name for name, r in self.registrations.items() if r.tool.server == server}
         # Deliberately not silent.  A tool set that changed under the model is
         # the thing that makes its next call fail, and a log line here is the
         # only place a human ever finds out it happened.
         gone = sorted(before - after)
-        new = sorted(after - before)
         changes = []
         if gone:
             changes.append(f"gone: {', '.join(gone)}")
-        if new:
-            changes.append(f"new: {', '.join(new)}")
+        if withheld:
+            changes.append(f"new, not offered until the next session: {', '.join(withheld)}")
         return f"{server} restarted ({'; '.join(changes) or 'same tools'})"
 
-    def _restage(self) -> None:
+    def _restage(self, defer: bool | None = None) -> None:
         """Decide what is shown in full and what is shown only by name.
+
+        `defer` pins the answer instead of computing it.  Only `reconnect`
+        passes it, to keep a running session in the mode it started in.
 
         `visible` is mutated in place rather than rebound, because the model
         client holds a reference to this exact list object.
@@ -370,7 +389,10 @@ class McpRegistry:
         # alphabetical order, which means nothing to anybody.  The budget is
         # measured against the whole list the model receives, this project's
         # own tools included -- they are not free either.
-        if not names or estimate_messages((), self.local + schemas) <= self.schema_budget:
+        if defer is None:
+            fits = estimate_messages((), self.local + schemas) <= self.schema_budget
+            defer = bool(names) and not fits
+        if not defer or not names:
             self.deferred = set()
             self.visible[:] = self.local + schemas
         else:
@@ -548,9 +570,9 @@ class McpRegistry:
         it needed -- 0/6, and in every one of those runs it then asked the user
         for help rather than searching again.
 
-        The names are not free.  Measured on the sixty-tool catalogue: full
-        schemas 7488 tokens, this index 1399, names alone 469.  The one-line
-        descriptions are four fifths of the cost of the index and are what
+        The names are not free.  Measured on the sixty-one-tool catalogue: full
+        schemas 7108 tokens, this index 1206, names alone 432.  The one-line
+        descriptions are two thirds of the cost of the index and are what
         makes a query possible at all, so they stay.
         """
         lines = []

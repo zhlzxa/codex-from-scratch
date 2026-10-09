@@ -8,7 +8,7 @@
 # wrong one, because the honest reason this check exists is not "it must pass
 # before merge".
 #
-# What it does: applies twelve one-line mutations to chapter 9's code and
+# What it does: applies fourteen one-line mutations to chapter 9's code and
 # fails if the test suite does not notice. With all 43 of that chapter's tests
 # green, replacing `stderr=PIPE` with `stderr=DEVNULL` in mcp.py turned
 # nothing red -- the test whose name says it covers that case asserted the

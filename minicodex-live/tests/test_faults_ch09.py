@@ -10,6 +10,7 @@ Nothing in this file touches the network.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import sys
 from dataclasses import replace
@@ -460,6 +461,106 @@ async def test_F09_05_a_restart_re_reads_the_tool_list_rather_than_restoring_it(
         assert "mcp__files__stat" in registry.registrations
     finally:
         await stop(clients)
+
+
+async def test_F09_05_a_tool_that_first_appears_after_a_restart_is_withheld() -> None:
+    """A restarted server may come back offering *more* than it did.
+
+    The first version re-registered whatever the new process declared.  The
+    schema list is live, so the new tool was shown to the model at once -- and
+    the loop's handler table is not, so calling it answered
+
+        Error: no tool named 'mcp__files__filler_00'. Available tools: ...
+
+    which is chapter 0's message for a name the model made up, said about a
+    tool the model had just been handed.  Found by restarting a server with
+    one more tool and asking for it.  The property every tool list shown to
+    the model has to have is plain: nothing in it that the loop cannot call.
+    """
+    registry, clients = await started(files(MCP_DIE_AFTER="1"))
+    try:
+        callable_names = set(registry.handlers())  # what the loop is given, once
+        handler = registry.handlers()["mcp__files__stat"]
+        await handler({"name": "pyproject.toml"})
+        await handler({"name": "pyproject.toml"})  # the call that finds it dead
+
+        # The restart comes back with one more tool than before.
+        clients[0].config = dataclasses.replace(clients[0].config, env={"MCP_EXTRA_TOOLS": "1"})
+        report = await registry.reconnect("files")
+
+        shown = {schema["function"]["name"] for schema in registry.visible}
+        assert shown <= callable_names, f"shown but not callable: {sorted(shown - callable_names)}"
+        assert "mcp__files__filler_00" in report
+        assert "not offered until the next session" in report
+    finally:
+        await stop(clients)
+
+
+async def test_F09_05_a_restart_does_not_change_whether_there_is_a_tool_search() -> None:
+    """`tool_search` gets its handler at startup or not at all.
+
+    So a restart after which the same tools cost more -- a longer description
+    is enough -- must not start deferring them: the model would be shown a
+    `tool_search` that nothing in the loop answers to.
+    """
+
+    class Restartable:
+        failure: str | None = None
+        alive = False
+
+        def __init__(self) -> None:
+            self.description = "short"
+
+        async def close(self) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+        async def list_tools(self) -> list[RemoteTool]:
+            return [RemoteTool("s", "t", self.description, {"type": "object"})]
+
+    client = Restartable()
+    registry = McpRegistry(schema_budget=200)
+    registry.add(client, await client.list_tools())  # type: ignore[arg-type]
+    assert registry.deferred == set()
+
+    client.description = "x" * 5000  # the same tool, now far over the budget
+    await registry.reconnect("s")
+
+    assert [schema["function"]["name"] for schema in registry.visible] == ["mcp__s__t"]
+    assert registry.deferred == set()
+
+
+async def test_F09_17_restarting_one_of_two_servers_leaves_the_caller_alone() -> None:
+    """Found with two servers connected, and invisible with one.
+
+    The SDK's connection is built on anyio, whose cancel scopes belong to the
+    task that entered them and have to be left in reverse order.  The first
+    version entered every server's connection from the session's own task --
+    so restarting `files` while `notes` was still open left the outer scope
+    first.  The call that triggered the restart raised
+    `CancelledError: Cancelled via cancel scope ...` in the *agent's* task,
+    which chapter 7 reports as "interrupted by the user", and every await
+    after it in that task was cancelled as well.
+
+    Every reconnect test above uses one server, which is why none of them saw
+    it.  The example config this chapter ships has two.
+    """
+    registry, clients = await started(files(MCP_DIE_AFTER="1"), notes())
+    try:
+        handlers = registry.handlers()
+        stat = handlers["mcp__files__stat"]
+        assert (await stat({"name": "pyproject.toml"})).isdigit()
+        assert "did not return" in await stat({"name": "pyproject.toml"})  # files is gone
+        # The call that restarts `files` while `notes` is still connected.
+        assert (await stat({"name": "pyproject.toml"})).isdigit()
+        found = await handlers["mcp__notes__search"]({"query": "idea"})
+        assert "A tool nobody can find" in found
+    finally:
+        await stop(clients)
+    # ...and the task that did all of that was not cancelled behind its back.
+    await asyncio.sleep(0)
 
 
 # -- F09-06: the server asks us something ------------------------------------
