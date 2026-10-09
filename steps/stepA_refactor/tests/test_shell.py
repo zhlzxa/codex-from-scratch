@@ -17,7 +17,7 @@ from minicodex.shell import MAX_OUTPUT_CHARS, ShellSession, _clip
 
 STUBBORN = os.path.join(os.path.dirname(__file__), "fixtures", "stubborn.py")
 
-# F02-10, and the first time this project has run on Windows.  `run_shell`
+# F02-10.  `run_shell`
 # kills process groups with `os.killpg` and `start_new_session`, both of which
 # are POSIX-only, and its tests drive a POSIX shell (`sleep`, `cat`, `pwd`,
 # `yes`).  On Windows the killpg call raises AttributeError *after the command

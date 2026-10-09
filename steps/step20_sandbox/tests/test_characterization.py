@@ -4,14 +4,14 @@ These are *characterization* tests, and they are a different animal from the
 rest of the suite.  An ordinary test says what the code **should** do, and is
 written from the requirement.  A characterization test says what the code
 **currently does**, is written from the code, and is allowed to pin behaviour
-nobody would choose on purpose.  Chapter 4 already shipped one without naming
-it: `test_several_edits_to_one_file_all_land` pins "the last edit wins", which
-is a known defect.
+nobody would choose on purpose.  Chapter 4 first shipped one without naming
+it: `test_several_edits_to_one_file_all_land` pinned "the last edit wins", a
+known defect, until it was recognised as silent data loss and fixed.
 
 They exist because "refactor" means "behaviour does not change", and nothing
 can be shown not to have changed unless something describes it first.  Three
 mutations of `default_tools()` -- rename a key, drop an entry, add an entry --
-each left all 125 tests green before this file existed.  `default_tools` was
+each left all 120 tests green before this file existed.  `default_tools` was
 mentioned by exactly zero of them.
 
 FA-02 in FAULTS.md.
