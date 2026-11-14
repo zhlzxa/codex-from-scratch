@@ -90,9 +90,11 @@ jobs:
       - name: Mutation check (chapter 13)
         run: uv run python probe_mutations_ch13.py
 
-      # Chapter 14's fourteen, and two of them are the reason this chapter
-      # exists: `instructions=None` in `__main__` and `COMPACT_AT = 0.95`
-      # both survived the whole 1525-test suite. The first switches off
+      # Chapter 14's twenty-three. The first two are the reason the chapter was
+      # first written: `instructions=None` in `__main__` and `COMPACT_AT = 0.95`
+      # both survived the whole suite as it then stood (1525 tests; chapters 11
+      # and 13 have since grown CLI-level tests that catch them too, re-measured
+      # when this chapter was rewritten). The first switches off
       # chapter 5's permission block, chapter 11's plan paragraph and chapter
       # 13's system prompt in one line; the second moves the point at which a
       # session starts paying for compaction. Every test of `_instructions`
@@ -116,8 +118,11 @@ jobs:
         run: uv run python probe_mutations_ch16.py
 
       # Chapter 14 again, and a different kind of check: run the suite five
-      # times with a different property-test seed each time and fail if any
-      # test does not decide the same way every time. F14-02 -- flakiness is a
+      # times on the *same* input -- property seed included -- and fail if any
+      # test does not decide the same way every time, or is not there every
+      # time. (This comment said "a different seed each time" long after the
+      # script stopped doing that; the seed changes the test ids, so a varied
+      # seed compares nothing with nothing.) F14-02 -- flakiness is a
       # defect, and the way it stops being one is that something reports it
       # with a name instead of somebody re-running the job.
       - name: Flake check

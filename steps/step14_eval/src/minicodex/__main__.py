@@ -37,7 +37,7 @@ from minicodex.replay import (
     load,
     recorded_tools,
 )
-from minicodex.retry import ModelFailed
+from minicodex.retry import DEFAULT_POLICY, ModelFailed
 from minicodex.rollout import (
     DEFAULT_DIR,
     RolloutError,
@@ -233,10 +233,6 @@ async def _ask(
         print(f"[resumed {len(resume_from)} message(s) from {path}]")
 
     writer = RolloutWriter(rollout_path(current.session_id, session_dir), current)
-    # The same two objects a sub-agent is built from, one level up.  Before
-    # interlude B this call passed seven keyword arguments and the sub-agent's
-    # passed three, and no test compared them because nothing put them next to
-    # each other.
     # Written before the first request, not after the run: a recording is worth
     # having *because* the process died, and the line saying which model and
     # which sandbox mode produced it is the one a replay cannot do without.
@@ -262,6 +258,10 @@ async def _ask(
     agents_watcher = AgentsMdWatcher(
         root, shown=resume_from.developer_notes() if resume_from is not None else ()
     )
+    # The same two objects a sub-agent is built from, one level up.  Before
+    # interlude B this call passed seven keyword arguments and the sub-agent's
+    # passed three, and no test compared them because nothing put them next to
+    # each other.
     agent = wiring.agent(
         llm,
         tools,
@@ -555,7 +555,13 @@ def _replay(path: Path, *, strict: bool) -> int:
     )
     session = Session(mode=config["sandbox_mode"], policy=config["approval_policy"])
     model = RecordedModel(recording, strict=strict)
-    agent = Wiring(context_window=config.get("context_window")).agent(
+    agent = Wiring(
+        context_window=config.get("context_window"),
+        # The clock is replayed too: a recorded `retry-after: 46` is decided
+        # on and announced, and nobody sits through it.
+        retry_policy=replace(DEFAULT_POLICY, serve_waits=False),
+        announce=print,
+    ).agent(
         model,
         tools,
         instructions=_instructions(session, tools),
@@ -570,11 +576,27 @@ def _replay(path: Path, *, strict: bool) -> int:
         print(f"\n{exc}", file=sys.stderr)
         return 1
 
-    for index, sent in enumerate(model.sent):
-        print(f"  turn {index}: {len(sent)} message(s) match")
+    # One line per *attempt*, labelled with the turn it belongs to.  The first
+    # version numbered the lines and called the number a turn, so a turn that
+    # was retried once showed up as two turns.  And "match" is only printed
+    # when something was compared: `--loose` compares nothing.
+    verdict = "match" if strict else "sent, not compared"
+    for step, sent in zip(recording.attempts, model.sent, strict=False):
+        again = f" (attempt {step.attempt + 1})" if step.attempt else ""
+        print(f"  turn {step.turn}{again}: {len(sent)} message(s) {verdict}")
     if replayed.missed:
         print(f"  {len(replayed.missed)} call(s) not in the recording: {replayed.missed[:3]}")
-    print(f"\nok  {result.stop_reason} after {result.turns_used} turn(s), same as recorded")
+    if model.unused:
+        first = model.unused[0]
+        print(
+            f"\ndrift: the run stopped ({result.stop_reason}) after "
+            f"{len(model.sent)} of {len(recording.attempts)} recorded attempt(s); "
+            f"turn {first.turn} was recorded and never asked for",
+            file=sys.stderr,
+        )
+        return 1
+    same = "same as recorded" if strict else "requests not compared (--loose)"
+    print(f"\nok  {result.stop_reason} after {result.turns_used} turn(s), {same}")
     return 0
 
 

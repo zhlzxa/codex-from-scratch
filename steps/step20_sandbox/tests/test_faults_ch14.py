@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -35,6 +36,7 @@ from minicodex.evals import (
     run_task,
 )
 from minicodex.history import History
+from minicodex.recorder import Recorder
 from minicodex.replay import (
     RecordedModel,
     ReplayDrift,
@@ -131,6 +133,11 @@ def test_F14_03_the_cli_sends_a_system_message_at_all(
 ) -> None:
     """Deleting the system prompt from the CLI left all 1525 tests green.
 
+    That was the count, and the result, when this chapter was first written.
+    Re-measured during the rewrite it is no longer true -- three tests added
+    to chapters 11 and 13 since then run `main()` and notice -- and this one
+    stays, because it is the only one of the four that says what it is for.
+
     Measured, not imagined: replacing `instructions=_instructions(session,
     tools)` with `instructions=None` in `__main__` -- which switches off
     chapter 5's permission block, chapter 11's plan paragraph and chapter 13's
@@ -160,7 +167,9 @@ async def test_F14_03_compaction_fires_at_the_documented_fraction() -> None:
     """`COMPACT_AT = 0.75` had nothing depending on it.
 
     Setting it to 0.95 -- a real behaviour change, since it decides when a
-    session starts paying for a summary -- left all 1525 tests green.  Chapter
+    session starts paying for a summary -- left all 1525 tests green when this
+    chapter was first written (one chapter-13 test now happens to sit close
+    enough to the threshold to notice; this is the one that says so).  Chapter
     6 has thirteen faults' worth of tests about *how* a history is cut and not
     one about *when* the cutting starts.
 
@@ -520,6 +529,195 @@ def test_F14_03_drift_is_not_swallowed_by_the_loops_failure_net() -> None:
 
 
 # ---------------------------------------------------------------------------
+# F14-03, found while rewriting the chapter: three places where the replay
+# reported more than it had looked at
+# ---------------------------------------------------------------------------
+
+
+def _rate_limited(turn: int, attempt: int, **extra: Any) -> str:
+    return _event(
+        "model_failure",
+        {
+            "turn": turn,
+            "attempt": attempt,
+            "disposition": "retry",
+            "kind": "rate_limit",
+            "detail": "rate limited",
+            "status": 429,
+            # Three seconds and not the recorded 46: the mutation that puts
+            # the sleep back has to be noticed without anybody waiting 46
+            # seconds for it.
+            "headers": {"retry-after": "3"},
+            "body": json.dumps(stub.RATE_LIMITED["body"]),
+            **extra,
+        },
+    )
+
+
+def test_F14_03_a_sub_agents_requests_do_not_displace_its_parents(tmp_path: Path) -> None:
+    """A child writes to its parent's recorder and counts its turns from zero.
+
+    Measured on a real parent-and-child run before the `conversation` field
+    existed: `load()` paired on `(turn, attempt)`, the child's "turn 0" replaced
+    the parent's, and the result -- child's first turn, then parent's second --
+    was described as `2 turn(s), 2 attempt(s)` with no complaint from anything.
+    """
+    parent = [{"role": "user", "content": "delegate it"}]
+    child = [{"role": "user", "content": "read a.txt and report"}]
+    path = _recording(
+        tmp_path / "r.jsonl",
+        _event("request", {"conversation": 7, "turn": 0, "attempt": 0, "messages": parent}),
+        _event(
+            "response",
+            {
+                "conversation": 7,
+                "turn": 0,
+                "text": "",
+                "tool_calls": [{"id": "p1", "name": "spawn_agent", "arguments": "{}"}],
+            },
+        ),
+        _event("request", {"conversation": 8, "turn": 0, "attempt": 0, "messages": child}),
+        _event("response", {"conversation": 8, "turn": 0, "text": "hello", "tool_calls": []}),
+        _event("request", {"conversation": 7, "turn": 1, "attempt": 0, "messages": parent}),
+        _event("response", {"conversation": 7, "turn": 1, "text": "done", "tool_calls": []}),
+    )
+    recording = load(path)
+
+    assert [a.request[0]["content"] for a in recording.attempts] == ["delegate it"] * 2
+    assert [c.name for c in recording.attempts[0].tool_calls] == ["spawn_agent"]
+    assert recording.attempts[1].text == "done"
+    assert recording.elsewhere == 1
+    assert "1 sub-agent request(s)" in recording.describe()
+
+
+def test_F14_03_a_repeated_key_with_no_owner_is_refused(tmp_path: Path) -> None:
+    """The same file as chapters 10 to 13 would have written it: no
+    `conversation` on anything.  Which of the two "turn 0" requests is the
+    parent's cannot be recovered, so this is refused rather than guessed --
+    the rule for a missing argument, applied to a missing owner."""
+    path = _recording(
+        tmp_path / "old.jsonl",
+        _event(
+            "request", {"turn": 0, "attempt": 0, "messages": [{"role": "user", "content": "a"}]}
+        ),
+        _event("response", {"turn": 0, "text": "", "tool_calls": []}),
+        _event(
+            "request", {"turn": 0, "attempt": 0, "messages": [{"role": "user", "content": "b"}]}
+        ),
+        _event("response", {"turn": 0, "text": "", "tool_calls": []}),
+    )
+    with pytest.raises(ReplayError, match="nothing says whose they are"):
+        load(path)
+
+
+async def test_F14_03_every_agent_signs_its_events_with_its_own_number(tmp_path: Path) -> None:
+    """Two agents, one recorder -- which is what a parent and a child are."""
+    recorder = Recorder(tmp_path / "run.jsonl")
+    wiring = Wiring(recorder=recorder)
+    for answer in ("one", "two"):
+        await wiring.agent(_Answers([answer]), ToolSet(handlers={}, schemas=[])).run("hi")
+
+    events = [json.loads(line) for line in recorder.path.read_text("utf-8").splitlines()]
+    owners = [e["payload"]["conversation"] for e in events if e["kind"] in ("request", "response")]
+    assert len(owners) == 4
+    assert owners[0] == owners[1] and owners[2] == owners[3]
+    assert owners[0] != owners[2]
+
+
+async def test_F14_03_a_replay_decides_a_recorded_wait_and_does_not_serve_it(
+    tmp_path: Path,
+) -> None:
+    """A recorded `retry-after`, replayed without anybody sitting through it.
+
+    The first `minicodex replay` of a rate-limited session took 46.4 seconds
+    and printed nothing while it waited.  The wait is still *decided* -- that
+    is the retry logic under test -- and still announced; it is just not slept.
+    """
+    messages = [{"role": "user", "content": "hi"}]
+    path = _recording(
+        tmp_path / "r.jsonl",
+        _event("request", {"turn": 0, "attempt": 0, "messages": messages}),
+        _rate_limited(0, 0),
+        _event("request", {"turn": 0, "attempt": 1, "messages": messages}),
+        _event("response", {"turn": 0, "text": "done", "finish_reason": "stop", "tool_calls": []}),
+    )
+    said: list[str] = []
+    agent = Wiring(retry_policy=RetryPolicy(serve_waits=False), announce=said.append).agent(
+        RecordedModel(load(path)), ToolSet(handlers={}, schemas=[])
+    )
+
+    began = time.monotonic()
+    result = await agent.run("hi")
+
+    assert time.monotonic() - began < 1.5
+    assert result.final_text == "done"
+    assert said and "waiting 3s" in said[0]
+
+
+async def test_F14_03_an_unserved_wait_still_counts_against_the_budget(tmp_path: Path) -> None:
+    """Two 429s asking for 3 seconds each do not fit in a 5-second budget once
+    the first has been waited out, so on the day the run gave up after the
+    second.  A replay that skipped the waits *and forgot them* would have the
+    whole budget left, ask for a third attempt, and run off the end of the
+    recording -- a different run from the one that was recorded."""
+    messages = [{"role": "user", "content": "hi"}]
+    path = _recording(
+        tmp_path / "r.jsonl",
+        _event("request", {"turn": 0, "attempt": 0, "messages": messages}),
+        _rate_limited(0, 0),
+        _event("request", {"turn": 0, "attempt": 1, "messages": messages}),
+        _rate_limited(0, 1),
+    )
+    model = RecordedModel(load(path))
+    agent = Wiring(retry_policy=RetryPolicy(budget=5.0, serve_waits=False)).agent(
+        model, ToolSet(handlers={}, schemas=[])
+    )
+
+    with pytest.raises(ModelFailed) as failure:
+        await agent.run("hi")
+    # The failure that ended it is the 429, not "the recording ran out".
+    assert failure.value.failure.kind == "rate_limit"
+    assert failure.value.attempts == 2
+
+
+def test_F14_03_replay_fails_when_the_run_stops_before_the_recording_does(
+    tmp_path: Path, stub_url: str, served_requests: list[dict], monkeypatch: Any, capsys: Any
+) -> None:
+    """Every request matching is half of "same as recorded".
+
+    Chapter 0's first bug, put back (`if turn.text:` as the stop condition),
+    replayed a two-turn recording as one matching request and then
+    `ok  completed after 1 turn(s), same as recorded`.  The code cannot be
+    mutated from inside a test, so the same situation is built from the other
+    side: a real two-turn recording whose first reply is edited to ask for no
+    tools.  Today's loop then stops after turn 0, and turn 1 is still on file.
+    """
+    from minicodex.__main__ import main
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["ask", "what does this define?", "--base-url", stub_url, "--yes"]) == 0
+    (path,) = (tmp_path / ".minicodex" / "recordings").glob("*.jsonl")
+    capsys.readouterr()
+
+    assert main(["replay", str(path)]) == 0
+    assert "same as recorded" in capsys.readouterr().out
+
+    assert main(["replay", str(path), "--loose"]) == 0
+    loose = capsys.readouterr().out
+    assert "not compared" in loose and "match" not in loose
+
+    events = [json.loads(line) for line in path.read_text("utf-8").splitlines()]
+    first_reply = next(e for e in events if e["kind"] == "response")
+    first_reply["payload"]["tool_calls"] = []
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+
+    assert main(["replay", str(path)]) == 1
+    captured = capsys.readouterr()
+    assert "1 of 2 recorded attempt(s)" in captured.err
+    assert "same as recorded" not in captured.out
+
+
+# ---------------------------------------------------------------------------
 # F14-07  the average is not the measurement
 # ---------------------------------------------------------------------------
 
@@ -606,6 +804,51 @@ def test_F14_08_the_shell_starts_where_the_other_tools_are_pointed(tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
+# F14-02  a flake checker has to see every test, every time
+# ---------------------------------------------------------------------------
+
+
+def _flaky(repo_root: Path) -> Any:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("probe_flaky", repo_root / "probe_flaky.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_F14_02_the_parser_reads_a_test_id_with_spaces_in_it(repo_root: Path) -> None:
+    """Ten parametrised ids in this repository contain spaces, and a name
+    pattern of `\\S+` dropped all ten lines without a word: 1548 parsed
+    against 1558 reported.  This is one of the ten, verbatim."""
+    line = (
+        "tests/test_faults_ch11.py::test_a_malformed_plan_says_what_to_send_instead"
+        "[argument3-not an object-Each step is] PASSED [ 19%]"
+    )
+    match = _flaky(repo_root).RESULT.match(line)
+    assert match is not None
+    assert match["status"] == "PASSED"
+    assert match["name"].endswith("Each step is]")
+
+
+def test_F14_02_a_test_missing_from_one_run_is_not_called_stable(repo_root: Path) -> None:
+    """Passing once and then not being there is not "the same way every time".
+
+    The script had a `missing` list for this whose condition no set could
+    satisfy, so for as long as it existed it reported nothing.  A flake checker
+    that cannot see a test disappear has the blind spot it was written about.
+    """
+    verdict = _flaky(repo_root).verdict
+    steady = {"tests/a.py::one": "PASSED", "tests/a.py::two": "PASSED"}
+
+    assert verdict([steady, steady]) == ({}, [])
+    assert verdict([steady, {"tests/a.py::one": "PASSED"}]) == ({}, ["tests/a.py::two"])
+    unstable, absent = verdict([steady, {**steady, "tests/a.py::two": "FAILED"}])
+    assert unstable == {"tests/a.py::two": ["FAILED", "PASSED"]} and absent == []
+
+
+# ---------------------------------------------------------------------------
 # F14-05  the tier a real model belongs in
 # ---------------------------------------------------------------------------
 
@@ -631,6 +874,12 @@ def test_F14_05_the_nightly_tier_cannot_block_a_merge_and_sets_no_threshold(
     assert "schedule" in triggers
     # No `--fail-under`, no `exit 1` on a score: the job prints a table.
     assert "fail-under" not in text
+    # ...and it does nothing at all where there is no key.  The first guard was
+    # `if: github.repository_owner != ''`, which is never false.
+    (job,) = workflow["jobs"].values()
+    assert "if" not in job
+    assert job["steps"][0]["id"] == "key"
+    assert all("steps.key.outputs.present" in step.get("if", "") for step in job["steps"][1:])
 
 
 def test_F14_08_no_task_declares_a_path_out_of_its_workspace() -> None:
@@ -668,3 +917,47 @@ def test_F14_04_a_failing_history_is_reported_at_its_smallest() -> None:
     assert fails(smaller)
     assert len(smaller.items) < len(history.items)
     assert len(smaller.items) == 1
+
+
+def test_F14_04_a_candidate_that_lost_a_tool_result_is_not_a_candidate() -> None:
+    """`rebuild` refused a result without its call and let a call without its
+    result through, because `History` only objects to the second kind when it
+    is asked to render.  The first property that was ever actually minimised
+    crashed inside the shrinker with `HistoryError` -- a failure the shrinker
+    built, reported as though the code under test had produced it."""
+    from property_support import rebuild
+
+    history = History()
+    history.add_user("go")
+    history.add_assistant("", [ToolCall("c1", "run_shell", {}, "{}")])
+    history.add_tool_result("c1", "ok")
+    user, assistant, result = history.items
+
+    assert rebuild([user, assistant, result]) is not None
+    assert rebuild([user, result]) is None  # a result nobody asked for
+    assert rebuild([user, assistant]) is None  # a call nobody answered
+
+
+def test_F14_04_the_report_describes_shapes_not_scenery() -> None:
+    from property_support import describe
+
+    history = History()
+    history.add_user("u" * 300)
+    history.add_assistant("", [ToolCall("c1", "run_shell", {}, "{}")])
+    history.add_tool_result("c1", "o" * 2931)
+
+    assert describe(history).splitlines() == [
+        "  0: UserMessage, 300 chars",
+        "  1: AssistantMessage calling [c1]",
+        "  2: ToolResult for c1, 2931 chars",
+    ]
+    assert "ooo" not in describe(history)
+
+
+def test_F14_04_the_property_file_actually_calls_the_shrinker(repo_root: Path) -> None:
+    """`minimise` was written, tested, described in the chapter -- and imported
+    by nothing except its own test.  The property suite went on printing a
+    seed.  A tool nobody calls is the cheapest kind of fix to believe in."""
+    text = (repo_root / "tests" / "test_properties.py").read_text(encoding="utf-8")
+    assert "from property_support import describe, minimise" in text
+    assert "await shrunk(history" in text

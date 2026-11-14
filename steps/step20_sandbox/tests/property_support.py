@@ -54,6 +54,14 @@ def rebuild(items: list) -> History | None:
                 history.add_system_note(item.text)
             elif isinstance(item, DeveloperNote):
                 history.add_developer_note(item.text)
+        # The other half of the invariant, and the half the first version
+        # missed.  Adding a result with no call raises at once; adding a call
+        # and never its result raises nothing until somebody tries to send the
+        # history.  A candidate that had lost a `ToolResult` came back from
+        # here as "legal", and the property being minimised then crashed on it
+        # with `HistoryError` -- a failure the shrinker had manufactured,
+        # which is the one thing this function exists to prevent.
+        history.to_wire()
     except Exception:
         return None
     return history
@@ -86,3 +94,24 @@ def minimise(history: History, fails: Callable[[History], bool], *, rounds: int 
             size = max(size // 2, 1)
     rebuilt = rebuild(items)
     return rebuilt if rebuilt is not None else history
+
+
+def describe(history: History) -> str:
+    """One line per item: what kind it is and how big, not what it says.
+
+    The generator fills its messages with `"o" * 2931`, so printing the text
+    would print the scenery.  What decides whether compaction misbehaves is the
+    *shape* -- which kinds of item, in which order, how long -- and that fits
+    on a line each.
+    """
+    lines = []
+    for index, item in enumerate(history.items):
+        kind = type(item).__name__
+        if isinstance(item, AssistantMessage) and item.tool_calls:
+            ids = ", ".join(call.call_id for call in item.tool_calls)
+            lines.append(f"  {index}: {kind} calling [{ids}]")
+        elif isinstance(item, ToolResult):
+            lines.append(f"  {index}: {kind} for {item.call_id}, {len(item.content)} chars")
+        else:
+            lines.append(f"  {index}: {kind}, {len(item.text)} chars")
+    return "\n".join(lines) or "  (an empty history)"

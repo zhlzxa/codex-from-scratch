@@ -360,18 +360,39 @@ def section_leak(args: argparse.Namespace) -> None:
     from minicodex.evals import declared_files
 
     path = workspace("leak")
-    asyncio.run(_leak(path))
+    target = HERE.parent / "src" / "minicodex" / "evals.py"
+    # Worked out here and not in `_leak`: `os.path` in an `async def` is what
+    # chapter -1's `ASYNC240` exists to stop, and it stopped it.
+    asyncio.run(_leak(path, target, os.path.relpath(target, path)))
     print(f"\n  declared by the task set: {sorted(declared_files())}")
 
 
-async def _leak(path: Path) -> None:
+async def _leak(path: Path, target: Path, climbing: str) -> None:
+    from minicodex.approval import AllowAll, Session
+    from minicodex.composition import local_tools
     from minicodex.evals import _materialise, _snapshot
 
     task = by_name("add-function")
     _materialise(path, task.files)
     print(f"  the agent's root contains: {sorted(_snapshot(path))}")
     print(f"  the repository is at:      {HERE}")
-    print("  ...and is not reachable through `paths.resolve()` from that root.")
+
+    # Ask, with the agent's own tools, for the three things F14-08 is about.
+    # This section used to end with a printed sentence -- "...and is not
+    # reachable through `paths.resolve()` from that root" -- that nothing had
+    # checked: a probe reporting a conclusion it never measured.
+    tools = local_tools(path, Session(mode="workspace-write", approver=AllowAll()))
+    asked = [
+        ("run_shell", {"command": "pwd"}),
+        ("read_file", {"path": str(target)}),
+        ("read_file", {"path": climbing}),
+        # The honest fourth line.  The shell *starts* in the workspace; nothing
+        # keeps it there until chapter 20 builds a sandbox.
+        ("run_shell", {"command": f"head -c 40 {climbing}"}),
+    ]
+    for name, arguments in asked:
+        output = (await tools.handlers[name](arguments)).strip().splitlines()
+        print(f"  {name}({json.dumps(arguments)[:60]})\n      -> {(output or [''])[0][:100]}")
 
 
 SECTIONS = {

@@ -244,6 +244,13 @@ class RetryPolicy:
     base: float = 1.0
     cap: float = 30.0
     budget: float = 90.0
+    # `False` decides every wait exactly as usual, announces it, and does not
+    # sleep.  For chapter 14's replay and nothing else: a recorded 429 carries
+    # the `retry-after: 46` it carried on the day, and the first replay of one
+    # sat silent for 46.4 seconds -- an "offline, deterministic" test that looks
+    # hung is a test nobody runs twice.  The clock is the third boundary a
+    # replay has to stand in for, after the model and the tools.
+    serve_waits: bool = True
 
 
 DEFAULT_POLICY = RetryPolicy()

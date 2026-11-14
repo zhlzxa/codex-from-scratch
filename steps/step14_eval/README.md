@@ -3,8 +3,10 @@
 Thirteen chapters of measurements, and no way to find out whether any of them
 still holds.
 
-Two mutations make the point. Both were applied to the code as it stood at the
-end of chapter 13, and both left **all 1525 tests green**:
+Two mutations made the point when this chapter was first written. Both were
+applied to the code as it then stood at the end of chapter 13, and both left
+**all 1525 tests green** (re-measured since: chapters 11 and 13 have grown
+CLI-level tests that now catch both, see the chapter's section 3):
 
 ```
 instructions=None            # the CLI stops sending a system message at all
@@ -21,10 +23,10 @@ that says whether a change made the agent worse.
 
 ```bash
 uv sync --all-extras
-uv run pytest                             # 1549 tests, all offline
+uv run pytest                             # 1635 tests, all offline
 uv run python probe_eval.py replay        # offline
 uv run python probe_eval.py leak          # offline
-uv run python probe_mutations_ch14.py     # 14 mutations
+uv run python probe_mutations_ch14.py     # 23 mutations
 uv run python probe_flaky.py --runs 5     # the same suite, five times
 
 uv run minicodex ask "..." --provider openai      # writes a recording
@@ -44,10 +46,12 @@ uv run minicodex replay .minicodex/recordings/session-*.jsonl
 | `tests/property_support.py` | `minimise()`: a failing random history, shrunk to the part that matters |
 | `tests/test_faults_ch12.py` | one `monkeypatch.chdir` — that test had been writing a real transcript into the repository since chapter 12 |
 | `pyproject.toml` | `extend-exclude = [".probe"]`, so the linter stops formatting the agent's homework |
-| `tests/test_faults_ch14.py` | 24 tests, F14-01…F14-08 |
+| `tests/test_faults_ch14.py` | 35 tests, F14-01…F14-08 |
+| `tests/test_properties.py` | `shrunk()`: a failing property now prints its smallest history, not only a seed |
+| `src/minicodex/retry.py` | `RetryPolicy.serve_waits` — a replay decides a recorded wait and does not sleep through it |
 | `probe_eval.py` | seven sections: replay, trajectory, ab, focus, judge, cost, leak |
 | `probe_flaky.py` | the suite N times, same input every time; anything that changes its mind is named |
-| `probe_mutations_ch14.py` | 14 mutations |
+| `probe_mutations_ch14.py` | 23 mutations |
 | `.github/workflows/nightly.yml` | the third tier: the eval set against a real provider, on a schedule, no threshold |
 
 ## What was measured
@@ -126,6 +130,37 @@ the same task: gemma4 returned the identical 50-character sentence 5/5, so
 `assert "I have added" in answer` would have passed every time. gpt-4o-mini
 produced five different answers between 133 and 224 characters, one of which
 did not do the task at all.
+
+## Found when the chapter was rewritten
+
+Every one of these is the same shape: a checker reporting more than it had
+looked at.
+
+- `minicodex replay` printed `ok ... same as recorded` for a run that stopped
+  after one of two recorded turns (chapter 0's F00-02, put back on purpose).
+  Every request it *sent* matched; the one it never sent was not compared with
+  anything. `RecordedModel.unused` is now drift.
+- `--loose` printed `match` for requests it had not compared, and attempts
+  were numbered and called turns.
+- Replaying a recorded `retry-after: 46` slept for 46.4 seconds in silence.
+  `RetryPolicy(serve_waits=False)` decides and announces the wait, counts it
+  against the budget, and does not serve it: 0.9 seconds.
+- A sub-agent shares its parent's recorder and counts its own turns from zero,
+  so `load()` spliced the child's first turn onto the parent's second and
+  described the result as `2 turn(s), 2 attempt(s)`. Every agent now signs its
+  events (`conversation`); the first conversation in the file is the one
+  loaded, and an unsigned file that repeats a key is refused.
+- `minimise()` was written, tested and called by nothing. Wired into
+  `test_properties.py`; its first real use crashed inside the shrinker,
+  because `rebuild()` let a tool call without its result through.
+- `probe_flaky.py` could not see a test that was present in one run and
+  absent from the next; the list meant for that had a condition no set can
+  satisfy.
+- `nightly.yml`'s "no key, no run" guard was `github.repository_owner != ''`.
+- `probe_eval.py leak` printed its conclusion instead of measuring it. It now
+  asks with the agent's own tools, and prints the line the old sentence was
+  covering: the shell starts in the workspace and is **not** confined to it
+  (chapter 20).
 
 ## Deliberately not done
 
