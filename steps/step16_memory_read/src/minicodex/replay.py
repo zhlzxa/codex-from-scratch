@@ -159,6 +159,11 @@ class Recording:
     # model directly and that call never reaches the recorder.  Refused rather
     # than half-served, for the reason `load()` refuses a missing argument.
     compacted: bool = False
+    # Requests in the file that belong to some *other* conversation -- a
+    # sub-agent's.  They are counted and not loaded: a child's whole run is one
+    # `spawn_agent` call to its parent, and that call's result is in the
+    # parent's next request like any other tool's (`recorded_tools`).
+    elsewhere: int = 0
 
     @property
     def turns(self) -> int:
@@ -167,10 +172,13 @@ class Recording:
     def describe(self) -> str:
         failed = sum(1 for a in self.attempts if a.failure is not None)
         calls = sum(len(a.tool_calls) for a in self.attempts)
-        return (
+        text = (
             f"{self.turns} turn(s), {len(self.attempts)} attempt(s) "
             f"({failed} failed), {calls} tool call(s)"
         )
+        if self.elsewhere:
+            text += f"; {self.elsewhere} sub-agent request(s) in the file, not replayed"
+        return text
 
 
 def load(path: Path | str) -> Recording:
@@ -181,12 +189,28 @@ def load(path: Path | str) -> Recording:
     about -- so the pairing is done on `(turn, attempt)` rather than on
     adjacency.  A `compaction` event between a request and its response is
     normal and must not break the pairing; adjacency would have made it.
+
+    `(turn, attempt)` is only a key inside **one conversation**, and a file can
+    hold several: a sub-agent writes to its parent's recorder and counts its
+    own turns from zero.  The first version did not know that.  Given a session
+    in which the parent spawned one child, it kept whichever `request` for
+    "turn 0 attempt 0" came last and returned this, without a word:
+
+        2 turn(s), 2 attempt(s) (0 failed), 1 tool call(s)
+
+    -- the child's first turn followed by the parent's second, a conversation
+    nobody had.  So the conversation that made the first request is the one
+    that is loaded, the others are counted, and a file that repeats a key
+    *without* saying whose it is (recorded before the `conversation` field
+    existed) is refused for the reason a missing argument is.
     """
     path = Path(path)
     requests: dict[tuple[int, int], tuple[dict[str, Any], ...]] = {}
     outcomes: dict[tuple[int, int], tuple[str, dict[str, Any]]] = {}
     config: dict[str, Any] | None = None
     compacted = False
+    top: Any = None
+    elsewhere = 0
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -202,9 +226,23 @@ def load(path: Path | str) -> Recording:
         elif kind == "compaction":
             compacted = True
         elif kind == "request":
+            if not requests:
+                top = payload.get("conversation")
+            if payload.get("conversation") != top:
+                elsewhere += 1
+                continue
             key = (payload["turn"], payload["attempt"])
+            if key in requests:
+                raise ReplayError(
+                    f"{path}: two requests were recorded for turn {key[0]} attempt "
+                    f"{key[1]} and nothing says whose they are. A sub-agent shares "
+                    "its parent's recorder, and recordings made before the "
+                    "`conversation` field cannot tell the two apart."
+                )
             requests[key] = tuple(payload["messages"])
         elif kind in ("response", "model_failure"):
+            if payload.get("conversation") != top:
+                continue
             # A `response` carries no `attempt`: it is written once the attempt
             # that worked has already returned, so it belongs to the last
             # request issued for its turn.
@@ -250,7 +288,7 @@ def load(path: Path | str) -> Recording:
         )
     if not attempts:
         raise ReplayError(f"{path}: no complete request/response pair in this recording")
-    return Recording(path, tuple(attempts), config=config, compacted=compacted)
+    return Recording(path, tuple(attempts), config=config, compacted=compacted, elsewhere=elsewhere)
 
 
 def _calls(payload: dict[str, Any], path: Path) -> tuple[ToolCallDelta, ...]:
@@ -356,6 +394,18 @@ class RecordedModel:
         # `Agent._sizer` reads this off whatever object it was handed, so a
         # replay sizes its requests the way the real client did.
         self.tools: list[dict[str, Any]] = []
+
+    @property
+    def unused(self) -> tuple[RecordedAttempt, ...]:
+        """Recorded attempts the loop never asked for.
+
+        Every request matching is half of "same as recorded"; the other half is
+        that the run went on for as long.  Put chapter 0's first bug back --
+        stop as soon as a reply has text (F00-02) -- and a two-turn recording
+        replays as one matching request and then silence.  The first version
+        of `minicodex replay` printed `ok ... same as recorded` for that run.
+        """
+        return self.recording.attempts[self._next :]
 
     async def stream(self, messages: Sequence[dict[str, Any]]) -> AsyncIterator[StreamEvent]:
         if self._next >= len(self.recording.attempts):
@@ -473,13 +523,3 @@ def recorded_tools(recording: Recording) -> ReplayedTools:
         if call_id in by_id:
             replayed.outputs.setdefault(key, []).append(by_id[call_id])
     return replayed
-
-
-def names_called(recording: Recording) -> list[str]:
-    """Every tool name the recording mentions, in first-seen order."""
-    seen: list[str] = []
-    for step in recording.attempts:
-        for call in step.tool_calls:
-            if call.name not in seen:
-                seen.append(call.name)
-    return seen

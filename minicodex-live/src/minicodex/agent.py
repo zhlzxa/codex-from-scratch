@@ -12,6 +12,7 @@ means touching every caller on the path.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -113,6 +114,17 @@ COMPACT_TO = 0.45
 # See `_shrink`: without it, a single stated token count moves the ratio
 # wildly and the run compacts on almost every turn.
 MAX_REFUSAL_CORRECTION = 4.0
+
+# One number per `Agent`, written into every event it records.  A parent and
+# the sub-agents it spawns share one recorder (interlude B, FB-01), and each of
+# them counts its own turns from zero -- so without this the file holds two
+# `request` lines for "turn 0 attempt 0" and nothing says whose they are.
+# Chapter 14's loader found out the hard way: it paired them by `(turn,
+# attempt)`, kept whichever came last, and described a four-call session as
+# "2 turn(s), 2 attempt(s)" built from the child's first turn and the parent's
+# second.  A process-wide counter and not a constructor argument: which number
+# an agent gets does not matter, only that no two agents get the same one.
+_CONVERSATIONS = itertools.count()
 
 # How many tool calls may actually be running at once, across every batch this
 # process ever schedules. A model that reads fifty files in one turn produces
@@ -274,6 +286,7 @@ class Agent:
         # was sending.
         self.on_turn_start = on_turn_start
         self.retry_policy = retry_policy
+        self.conversation = next(_CONVERSATIONS)
         # Where "waiting N seconds because the provider said so" is said out
         # loud.  `None` rather than `print` as the default so that nothing
         # embedding this class gets written to on stdout without asking.
@@ -488,6 +501,11 @@ class Agent:
         # 10/10 in *both* configurations -- the child's own deadline was doing
         # all the bounding and the retry budget was decorative.
         began = time.monotonic()
+        # Waits that were decided and not served (`RetryPolicy.serve_waits`).
+        # Counted as if they had happened, so that the *next* decision -- "is
+        # there budget left for another 46 seconds" -- comes out the way it did
+        # on the day.
+        skipped = 0.0
         shrunk = False
         forced: CompactionResult | None = None
 
@@ -500,7 +518,13 @@ class Agent:
             messages = history.to_wire(self.dialect)
             estimated = self._sizer().messages(messages)
             self.recorder.record(
-                "request", {"turn": turn_index, "attempt": attempt, "messages": messages}
+                "request",
+                {
+                    "conversation": self.conversation,
+                    "turn": turn_index,
+                    "attempt": attempt,
+                    "messages": messages,
+                },
             )
 
             try:
@@ -525,6 +549,7 @@ class Agent:
             self.recorder.record(
                 "model_failure",
                 {
+                    "conversation": self.conversation,
                     "turn": turn_index,
                     "attempt": attempt,
                     "disposition": failure.disposition,
@@ -544,7 +569,7 @@ class Agent:
                 shrunk = True
                 continue
 
-            elapsed = time.monotonic() - began
+            elapsed = time.monotonic() - began + skipped
             if failure.disposition == "fatal":
                 raise ModelFailed(failure, attempts=attempt + 1, waited=elapsed)
 
@@ -561,10 +586,15 @@ class Agent:
             # for the whole backoff -- and would also stop every other tool,
             # sub-agent and MCP reader in the process, which is a bigger fault
             # than the one it is inside.
-            await asyncio.sleep(wait)
+            if self.retry_policy.serve_waits:
+                await asyncio.sleep(wait)
+            else:
+                skipped += wait
 
         raise ModelFailed(
-            failure, attempts=self.retry_policy.attempts, waited=time.monotonic() - began
+            failure,
+            attempts=self.retry_policy.attempts,
+            waited=time.monotonic() - began + skipped,
         )
 
     async def _shrink(
@@ -705,6 +735,7 @@ class Agent:
             self.recorder.record(
                 "response",
                 {
+                    "conversation": self.conversation,
                     "turn": turn_index,
                     "text": turn.text,
                     "finish_reason": turn.finish_reason,

@@ -19,7 +19,8 @@
 # Honest note about this repository: `OPENAI_API_KEY` is not set here, so this
 # workflow has never run to completion in CI. It has run from a laptop, which
 # is where every number in chapter 14 comes from. A workflow that has never
-# run is a draft, and calling it one costs nothing.
+# run is a draft, and calling it one costs nothing -- the guard below was
+# wrong for exactly as long as nothing ran it.
 name: nightly
 
 on:
@@ -31,20 +32,39 @@ jobs:
   evals:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Without a key there is nothing to measure, and a red X on a scheduled
-    # job every morning trains everybody to stop reading the mail.
-    if: ${{ github.repository_owner != '' }}
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
+      # Without a key there is nothing to measure, and a red X on a scheduled
+      # job every morning trains everybody to stop reading the mail.
+      #
+      # This guard used to be a job-level `if: github.repository_owner != ''`
+      # under the same comment -- a condition that is true in every repository
+      # there is, so it guarded nothing and the job would have gone red on its
+      # first scheduled run. A secret cannot be read in a job-level `if`; it
+      # can be read in a step, so the check is a step and the rest depend on it.
+      - name: Is there a key?
+        id: key
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "No OPENAI_API_KEY secret here; nothing to measure." >> "$GITHUB_STEP_SUMMARY"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.key.outputs.present == 'true'
       - uses: astral-sh/setup-uv@v5
+        if: steps.key.outputs.present == 'true'
         with:
           enable-cache: true
       - run: uv sync --frozen --all-extras
+        if: steps.key.outputs.present == 'true'
 
       # One sample per task is enough to notice that something has broken
       # outright; it is not enough to see a one-in-five effect, which is what
       # `probe_eval.py focus` is for and why that one is run by hand.
       - name: Eval task set (openai)
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        if: steps.key.outputs.present == 'true'
         run: uv run python probe_eval.py cost --provider openai

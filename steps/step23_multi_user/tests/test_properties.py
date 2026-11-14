@@ -6,9 +6,11 @@ wrote, which means they all use histories whose author already knew where the
 boundaries were.  A generator does not know that, which is the point.
 
 No `hypothesis`: a seeded generator is enough here and costs no dependency.
-The trade is real and worth stating -- there is no shrinking, so a failure
-prints a seed rather than a minimal example, and reproducing it means running
-`MINICODEX_PROPERTY_SEED=<n>`.  Chapter 14 revisits this.
+The trade was real -- for eight chapters a failure printed a seed and nothing
+else, and reproducing it meant running `MINICODEX_PROPERTY_SEED=<n>` and
+reading a fourteen-item history by eye.  Chapter 14 wrote the shrinker
+(`property_support.minimise`), and then shipped it connected to nothing: this
+file went on printing seeds.  `shrunk()` below is the connection.
 
 CI runs this file with `MINICODEX_PROPERTY_CASES=2000`; the default is small
 enough that nobody is tempted to skip it locally.
@@ -16,8 +18,10 @@ enough that nobody is tempted to skip it locally.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import random
+from collections.abc import Awaitable, Callable
 
 import pytest
 
@@ -32,6 +36,7 @@ from minicodex.compaction import (
     unused_call_ids,
 )
 from minicodex.history import History
+from property_support import describe, minimise
 
 CASES = int(os.environ.get("MINICODEX_PROPERTY_CASES", "200"))
 BASE_SEED = int(os.environ.get("MINICODEX_PROPERTY_SEED", "0"))
@@ -76,6 +81,24 @@ async def stub_summary(request: SummaryRequest) -> str:
 
 def seeds() -> list[int]:
     return [BASE_SEED + i for i in range(CASES)]
+
+
+async def shrunk(history: History, still_fails: Callable[[History], Awaitable[bool]]) -> str:
+    """The smallest history that still fails, ready to go in a failure message.
+
+    Only ever reached once a property has already failed, so its cost is paid
+    by the run that needs it.  `minimise` is synchronous and the properties
+    are not, and a test is already inside a running event loop -- hence the
+    worker thread, which gets a loop of its own for each candidate.
+    """
+
+    def fails(candidate: History) -> bool:
+        return asyncio.run(still_fails(candidate))
+
+    smallest = await asyncio.to_thread(minimise, history, fails)
+    return f"smallest history that still fails ({len(smallest.items)} item(s)):\n" + describe(
+        smallest
+    )
 
 
 @pytest.mark.parametrize("seed", seeds())
@@ -132,10 +155,20 @@ async def test_property_compaction_never_grows_the_history(seed):
     rng = random.Random(seed)
     history = random_history(rng)
     sizer = Sizer()
-    before = sizer.messages(history.to_wire())
-    result = await compact(history, summarise=stub_summary, budget=rng.choice([1, 300, 3000]))
-    after = sizer.messages(result.history.to_wire())
-    assert after <= before, f"seed={seed} before={before} after={after}"
+    budget = rng.choice([1, 300, 3000])
+
+    async def grows(candidate: History) -> bool:
+        before = sizer.messages(candidate.to_wire())
+        result = await compact(candidate, summarise=stub_summary, budget=budget)
+        return sizer.messages(result.history.to_wire()) > before
+
+    if await grows(history):
+        # The seed is still printed -- it is how to get this exact run back --
+        # but it is no longer the whole report.
+        pytest.fail(
+            f"seed={seed} budget={budget}: compaction made this history bigger\n"
+            + await shrunk(history, grows)
+        )
 
 
 @pytest.mark.parametrize("seed", seeds())

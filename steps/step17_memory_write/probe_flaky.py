@@ -63,7 +63,6 @@ def one_run(target: str) -> tuple[dict[str, str], float]:
         [sys.executable, "-m", "pytest", target, "-vv", "--no-header"],
         capture_output=True,
         text=True,
-        env=_env(),
     )
     outcomes: dict[str, str] = {}
     for line in result.stdout.splitlines():
@@ -78,10 +77,26 @@ def one_run(target: str) -> tuple[dict[str, str], float]:
     return outcomes, time.monotonic() - began
 
 
-def _env() -> dict[str, str]:
-    import os
+def verdict(runs: list[dict[str, str]]) -> tuple[dict[str, list[str]], list[str]]:
+    """Which tests changed their mind, and which were not there every time.
 
-    return dict(os.environ)
+    The second list is the fourth "I did not see it" in this file, found when
+    the chapter was rewritten.  The first three versions only ever asked *did a
+    test give two different answers*; a test that passes in run 0 and is simply
+    absent from run 1 -- not collected, or its line not parsed -- gave one
+    answer, once, and was counted as stable.  There was a `missing` list for
+    this, and its condition was `len(statuses) == 1 and not statuses`, which
+    no set can satisfy.
+    """
+    seen: dict[str, set[str]] = defaultdict(set)
+    appeared: dict[str, int] = defaultdict(int)
+    for outcomes in runs:
+        for name, status in outcomes.items():
+            seen[name].add(status)
+            appeared[name] += 1
+    unstable = {name: sorted(statuses) for name, statuses in seen.items() if len(statuses) > 1}
+    absent = sorted(name for name, count in appeared.items() if count < len(runs))
+    return unstable, absent
 
 
 def main() -> int:
@@ -90,27 +105,31 @@ def main() -> int:
     parser.add_argument("--target", default="tests")
     args = parser.parse_args()
 
-    seen: dict[str, set[str]] = defaultdict(set)
+    runs = []
     times = []
     for index in range(args.runs):
         outcomes, elapsed = one_run(args.target)
+        runs.append(outcomes)
         times.append(elapsed)
-        for name, status in outcomes.items():
-            seen[name].add(status)
         failed = sum(1 for s in outcomes.values() if s in ("FAILED", "ERROR"))
         print(f"  run {index}: {len(outcomes)} tests, {failed} failed, {elapsed:.1f}s")
 
-    unstable = {name: sorted(statuses) for name, statuses in seen.items() if len(statuses) > 1}
-    missing = [name for name, statuses in seen.items() if len(statuses) == 1 and not statuses]
-    print(f"\n  {len(seen)} distinct tests over {args.runs} runs")
+    unstable, absent = verdict(runs)
+    distinct = len({name for outcomes in runs for name in outcomes})
+    print(f"\n  {distinct} distinct tests over {args.runs} runs")
     print(f"  wall clock: {sum(times):.1f}s total, {sum(times) / len(times):.1f}s per run")
     if unstable:
         print(f"\n  {len(unstable)} test(s) did not decide the same way every time:")
         for name, statuses in sorted(unstable.items()):
             print(f"    {name}: {statuses}")
+    if absent:
+        print(f"\n  {len(absent)} test(s) were not there in every run:")
+        for name in absent[:20]:
+            print(f"    {name}")
+    if unstable or absent:
         return 1
     print("  every test decided the same way every time.")
-    return 0 if not missing else 1
+    return 0
 
 
 if __name__ == "__main__":
