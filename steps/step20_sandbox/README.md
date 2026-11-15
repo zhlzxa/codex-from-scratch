@@ -26,7 +26,7 @@ This chapter builds it, on Linux, with bubblewrap. Measured, not asserted:
 
 ```bash
 uv sync --all-extras
-uv run pytest                                 # 1822 tests
+uv run pytest                                 # 1930 tests
 uv run python scripts/check_layers.py
 uv run python probe_mutations_ch20.py         # 26 mutations, 0 survivors
 
@@ -138,6 +138,26 @@ assert DEFAULT_OWNER.memories() == DEFAULT_MEMORY_DIR
 assert DEFAULT_OWNER.jobs_db() == DEFAULT_JOBS_PATH
 assert DEFAULT_OWNER.merge_lock() == MERGE_LOCK
 ```
+
+## Found when the chapter was rewritten
+
+Rewritten on a Linux machine with bubblewrap 0.9.0, so every `needs_bwrap`
+test and every probe section really ran for the first time:
+
+- **Nothing wires the sandbox in.** No code outside `sandbox.py` builds one or
+  passes `confined=True`; `minicodex ask` and the console run unconfined.
+  Left as it is -- chapter 21 records the gap, `minicodex-live` closes it --
+  and said plainly at the top of the chapter.
+- **`full-access` with the network off could write nowhere**, not even its
+  workspace (`--ro-bind / /` and no hole). `writable()` now returns `/`.
+- **F20-07 was the wrong way round.** Under `--ro-bind / /` the shell reads
+  everything, `read_roots` or not; a read root only keeps a directory inside a
+  writable workspace read-only. `cat` reads what `read_file` cannot.
+- **`test_F20_02_for_mode_does_not_silently_fall_back` only meant something
+  without bwrap.** It now removes bwrap itself.
+- **`probe_sandbox.py net` had no control row**, so an unreachable host read as
+  "blocked" everywhere. `PROBE_URL=https://pypi.org/simple/` and a control row.
+- `chdir_is_reachable` had no caller; removed.
 
 ## Deliberately not done
 
