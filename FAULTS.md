@@ -1030,6 +1030,19 @@ closed it.
 **Nothing in this chapter goes beyond codex.** Every mechanism is a subset,
 and the gap is the entire right-hand column of the comparison table.
 
+Found when the chapter was rewritten for beginners (2026-11), on a Linux
+machine with bubblewrap 0.9.0 -- the first time every `needs_bwrap` test and
+every probe section really ran:
+
+| Fault | Found | Fix |
+|---|---|---|
+| **The sandbox is not wired into the program.** No code outside `sandbox.py` builds one or passes `confined=True`; `minicodex ask` and the console run every command unconfined. Chapter 21 notices it in passing; the first chapter text said `run_shell` "can now run in bubblewrap". | 🟣 review | Not wired here -- chapter 21's text depends on its absence and `minicodex-live` wires it. The chapter now says so at the top and in §10.3 |
+| **`full-access` with the network off could write nowhere**, not even its workspace: `writable()` returned nothing for `full-access` on the assumption it is never wrapped, but `network=False` wraps it with `--ro-bind / /` and no hole. Measured: `Read-only file system` inside the workspace | 🟢 boundary test | `writable()` returns `/` for `full-access`; argv and kernel tests |
+| **F20-07 was stated backwards.** Under `--ro-bind / /` the shell reads every file the host user can, `read_roots` or not; measured: `cat` reads a memory file outside the workspace with and without it. A read root only keeps a directory inside a writable workspace read-only. The real asymmetry is the reverse of the one recorded: `cat` reads what `read_file` cannot. | 🟢 boundary test | Docstrings and chapter corrected; a kernel test for what a read root does |
+| **`test_F20_02_for_mode_does_not_silently_fall_back` only tested anything on a machine without bwrap** -- with bwrap present the fallback never triggers, and the mutation adding it survived | ⚪ static | The test makes `shutil.which` return `None` itself |
+| **`probe_sandbox.py`'s network rows had no control**: where the machine cannot reach `example.com`, every row read "blocked", including the two with the network on; and its explanation text was hard-coded ("curl 6" beside a measured 7) | 🟠 observability | `PROBE_URL`, an unsandboxed control row, labels from the exit code |
+| **`chdir_is_reachable` had no caller**; its docstring and its test's name said it ran before every command | 🟣 review | Removed with its test and its mutation; `setup_failure` is what reports a failed `--chdir` |
+
 ---
 
 ## Chapter 15 · Release and maintenance ✅

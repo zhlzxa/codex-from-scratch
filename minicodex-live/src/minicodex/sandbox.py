@@ -74,12 +74,15 @@ class SandboxSpec:
     unreachable -- the same argument `policy.py` makes for keeping
     `SandboxMode` and `ApprovalPolicy` apart.
 
-    `read_roots` carries extra read-only roots (the memory directory).  It is
-    worth a sentence: `paths.resolve(..., extra_roots=...)` bounds
-    `read_file` in *Python*, and the sandbox bounds `run_shell` in the
-    *kernel*.  They are two mechanisms enforcing one intention, and neither
-    knows about the other, so a path added to one and not the other produces
-    a tool that can read a file its sibling cannot.
+    `read_roots` carries extra read-only roots (the memory directory), and
+    what it does is narrower than it looks.  The namespace starts from
+    `--ro-bind / /`, so the shell can already *read* every file the host user
+    can, with or without this field.  What a read root adds is protection
+    from *writing* when it lies inside a writable hole.  `paths.resolve(...,
+    extra_roots=...)` bounds what `read_file` may read, in Python; the sandbox
+    bounds what `run_shell` may write and whether it reaches the network, in
+    the kernel, and does not bound reading at all.  (Measured when chapter 20
+    was rewritten; this paragraph used to say the opposite.)
     """
 
     mode: SandboxMode
@@ -111,12 +114,17 @@ class SandboxSpec:
     def writable(self) -> tuple[Path, ...]:
         """Paths the payload may write to.
 
-        `read-only` gets nothing, which is the whole point of the name, and
-        `full-access` gets nothing *here* because it is not wrapped at all --
-        see `BubblewrapSandbox.wrap`.
+        `read-only` gets nothing, which is the whole point of the name.
+        `full-access` gets the whole filesystem: with the network on it is not
+        wrapped at all (see `BubblewrapSandbox.wrap`), and with the network off
+        it is wrapped only to take the network away.  This used to return
+        nothing for `full-access`, so "full access, no network" could write
+        nowhere at all (found when chapter 20 was rewritten).
         """
         if self.mode == "workspace-write":
             return (self.root,)
+        if self.mode == "full-access":
+            return (Path(_ROOT),)
         return ()
 
 
@@ -193,14 +201,16 @@ class BubblewrapSandbox:
         # above for why this shape and not the smaller one.
         argv += ["--ro-bind", _ROOT, _ROOT]
 
+        # `as_posix()`, for `_ROOT`'s reason: these are paths inside a Linux
+        # namespace, whatever host is building the command line.
         for path in self.spec.writable():
-            argv += ["--bind", str(path), str(path)]
+            argv += ["--bind", path.as_posix(), path.as_posix()]
 
-        # The caller's extra read roots (e.g. the memory directory).  Bound
-        # *after* the writable holes so
-        # that a read root inside the workspace stays readable rather than
-        # silently re-mounting a writable path as read-only -- bwrap applies
-        # these in order, last one wins.
+        # The caller's extra read roots (e.g. the memory directory).
+        # Everything is readable already, so what this buys is a read-only
+        # *window* inside a writable hole -- and only because it is bound
+        # *after* the holes: bwrap applies binds in order and the last one
+        # wins, so a read root bound first would be re-mounted writable.
         for path in self.spec.read_roots:
             argv += ["--ro-bind-try", str(path), str(path)]
 
@@ -235,23 +245,6 @@ class BubblewrapSandbox:
         # bigger behaviour change than adding a sandbox.
         argv += ["/bin/sh", "-c", command]
         return argv
-
-    def chdir_is_reachable(self, cwd: str) -> bool:
-        """Will `--chdir cwd` find a directory inside the namespace?
-
-        Kept as part of the sandbox's query surface: under `--ro-bind / /`
-        everything on the host is present, so the only way to be unreachable
-        is to not exist.  (bwrap reports an unreachable chdir on stderr with
-        exit 1 -- `setup_failure` is what tells that story apart from a
-        failing command.)
-        """
-        try:
-            resolved = Path(cwd).resolve()
-        except OSError:  # pragma: no cover - resolve() on a broken mount
-            return False
-        if self.spec.mode == "full-access":
-            return True
-        return resolved.is_dir()
 
 
 # bwrap reports its own setup failures on stderr and exits 1 -- the same exit

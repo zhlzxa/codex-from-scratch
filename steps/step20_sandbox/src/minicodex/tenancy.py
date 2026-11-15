@@ -34,7 +34,7 @@ the *seam*, not a multi-user system.  There is no registration here, no
 session, no password, no quota, and `Owner.key` is trusted completely by
 whoever constructs it.  A server that derives an owner from an unauthenticated
 request header has moved the leak, not closed it.  Authentication and quotas
-are chapter 22; this chapter's job is to make sure that when they arrive there
+are chapter 23; this chapter's job is to make sure that when they arrive there
 is somewhere to put them.
 """
 
@@ -114,7 +114,7 @@ class Owner:
             return self.home
         return self.home / TENANTS_DIR / self.key
 
-    # -- the four things that were global ------------------------------------
+    # -- the three things that were global -----------------------------------
 
     def memories(self) -> Path:
         """Chapter 16's read path, and chapter 17's write target."""

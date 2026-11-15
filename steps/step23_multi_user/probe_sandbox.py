@@ -48,7 +48,21 @@ WRITE_PAYLOAD = "python3 -c \"open({path!r},'w').write('escaped')\""
 
 # F05-05: "`curl` exfiltrates". Same reasoning. `-m 5` so a probe run on a
 # machine with no egress finishes rather than hanging for the default timeout.
-NETWORK_PAYLOAD = "curl -s -m 5 https://example.com -o /dev/null"
+#
+# The URL is an environment variable, and every network row is printed beside
+# an unsandboxed *control*.  Both arrived when chapter 20 was rewritten, on a
+# machine whose egress goes through a proxy that refuses example.com: there the
+# first version printed "blocked" for every combination, including the two
+# with the network switched on, and blamed the sandbox for a host this machine
+# cannot reach at all.  A row labelled "blocked" means something only next to
+# a control that reached.  Its exit codes were hard-coded too -- "(curl 6 =
+# could not resolve host)" printed beside a measured 7.
+NETWORK_URL = os.environ.get("PROBE_URL", "https://example.com")
+NETWORK_PAYLOAD = f"curl -s -m 5 {NETWORK_URL} -o /dev/null"
+
+
+def _reach(returncode: int) -> str:
+    return "reached" if returncode == 0 else f"not reached (curl exit {returncode})"
 
 
 def _linux() -> bool:
@@ -121,12 +135,14 @@ def escape(_args: argparse.Namespace) -> None:
         print(f"  workspace-write   exit={got.returncode}  wrote outside: {outside.exists()}")
 
         print()
-        print("F05-05 -- network, 'recognised rather than blocked'")
+        print(f"F05-05 -- network, 'recognised rather than blocked'  ({NETWORK_URL})")
+        got = _sh(NETWORK_PAYLOAD, cwd=str(ws))
+        print(f"  no sandbox        {_reach(got.returncode)}   <- the control")
         got = _run(ro.wrap(NETWORK_PAYLOAD, cwd=str(ws)) or [])
-        print(f"  read-only         exit={got.returncode}  (curl 6 = could not resolve host)")
+        print(f"  read-only         {_reach(got.returncode)}")
         opened = SandboxSpec(mode="read-only", root=ws.resolve(), network=True)
         got = _run(BubblewrapSandbox(opened).wrap(NETWORK_PAYLOAD, cwd=str(ws)) or [])
-        print(f"  read-only +net    exit={got.returncode}  (0 = fetched)")
+        print(f"  read-only +net    {_reach(got.returncode)}")
 
 
 def binds(_args: argparse.Namespace) -> None:
@@ -232,15 +248,20 @@ def net(_args: argparse.Namespace) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         ws = Path(tmp)
         print("  four combinations, because all four are real configurations")
+        print(f"  target: {NETWORK_URL}  (PROBE_URL to change it)")
         print()
+        control = _sh(NETWORK_PAYLOAD, cwd=str(ws))
+        print(f"  {'no sandbox':<16} {'':<14} {_reach(control.returncode)}   <- the control")
+        if control.returncode != 0:
+            print("  the control did not reach either: the rows below say nothing")
+            print("  about the sandbox. Set PROBE_URL to a host this machine can reach.")
         for mode in ("read-only", "workspace-write"):
             for network in (False, True):
                 spec = SandboxSpec(mode=mode, root=ws.resolve(), network=network)
                 argv = BubblewrapSandbox(spec).wrap(NETWORK_PAYLOAD, cwd=str(ws))
                 assert argv is not None
                 got = _run(argv)
-                reach = "reached" if got.returncode == 0 else f"blocked (curl {got.returncode})"
-                print(f"  {mode:<16} network={network!s:<6} {reach}")
+                print(f"  {mode:<16} network={network!s:<6} {_reach(got.returncode)}")
 
 
 def env(_args: argparse.Namespace) -> None:

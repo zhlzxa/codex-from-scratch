@@ -53,8 +53,8 @@ MUTATIONS = [
         "src/minicodex/sandbox.py",
         "workspace-write loses its writable hole",
         "        for path in self.spec.writable():\n"
-        '            argv += ["--bind", str(path), str(path)]',
-        '        for path in ():\n            argv += ["--bind", str(path), str(path)]',
+        '            argv += ["--bind", path.as_posix(), path.as_posix()]',
+        '        for path in ():\n            argv += ["--bind", path.as_posix(), path.as_posix()]',
     ),
     (
         "src/minicodex/sandbox.py",
@@ -100,11 +100,11 @@ MUTATIONS = [
         "src/minicodex/sandbox.py",
         "read roots are bound before the writable holes, so a hole re-opens them",
         "        for path in self.spec.writable():\n"
-        '            argv += ["--bind", str(path), str(path)]',
+        '            argv += ["--bind", path.as_posix(), path.as_posix()]',
         "        for path in self.spec.read_roots:\n"
         '            argv += ["--ro-bind-try", str(path), str(path)]\n'
         "        for path in self.spec.writable():\n"
-        '            argv += ["--bind", str(path), str(path)]',
+        '            argv += ["--bind", path.as_posix(), path.as_posix()]',
     ),
     # ---- telling the wrapper's failure from the command's (F20-05) ----------
     (
@@ -118,12 +118,6 @@ MUTATIONS = [
         "every exit code is examined, so a command exiting 42 can be called a wrapper failure",
         "    if returncode != 1:\n        return None",
         "    if returncode == 0:\n        return None",
-    ),
-    (
-        "src/minicodex/sandbox.py",
-        "an unreachable cwd is not detected before running",
-        "        return resolved.is_dir()",
-        "        return True",
     ),
     # ---- fail closed (F20-02) ------------------------------------------------
     (
@@ -215,6 +209,13 @@ MUTATIONS = [
         "the jobs table is shared, so one owner marks another's session extracted",
         '        return self.root() / "memory_jobs.sqlite3"',
         '        return self.home / "memory_jobs.sqlite3"',
+    ),
+    # ---- found when the chapter was rewritten --------------------------------
+    (
+        "src/minicodex/sandbox.py",
+        "full-access without the network can write nowhere, not even its workspace",
+        '        if self.mode == "full-access":\n            return (Path(_ROOT),)\n',
+        "",
     ),
 ]
 
