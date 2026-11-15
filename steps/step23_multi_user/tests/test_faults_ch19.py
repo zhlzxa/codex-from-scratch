@@ -926,3 +926,49 @@ def test_the_skills_tab_is_real_now(console: TestClient, workspace: Path) -> Non
     assert body["supported"] is True
     assert [s["name"] for s in body["items"]] == ["run-tests"]
     assert "uv run pytest" in body["items"][0]["body"]
+
+
+async def test_a_follow_up_message_does_not_repeat_agents_md_or_memory(
+    tmp_path: Path, stub_url: str, served_requests: list[dict], monkeypatch: Any
+) -> None:
+    """Every message in a browser thread is a resume: the thread is reloaded
+    from its rollout file and a new agent is built. Both watchers were built
+    without being told what the conversation already held, so each follow-up
+    message added another copy of AGENTS.md and of the memory block --
+    chapter 13's resume fix and chapter 16's had reached `__main__` and not
+    this file. Found when chapter 16 was rewritten.
+    """
+    from minicodex.memory import BODY_FILE, DATA_PREAMBLE, SUMMARY_FILE
+    from minicodex.tenancy import Owner
+    from minicodex.web import runtime
+
+    # Memory is per owner from chapter 20 on, under the owner's own home.
+    owner = Owner(home=tmp_path / "home")
+    memory_dir = owner.memories()
+    memory_dir.mkdir(parents=True)
+    (memory_dir / SUMMARY_FILE).write_text("v1\n\n- Run tests as `python -m pytest`.\n")
+    (memory_dir / BODY_FILE).write_text("v1\n\n## Running tests\n\nUse python -m pytest.\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "AGENTS.md").write_text("Use uv, not pip.\n")
+    settings = {**DEFAULT_THREAD_SETTINGS, "memory": True}
+
+    for question in ("what does this define?", "and again?"):
+        await runtime.run_turn(
+            thread_dir=tmp_path / "thread",
+            workspace_root=workspace,
+            question=question,
+            settings=settings,
+            provider_name="ollama",
+            base_url=stub_url,
+            model="m",
+            api_key=None,
+            mcp_servers=[],
+            broker=ApprovalBroker(),
+            emit=lambda _event: None,
+            owner=owner,
+        )
+
+    notes = [m["content"] for m in served_requests[-1]["messages"] if m["role"] == "developer"]
+    assert sum(DATA_PREAMBLE in note for note in notes) == 1
+    assert sum("Use uv, not pip." in note for note in notes) == 1

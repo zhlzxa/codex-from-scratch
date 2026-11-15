@@ -28,6 +28,7 @@ import asyncio
 import os
 import shutil
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,16 @@ from minicodex.tokens import estimate_messages
 
 HERE = Path(__file__).resolve().parent
 SCRATCH = HERE / ".probe" / "ch16"
+# Memory directories live somewhere else entirely -- a fresh temporary
+# directory outside this repository -- and the reason is F14-08. The first
+# version put them in `SCRATCH` too, as `mem-<arm>-<task>-<n>`, right next to
+# the workspaces: one `ls ..` from any agent's shell, including the agents in
+# the *memory-off* arm, which got a memory directory written for them anyway.
+# Measured after the fact, the off arm never went looking (it scored 0/2 on
+# every task memory decides), so no published number was inflated by it -- but
+# an arm that is "off" only because the model did not think to look is not
+# off. Found when the chapter was rewritten, by reading this function.
+MEMORY_SCRATCH = Path(tempfile.mkdtemp(prefix="minicodex-ch16-memory-"))
 
 PROVIDERS = {
     "openai": (OPENAI_BASE_URL, "gpt-4o-mini"),
@@ -118,11 +129,16 @@ def fresh(tag: str) -> Path:
 def memory_for(task: Task, tag: str) -> Memory:
     """Materialise this task's memory into its own directory and read it back.
 
-    Its own directory per run, and never the workspace: an agent that can
-    `ls` its way to the memory file is not being measured on whether memory
-    was injected, it is being measured on whether it found a file (F14-08).
+    Its own directory per run, and never near the workspace: an agent that
+    can `ls` its way to the memory file is not being measured on whether
+    memory was injected, it is being measured on whether it found a file
+    (F14-08). See `MEMORY_SCRATCH` for how "never the workspace" was first
+    taken to mean "next door to it".
     """
-    directory = fresh(f"mem-{tag}")
+    directory = MEMORY_SCRATCH / f"mem-{tag}"
+    if directory.exists():
+        shutil.rmtree(directory)
+    directory.mkdir(parents=True)
     for name, content in task.memory.items():
         (directory / name).write_text(content, encoding="utf-8")
     return load(directory)
@@ -164,20 +180,26 @@ async def run_arm(
     factory = build(provider)
     for sample in range(samples):
         for task in tasks:
-            memory = memory_for(task, f"{label}-{task.name}-{sample}")
+            # The off arm gets no memory directory at all, not one it was
+            # merely not told about.
+            memory = memory_for(task, f"{label}-{task.name}-{sample}") if memory_on else None
             space = fresh(f"{label}-{task.name}-{sample}")
             text = instructions(
-                memory.directory, memory_on=memory_on, dedicated_tools=dedicated_tools
+                memory.directory if memory is not None else space,
+                memory_on=memory is not None,
+                dedicated_tools=dedicated_tools,
             )
-            watcher = MemoryWatcher(memory, root=space) if memory_on else None
+            watcher = MemoryWatcher(memory, root=space) if memory is not None else None
             result = await run_task(
                 task,
                 factory,
                 workspace=space,
                 instructions=text,
-                extra_tools=memory_toolset(memory) if dedicated_tools else None,
+                extra_tools=memory_toolset(memory)
+                if dedicated_tools and memory is not None
+                else None,
                 on_turn_start=watcher.refresh if watcher is not None else None,
-                extra_read_roots=(memory.directory,) if memory_on else (),
+                extra_read_roots=(memory.directory,) if memory is not None else (),
             )
             arm.results.append(result)
             if verbose:

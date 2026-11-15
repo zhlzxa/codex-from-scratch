@@ -697,6 +697,17 @@ Faults found while correcting the first draft that were not on either list:
 | **A name collision between two modules' `load`.** `replay.load` was already imported in `__main__` | ⚪ | `from minicodex.memory import load as load_memory` |
 | **The controlled A/B and a real session disagree.** Not re-tested in this rewrite — recorded, in the step README's "deliberately not done", as still open | 🟠 | Not fixed |
 
+Found when the chapter was rewritten for beginners (2026-11), none of them on any list:
+
+| Fault | Found | Fix |
+|---|---|---|
+| **Every citation line number was wrong, and every test agreed with it.** `_strip_version` cut the `v1` line off before counting and a section's end was counted from its stripped body: a section on lines 3-6 parsed as 3-4, so a model citing the real lines (as `grep -n` shows them) had them all discarded as invented. The tests built their citations from `entry.lines` -- the parser's own output -- so producer and consumer agreed about the wrong numbers. Also casts doubt on F16-07's "0 resolved, 9 invented": some of those may have been right. | 🟣 | The marker line is blanked rather than removed and a section ends at its last non-blank line. The new test reads the expected line out of the file, not out of `parse_entries` |
+| **Every `--resume` added another copy of the memory block** -- three resumes, three copies in every later request, up to 2500 tokens each. Chapter 13's AGENTS.md resume fix, not carried over. | 🟢 | `MemoryWatcher(shown=History.developer_notes())`: nothing if the block is already there, `MEMORY_REPLACED` + the block if it changed |
+| **Resuming without `--memory` left the old block standing** while the system message that carried `INJECTION_RULE` was rebuilt without it -- fenced data with nothing left saying what the fence means. | 🟢 | The watcher is always built; with no memory and a block on record it says `MEMORY_WITHDRAWN`, once |
+| **The web console (chapters 19-23, minicodex-live) re-sent AGENTS.md and memory on every message.** Each browser message is a resume, and `web/runtime.py` built both watchers without `shown` -- chapter 13's fix had reached `__main__` only. | 🟣 | Both watchers get `shown`; a test in `test_faults_ch19.py`, red on the old runtime (2 copies against 1) |
+| **The drift check reported `docs.python.org`, `github.com`, `Node.js` and `MEMORY.md` as missing repository files** when fed a sentence a person would write rather than one written for the test. The two-letter extension rule stopped `e.g.` and nothing else. | 🟢 | An extension list, and memory's own file names skipped. `Node.js` is still flagged, and the test says so. The two-letter rule then decided nothing (its mutation survived) and was removed |
+| **The probe's memory-off arm could reach memory.** Every arm's memory directory was written next to its workspace under `.probe/ch16/`, the off arm's included, one `ls ..` away. The published off-arm scores (0/2 on every memory-decided task) show it never looked. | 🟣 | Memory goes to a temporary directory outside the repository; the off arm gets none |
+
 ## Chapter 17 · Memory, part two: writing and forgetting ✅
 
 > Extraction and merging measured against `gpt-4o-mini` on 2026-08-16

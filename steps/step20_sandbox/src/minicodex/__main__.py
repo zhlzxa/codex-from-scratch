@@ -360,13 +360,19 @@ async def _ask(
     # another; all are asked, and whatever any of them has to say is joined
     # into one developer note. On every turn but the first, at most one of
     # them has anything to say.
-    memory_watcher = MemoryWatcher(memory, root=root) if memory is not None else None
+    #
+    # Always built, even without `--memory`: a resumed session may carry a
+    # block that an earlier process delivered, and switching memory off has
+    # to be said out loud (`MemoryWatcher.refresh`, `MEMORY_WITHDRAWN`).
+    memory_watcher = MemoryWatcher(
+        memory,
+        root=root,
+        shown=resume_from.developer_notes() if resume_from is not None else (),
+    )
     skills_watcher = SkillsWatcher(skills) if skills is not None else None
 
     def _on_turn_start() -> str | None:
-        notes = [agents_watcher.refresh(Path(context.shell.cwd))]
-        if memory_watcher is not None:
-            notes.append(memory_watcher.refresh())
+        notes = [agents_watcher.refresh(Path(context.shell.cwd)), memory_watcher.refresh()]
         if skills_watcher is not None:
             notes.append(skills_watcher.refresh())
         said = [note for note in notes if note is not None]

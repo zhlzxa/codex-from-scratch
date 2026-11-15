@@ -34,7 +34,6 @@ comparing two sets of results is a second function.  There is one caller shape
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -611,20 +610,3 @@ def by_name(name: str) -> Task:
 def declared_files() -> set[str]:
     """Every path any task writes.  08's assertion reads this."""
     return {name for task in (*TASKS, *MEMORY_TASKS) for name in task.files}
-
-
-def as_json() -> str:
-    """The task set as data, for a diff to read when somebody edits it."""
-    return json.dumps(
-        [
-            {
-                "name": t.name,
-                "question": t.question,
-                "files": sorted(t.files),
-                "checks": [c.name for c in t.checks],
-            }
-            for t in TASKS
-        ],
-        indent=2,
-        ensure_ascii=False,
-    )

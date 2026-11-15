@@ -7,6 +7,13 @@ dedicated-tools flag being independent of `overflows()`, the developer-role
 watcher, the real citation format) -- a mutation list is only honest if it
 tests the code that actually ships, not the code that used to.
 
+The last six were added when the chapter was rewritten again, one per defect
+that rewrite found, and one was removed: "prose full stops count as file
+extensions" survived once the extension list existed, because the rule it
+mutated no longer decided anything. The rule went with it. Two of the new ones
+(the line numbers) would have survived the old tests, because every citation
+in them was built from the same numbers the parser produced.
+
     uv run python probe_mutations_ch16.py
 """
 
@@ -110,12 +117,6 @@ MUTATIONS = [
         "    parts = [DATA_PREAMBLE]\n    if root is not None:",
         "    parts = [DATA_PREAMBLE]\n    if False:",
     ),
-    (
-        "memory.py",
-        "prose full stops count as file extensions, so i.e. is a missing file",
-        r'_PATHISH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z][A-Za-z0-9]{1,5}\b")',
-        r'_PATHISH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.[A-Za-z][A-Za-z0-9]{0,5}\b")',
-    ),
     # ---- the dedicated tools' own budget (F16-04) ---------------------------
     (
         "memory.py",
@@ -176,6 +177,45 @@ MUTATIONS = [
         "reading MEMORY.md is never classified as touching memory",
         '        if target in haystack or f"memories/{filename}" in haystack:',
         "        if False:",
+    ),
+    # ---- found when the chapter was rewritten -------------------------------
+    (
+        "memory.py",
+        "the version line is cut off, so every line number is one too small",
+        '    return "\\n".join(["" for _ in lines[: index + 1]] + lines[index + 1 :])',
+        '    return "\\n".join(lines[index + 1 :])',
+    ),
+    (
+        "memory.py",
+        "a section ends where its stripped body ends, not at its last line",
+        '        last_line = heading_line + text[match.start() : end].rstrip().count("\\n")',
+        '        last_line = heading_line + body.count("\\n")',
+    ),
+    (
+        "memory.py",
+        "any dotted word counts as a file, so github.com is a missing path",
+        '        if candidate.rsplit(".", 1)[-1].lower() not in _FILE_EXTENSIONS:',
+        "        if False:",
+    ),
+    (
+        "memory.py",
+        "a resumed session is shown the same memory block again",
+        "        if block in self._earlier:",
+        "        if False:",
+    ),
+    (
+        "memory.py",
+        "resuming without --memory leaves the old block standing, unretracted",
+        "            return MEMORY_WITHDRAWN"
+        " if self._earlier is not None and not withdrawn else None",
+        "            return None",
+    ),
+    (
+        "__main__.py",
+        "the CLI's watcher is not told what the resumed session already holds",
+        "        shown=resume_from.developer_notes() if resume_from is not None else (),\n"
+        "    )\n\n    def _on_turn_start",
+        "        shown=(),\n    )\n\n    def _on_turn_start",
     ),
 ]
 
