@@ -70,6 +70,7 @@ from mcp.client.stdio import (
     stdio_client,
 )
 
+from minicodex.mcp_oauth import make_loopback_callback
 from minicodex.remote import (
     CallbackHandler,
     RedirectHandler,
@@ -298,6 +299,45 @@ def _as_callback(handler: RequestHandler) -> Any:
     return callback
 
 
+def _explain(exc: BaseException) -> str:
+    """What actually went wrong, rather than the group it arrived in.
+
+    The SDK's HTTP transport runs inside an anyio task group, so a remote
+    server that cannot be reached raises an `ExceptionGroup` whose own text is
+    `unhandled errors in a TaskGroup (1 sub-exception)` -- and the first
+    version put exactly that into the message.  A proxy's 403, a refused
+    connection and an authorization server with no `/register` all read the
+    same.  Measured when chapter 21 was rewritten, on a machine whose proxy
+    blocks the probe's real servers: the cause was one level down every time.
+    So: the leaves of the group, each as `Type: message`, duplicates dropped.
+    """
+
+    # Recognised by its `exceptions` tuple rather than by class: on Python
+    # 3.10 `BaseExceptionGroup` is not a builtin, and anyio raises the
+    # `exceptiongroup` backport's instead.
+    def inner(error: BaseException) -> tuple[BaseException, ...] | None:
+        found = getattr(error, "exceptions", None)
+        return tuple(found) if isinstance(found, (list, tuple)) else None
+
+    if inner(exc) is None:
+        # A plain exception keeps the wording chapter 9's tests pin.
+        return str(exc)
+    leaves: list[str] = []
+
+    def walk(error: BaseException) -> None:
+        children = inner(error)
+        if children is not None:
+            for child in children:
+                walk(child)
+            return
+        text = f"{type(error).__name__}: {error}".rstrip(": ").strip()
+        if text not in leaves:
+            leaves.append(text)
+
+    walk(exc)
+    return "; ".join(leaves)
+
+
 class McpClient:
     """One connection to one server, stdio or remote.
 
@@ -334,9 +374,21 @@ class McpClient:
         # web server is not this process's to do -- see the module docstring
         # and the remote-server gap above.
         self._sandbox = sandbox
-        self._owner = owner
+        # `_tenant`, not `_owner`: `_owner` is the task that holds the
+        # connection open (below), and the first version used the same name
+        # for both -- so the `Owner` was overwritten with `None` two lines
+        # later, and every remote server with OAuth failed to start with
+        # `'NoneType' object has no attribute 'mcp_tokens'`.  No test went
+        # through `McpClient` with OAuth configured.  Found when chapter 21
+        # was rewritten.
+        self._tenant = owner
         self._redirect_handler = redirect_handler
         self._callback_handler = callback_handler
+        # Seconds spent waiting on a person at an OAuth consent screen, and
+        # when the current wait (if any) began.  `start()` takes them off its
+        # deadline -- see there.
+        self._person_seconds = 0.0
+        self._person_since: float | None = None
         self._client: Client | None = None
         # The task that holds the connection open, and how to ask it to stop.
         self._owner: asyncio.Task[None] | None = None
@@ -385,11 +437,16 @@ class McpClient:
             return self._server
 
         if isinstance(self.config, RemoteServerConfig):
+            callback = self._callback_handler
+            if self.config.oauth is not None:
+                callback = self._timing_the_person(
+                    callback or make_loopback_callback(self.config.oauth.redirect_port)
+                )
             return await build_remote_transport(
                 self.config,
-                owner=self._owner,
+                owner=self._tenant,
                 redirect_handler=self._redirect_handler,
-                callback_handler=self._callback_handler,
+                callback_handler=callback,
             )
 
         # Not a `with`: the file has to outlive this function and stay open
@@ -461,15 +518,32 @@ class McpClient:
         if elicit is not None:
             callbacks["elicitation_callback"] = _as_callback(elicit)
 
-        opened: asyncio.Future[Client] = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+        opened: asyncio.Future[Client] = loop.create_future()
         closing = asyncio.Event()
+        started = loop.time()
         owner = asyncio.create_task(self._hold(callbacks, opened, closing))
         try:
-            # `shield`, so that the deadline expiring cancels the *wait* and
-            # not the future the owner task is about to resolve.
-            client = await asyncio.wait_for(
-                asyncio.shield(opened), timeout=self.config.startup_timeout
-            )
+            # The deadline is for the *server*, not for a person.  An OAuth
+            # server's first connection waits, inside the handshake, for
+            # somebody to read a consent screen and click -- and the first
+            # version put that wait under the same 30s, so anyone slower
+            # than that got "did not answer initialize" about a server that
+            # had answered at once, and the callback's own five-minute limit
+            # (`CALLBACK_TIMEOUT_SECONDS`) could never be reached.  Found when
+            # chapter 21 was rewritten.  So the clock stops while a person is
+            # being waited on; the callback's own timeout bounds that part.
+            #
+            # `asyncio.wait` rather than `wait_for`: it never cancels what it
+            # waits on, so waking up to re-read the clock costs nothing.
+            while True:
+                left = self.config.startup_timeout - (loop.time() - started - self._person_time())
+                if self._person_since is None and left <= 0:
+                    raise TimeoutError
+                await asyncio.wait({opened}, timeout=max(left, 0.05))
+                if opened.done():
+                    break
+            client = opened.result()
         except (TimeoutError, asyncio.TimeoutError) as exc:
             self.failure = (
                 f"{self.config.name} did not answer initialize within "
@@ -483,7 +557,7 @@ class McpClient:
             # stderr: a server that failed to start usually said why on the way
             # out, and the message without it is "could not start" and nothing
             # else.
-            detail = f"{exc}"
+            detail = _explain(exc)
             if self._last_words:
                 detail = f"{detail}: {self._last_words}"
             self.failure = f"could not start {self.config.name}: {detail}"
@@ -503,6 +577,26 @@ class McpClient:
                 "name": getattr(info, "name", "") or "",
                 "version": getattr(info, "version", "") or "",
             }
+
+    def _person_time(self) -> float:
+        """Seconds of this start-up that were a person's, including any now."""
+        if self._person_since is None:
+            return self._person_seconds
+        return self._person_seconds + asyncio.get_running_loop().time() - self._person_since
+
+    def _timing_the_person(self, inner: CallbackHandler) -> CallbackHandler:
+        """`inner`, with the time it spends waiting recorded for `start()`."""
+
+        async def callback() -> Any:
+            loop = asyncio.get_running_loop()
+            self._person_since = loop.time()
+            try:
+                return await inner()
+            finally:
+                self._person_seconds += loop.time() - self._person_since
+                self._person_since = None
+
+        return callback
 
     async def _hold(
         self,
@@ -627,9 +721,12 @@ class McpClient:
         Upstream did not implement this for stdio: a server on your own machine
         is reading files you could have read yourself, so there was nothing a
         resource would show that `read_file` did not already.  A remote
-        server is not on your own machine, and docs/history.md records the
-        measurement of whether a model reaches for it -- the method itself is
-        the SDK's `Client.list_resources`.
+        server is not on your own machine.  The method itself is the SDK's
+        `Client.list_resources`.
+
+        Nothing calls it yet: `connect()` does not, and no tool hands a
+        resource to a model, so there was never a measurement of whether a
+        model reaches for one (an earlier docstring here said there was).
         """
         client = self._require()
         capabilities = getattr(client, "server_capabilities", None) or getattr(
@@ -693,9 +790,8 @@ class McpClient:
         the traceback that would have said went to a pipe.  The stderr detour is that
         gap, and it is still this module's to fill for a stdio server -- so the
         server's stderr is re-read here and appended.  A remote server has no
-        stderr this process can read; `exc` is whatever `httpx2` or the SDK's
-        OAuth flow already said, which is usually specific enough on its own
-        (a status code, a connection-refused, an `OAuthRegistrationError`).
+        stderr this process can read; what it has instead is whatever `httpx2`
+        or the SDK's OAuth flow said -- once `_explain` has dug it out.
 
         Dropping `_client` is the other half.  There is no
         `returncode` to ask about -- the transport keeps the process handle --
@@ -706,7 +802,7 @@ class McpClient:
         """
         self._refresh_last_words()
         self._client = None
-        detail = f"{self.config.name}: {exc}"
+        detail = f"{self.config.name}: {_explain(exc)}"
         if self._last_words:
             return f"{detail}: {self._last_words}"
         return detail

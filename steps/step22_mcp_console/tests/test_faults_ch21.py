@@ -81,6 +81,10 @@ class ScriptedBrowser:
         )
 
 
+async def _never_asked() -> None:
+    raise AssertionError("this flow must not reach a browser")
+
+
 # ---------------------------------------------------------------------------
 # F21-01  a config's shape decides its transport (narrowed: the transport
 # itself is the SDK's now; the dispatch rule -- derive, refuse ambiguity --
@@ -194,6 +198,40 @@ async def test_F21_06_a_startup_timeout_fires_on_a_remote_server_that_never_answ
     with pytest.raises(McpError):
         await client.start()
     await client.close()
+
+
+async def test_F21_06_a_remote_failure_names_its_cause_not_a_task_group(tmp_path: Path) -> None:
+    """The SDK's HTTP transport fails inside an anyio task group, and the
+    first version reported the group: `could not start nowhere: unhandled
+    errors in a TaskGroup (1 sub-exception)` -- for a refused connection, for
+    a proxy's 403, and for an authorization server with no `/register`
+    alike.  Found when chapter 21 was rewritten.  What the person needs is
+    the one exception inside."""
+    client = McpClient(
+        RemoteServerConfig(name="nowhere", url="http://127.0.0.1:1/mcp", startup_timeout=5.0)
+    )
+    with pytest.raises(McpError) as refused:
+        await client.start()
+    await client.close()
+    assert "ConnectError" in str(refused.value)
+    assert "TaskGroup" not in str(refused.value)
+
+    async with OAuthStub(supports_dcr=False) as auth:
+        async with HttpMcpStub(
+            require_auth=True, challenge=auth.prm_url, accepts=auth.is_live
+        ) as stub:
+            auth.resource = stub.url
+            client = McpClient(
+                remote(stub, oauth=RemoteOAuthConfig()),
+                owner=Owner("alice-nodcr", home=tmp_path),
+                redirect_handler=_never_asked,  # type: ignore[arg-type]
+                callback_handler=_never_asked,  # type: ignore[arg-type]
+            )
+            with pytest.raises(McpError) as unregistered:
+                await client.start()
+            await client.close()
+    assert "OAuthRegistrationError" in str(unregistered.value)
+    assert "404" in str(unregistered.value)
 
 
 async def test_F21_06_a_tool_timeout_is_reported_by_name() -> None:
@@ -452,6 +490,96 @@ async def test_F21_09_the_default_loopback_callback_answers_a_real_http_request(
     assert result.state == "xyz"
 
 
+async def test_F21_09_mcp_client_sends_the_owners_stored_token(tmp_path: Path) -> None:
+    """The whole path a session takes -- `McpClient` with an `oauth` config and
+    an `Owner` -- rather than `build_oauth_provider` on its own.
+
+    The first version failed here with `'NoneType' object has no attribute
+    'mcp_tokens'`: `McpClient.__init__` stored the `Owner` as `self._owner` and
+    then, two lines later, reset `self._owner = None` for the task that holds
+    the connection.  Every test of OAuth called `build_oauth_provider`
+    directly, so none of them went through the line that broke.  Found when
+    chapter 21 was rewritten."""
+    from mcp.shared.auth import OAuthToken
+
+    owner = Owner("alice-stored", home=tmp_path)
+    await OwnerTokenStorage(owner, server="remote").set_tokens(
+        OAuthToken(access_token="stored-1", expires_in=3600)
+    )
+    async with HttpMcpStub(require_auth=True) as stub:
+        client = McpClient(
+            remote(stub, oauth=RemoteOAuthConfig(client_id="preset")),
+            owner=owner,
+            redirect_handler=_never_asked,  # type: ignore[arg-type]
+            callback_handler=_never_asked,  # type: ignore[arg-type]
+        )
+        await client.start()
+        try:
+            assert [tool.name for tool in await client.list_tools()] == ["echo"]
+        finally:
+            await client.close()
+    assert stub.authorized[0] == "Bearer stored-1"
+
+
+async def test_F21_09_a_person_at_the_consent_screen_is_not_a_server_timeout(
+    tmp_path: Path,
+) -> None:
+    """The startup deadline is for the server.  The first version also ran it
+    over the time a person spends reading a consent screen, so anyone slower
+    than 30s was told the server "did not answer initialize" -- and the
+    callback's own five-minute limit could never be reached.  Scaled down:
+    a one-second deadline, a person who takes a second and a half."""
+    async with OAuthStub() as auth:
+        async with HttpMcpStub(
+            require_auth=True, challenge=auth.prm_url, accepts=auth.is_live
+        ) as stub:
+            auth.resource = stub.url
+            browser = ScriptedBrowser()
+
+            async def slow_person() -> AuthorizationCodeResult:
+                await asyncio.sleep(1.5)
+                return await browser.callback()
+
+            client = McpClient(
+                remote(stub, oauth=RemoteOAuthConfig(client_id="preset"), startup_timeout=1.0),
+                owner=Owner("alice-slow", home=tmp_path),
+                redirect_handler=browser.redirect,
+                callback_handler=slow_person,
+            )
+            await client.start()
+            try:
+                assert [tool.name for tool in await client.list_tools()] == ["echo"]
+            finally:
+                await client.close()
+    assert auth.token_calls == 1
+    assert stub.authorized[-1] == "Bearer access-1"
+
+
+async def test_F21_06_a_server_that_accepts_and_never_answers_still_times_out() -> None:
+    """The other half of the test above: stopping the clock for a person must
+    not stop it for a server.  A socket that is accepted and never answered
+    -- the "reachable but silent" case F21-06's first test settles past."""
+    held: list[asyncio.StreamWriter] = []
+
+    async def silent(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        held.append(writer)
+
+    server = await asyncio.start_server(silent, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    config = RemoteServerConfig(
+        name="silent", url=f"http://127.0.0.1:{port}/mcp", startup_timeout=0.5
+    )
+    client = McpClient(config)
+    try:
+        with pytest.raises(McpError, match="did not answer initialize within"):
+            await asyncio.wait_for(client.start(), timeout=10)
+    finally:
+        await client.close()
+        for writer in held:
+            writer.close()
+        server.close()
+
+
 def _free_port() -> int:
     import socket
 
@@ -516,6 +644,88 @@ async def test_F21_10_the_token_file_is_not_world_readable(tmp_path: Path) -> No
     storage = OwnerTokenStorage(Owner("alice", home=tmp_path), server="gh")
     await storage.set_tokens(OAuthToken(access_token="a"))
     assert storage.path.stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes; Windows uses ACLs")
+async def test_F21_10_the_token_file_is_born_private_not_made_private_afterwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The test above checks the mode at the end.  The first version got
+    there by writing the file with the umask's mode (0644 on most machines)
+    and `chmod`ing it afterwards -- so for a moment, and for good if the
+    `chmod` failed (its error was suppressed), the token was readable by
+    anyone.  With `chmod` disabled, only a file *created* at 0600 passes."""
+    from mcp.shared.auth import OAuthToken
+
+    monkeypatch.setattr("minicodex.mcp_oauth.os.chmod", lambda *args, **kwargs: None)
+    old_umask = os.umask(0o022)
+    try:
+        storage = OwnerTokenStorage(Owner("alice", home=tmp_path), server="gh")
+        await storage.set_tokens(OAuthToken(access_token="a"))
+    finally:
+        os.umask(old_umask)
+    assert storage.path.stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes; Windows uses ACLs")
+async def test_F21_10_a_temporary_file_left_by_a_crash_does_not_widen_the_mode(
+    tmp_path: Path,
+) -> None:
+    """`O_CREAT`'s mode only applies to a file it creates.  A temporary file a
+    crashed write left behind keeps whatever mode it had, and is then renamed
+    into place -- so the write sets 0600 on it again before the rename."""
+    from mcp.shared.auth import OAuthToken
+
+    storage = OwnerTokenStorage(Owner("alice", home=tmp_path), server="gh")
+    storage.path.parent.mkdir(parents=True)
+    leftover = storage.path.with_name(f"{storage.path.name}.{os.getpid()}.tmp")
+    leftover.write_text("half a file", encoding="utf-8")
+    leftover.chmod(0o644)
+    await storage.set_tokens(OAuthToken(access_token="a"))
+    assert storage.path.stat().st_mode & 0o077 == 0
+
+
+async def test_F21_10_a_broken_token_file_is_not_silently_replaced(tmp_path: Path) -> None:
+    """A file that does not parse -- half-written, or edited by hand -- used to
+    read as "no tokens", and the next sign-in wrote a file holding only the
+    new server.  Every other server's token was gone, and nothing said so.
+    A reader may still call it empty; a writer must not replace it."""
+    from mcp.shared.auth import OAuthToken
+
+    from minicodex.mcp_oauth import OAuthStorageError
+
+    storage = OwnerTokenStorage(Owner("alice", home=tmp_path), server="gh")
+    storage.path.parent.mkdir(parents=True)
+    storage.path.write_text('{"linear": {"tokens": {"access_token": "keep-me"', encoding="utf-8")
+    assert await storage.get_tokens() is None
+    with pytest.raises(OAuthStorageError, match="not overwriting"):
+        await storage.set_tokens(OAuthToken(access_token="new"))
+    assert "keep-me" in storage.path.read_text(encoding="utf-8")
+
+
+async def test_F21_10_a_failed_write_leaves_the_previous_file_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The write goes to a new file that is renamed over the old one, so a
+    failure at any point leaves the old file as it was -- and no stray
+    temporary file beside it."""
+    from mcp.shared.auth import OAuthToken
+
+    from minicodex.mcp_oauth import OAuthStorageError
+
+    owner = Owner("alice", home=tmp_path)
+    storage = OwnerTokenStorage(owner, server="gh")
+    await storage.set_tokens(OAuthToken(access_token="first"))
+    before = storage.path.read_text(encoding="utf-8")
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("minicodex.mcp_oauth.os.replace", refuse)
+    with pytest.raises(OAuthStorageError, match="disk full"):
+        await storage.set_tokens(OAuthToken(access_token="second"))
+    assert storage.path.read_text(encoding="utf-8") == before
+    assert sorted(p.name for p in storage.path.parent.iterdir()) == [storage.path.name]
 
 
 # ---------------------------------------------------------------------------
@@ -692,9 +902,14 @@ async def test_F21_15_preload_tokens_makes_the_same_scenario_silent(tmp_path: Pa
 
 
 async def test_F21_12_a_server_without_the_capability_is_not_asked() -> None:
-    """A server that does not implement resources answers `-32601`, which
-    would otherwise be recorded as a *connection failure* and drop its tools
-    with it."""
+    """A server that does not implement resources answers `-32601`; asking
+    it anyway would hand the caller an error instead of an empty list.
+
+    Who that caller is: nobody yet.  `list_resources`/`read_resource` exist
+    and are tested here, but `connect()` never calls them and no tool
+    exposes them to a model -- the first version's docstring said a missing
+    check would "drop its tools", which describes a path that does not
+    exist.  Corrected when chapter 21 was rewritten."""
     async with HttpMcpStub(declare_resources_capability=False) as stub:
         client = McpClient(remote(stub))
         await client.start()
@@ -778,9 +993,10 @@ class FakeSandbox:
     without a kernel -- chapter 20's own fix for the same shape of survivor:
     deleting `McpClient`'s `if self._sandbox is not None:` branch leaves a
     session that says it is confined and is not, and nothing about that needs
-    bubblewrap to detect. `wrap` returns an argv that runs anywhere -- the
-    current interpreter, told to import and exit -- and records what it was
-    asked to wrap.
+    bubblewrap to detect. `wrap` records what it was asked to wrap and hands
+    the command back unchanged, so the server starts on any platform.  (The
+    first version of this docstring said it substituted "the current
+    interpreter, told to import and exit"; the code never did.)
     """
 
     def __init__(self) -> None:

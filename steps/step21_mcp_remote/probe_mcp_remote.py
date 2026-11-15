@@ -111,13 +111,28 @@ async def wellknown() -> None:
     """
     rule("wellknown")
     async with httpx.AsyncClient(timeout=10.0) as client:
-        response = await client.post(GITHUB, headers=HEADERS, json=INIT)
+        # The first two hops are guarded like every later one.  The first
+        # version let an unreachable GitHub raise out of here as a traceback --
+        # which, under `all`, also stopped `bearer` and `latency` from running.
+        # Found when chapter 21 was rewritten, on a machine whose proxy does
+        # not let `api.githubcopilot.com` through.
+        try:
+            response = await client.post(GITHUB, headers=HEADERS, json=INIT)
+        except httpx.HTTPError as exc:
+            print(f"  {GITHUB}\n    UNREACHABLE: {type(exc).__name__}; nothing to follow")
+            return
         metadata_url = _resource_metadata_url(response.headers.get("www-authenticate", ""))
         if metadata_url is None:
             print("  GitHub did not name a metadata document; nothing to follow")
             return
         print(f"  hop 1  {metadata_url}")
-        document = (await client.get(metadata_url, headers={"Accept": "application/json"})).json()
+        try:
+            document = (
+                await client.get(metadata_url, headers={"Accept": "application/json"})
+            ).json()
+        except (httpx.HTTPError, ValueError) as exc:
+            print(f"    could not read it: {type(exc).__name__}")
+            return
         servers = document.get("authorization_servers") or []
         print(f"  hop 2  authorization_servers = {servers}")
         if not servers:

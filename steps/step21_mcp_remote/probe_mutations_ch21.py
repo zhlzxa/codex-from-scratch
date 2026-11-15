@@ -36,6 +36,29 @@ repository to revert.
                                                               built an argv
                                                               nobody runs
 
+Added when chapter 21 was rewritten:
+
+    the Owner is stored where the connection task goes      -> every OAuth
+                                                              server fails to
+                                                              start
+    the startup clock runs over a person at a consent screen -> "did not
+                                                              answer" after
+                                                              30s of reading
+    the startup clock never runs out                         -> a silent
+                                                              server hangs
+                                                              the session
+    a failed start reports the task group, not the cause     -> "unhandled
+                                                              errors in a
+                                                              TaskGroup" for
+                                                              every failure
+    the token file is created 0644, chmod'd after            -> readable by
+                                                              anyone, for a
+                                                              moment or for
+                                                              good
+    a token file that does not parse is overwritten          -> every other
+                                                              server's token
+                                                              silently gone
+
     uv run python probe_mutations_ch21.py
 """
 
@@ -88,8 +111,11 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     (
         "src/minicodex/mcp_oauth.py",
         "the token file is written world-readable -- the chmod is dropped",
-        "            os.chmod(self.path, 0o600)",
-        "            pass",
+        # Retargeted when chapter 21 was rewritten: the file is now created
+        # 0600 and renamed into place, and this chmod is the one that covers a
+        # temporary file a crash left behind with a wider mode.
+        "            with contextlib.suppress(OSError):\n                os.chmod(temp, 0o600)\n",
+        "            if False:\n                os.chmod(temp, 0o600)\n",
     ),
     # ---- F21-15: restart-safe proactive refresh ------------------------------
     (
@@ -122,6 +148,43 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "the sandbox-wrapped command is built and then discarded",
         "    if wrapped is None:",
         "    if True:",
+    ),
+    # ---- added when chapter 21 was rewritten ------------------------------
+    (
+        "src/minicodex/mcp.py",
+        "the Owner and the connection task share one attribute again",
+        "                owner=self._tenant,",
+        "                owner=self._owner,",
+    ),
+    (
+        "src/minicodex/mcp.py",
+        "the startup clock keeps running while a person is at the consent screen",
+        "                if self._person_since is None and left <= 0:",
+        "                if loop.time() - started >= self.config.startup_timeout:",
+    ),
+    (
+        "src/minicodex/mcp.py",
+        "the startup clock never runs out at all",
+        "                if self._person_since is None and left <= 0:",
+        "                if False:",
+    ),
+    (
+        "src/minicodex/mcp.py",
+        "a failed start reports the task group instead of what is inside it",
+        "            detail = _explain(exc)",
+        '            detail = f"{exc}"',
+    ),
+    (
+        "src/minicodex/mcp_oauth.py",
+        "the token file is created with the umask's mode and only chmod'd after",
+        "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)",
+        "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)",
+    ),
+    (
+        "src/minicodex/mcp_oauth.py",
+        "a token file that does not parse is overwritten as if it were empty",
+        "            if for_writing:\n                raise OAuthStorageError(\n",
+        "            if False:\n                raise OAuthStorageError(\n",
     ),
 ]
 
