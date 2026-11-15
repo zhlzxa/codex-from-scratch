@@ -761,6 +761,17 @@ Nine faults found that were not on the list:
 | **git broke the chapter's own cleanup.** `.git/objects` is written 0444 and Windows enforces it, so `shutil.rmtree` over a committed memory directory raised `PermissionError [WinError 5]` | 🔴 | `onexc=` with a `chmod`. Introduce a dependency and the first thing it breaks is not the main path |
 | **Both of this chapter's own metrics measured something else.** The journal-word classifier fired on 2 bullets out of 60, while the real junk was grammatically identical to the real signal; and "unparseable" counted every correct `DURABLE: no` as a parse failure | 🟠 | One kept but labelled as measuring the wrong thing, one fixed. Chapter 6 had five of these, chapter 14 three, chapter 16 three, and this chapter three — it is a constant now, and the shape never changes: **not a wrong number, a number about something else** |
 
+Found when the chapter was rewritten for beginners (2026-11):
+
+| Fault | Found | Fix |
+|---|---|---|
+| **Stage 2 locked the write and not the read-merge-write.** Two runs each loaded the memory, each spent a model call merging, then wrote in turn; the later write was built on a memory from before the earlier one. Measured with two overlapping runs over two sessions: both reported success, one session's material was in neither file, and its `raw/` file had been deleted. The caller-supplied `memory` (loaded at session start) was a second route to the same stale read. | 🟢 | `MERGE_LOCK` held from the first read of `raw/` to the last delete; memory re-read under it; `run_pipeline` lost its `memory` parameter. A run that finds the lock taken returns `deferred` and leaves its `raw/` file |
+| **A provider error during the merge printed a traceback after the user's answer**, exit 1. `_finish_writer` caught `MemoryWriteError`, `MemoryError_`, `OSError` and `ModelFailed`; the writer has no agent loop, so its errors are the client's `ModelHTTPError` or `httpx` ones. A failure during the grace wait escaped by a second route, before that handler. | 🟣 | `Exception` at both points (and in `--remember-now`); a test drives both orders |
+| **A session whose process was killed was never turned into memory, and nothing said so.** `pending_sessions` reads chapter 7's lock file as "still open"; a killed process runs no `finally`, so the lock stays forever and the session is never enrolled. | 🟣 | Still skipped -- `os.kill(pid, 0)` terminates the process on Windows -- but `locked_sessions()` lists it with its pid and `--jobs` prints it, even with no job table yet |
+| **`--jobs` counted every finished session as eligible**, done ones included. | 🟠 | Counts sessions not yet in the table |
+| **F17-03's race is intermittent on Linux**: 3 of 6 runs duplicated claims, against every run on the Windows machine it was first measured on. A race that passes half the time passes a check half the time. | 🟢 | Recorded in the chapter and in `JobStore`'s docstring; the test asserts the outcome (a second claim gets nothing), not a race |
+| **The rewrite itself shipped a mutation into seven later snapshots**: the patch was generated while `probe_mutations_ch17.py` had `BEGIN IMMEDIATE` replaced by `pass` on disk. Their ch17 tests went 11 red. | 🔴 | Restored. Nothing is copied out of a directory while its mutation script runs |
+
 ## Chapter 18 · Skills: a name and one sentence, the rest on demand ✅
 
 > Discovery, parsing and the tool are offline. The one question that needs a

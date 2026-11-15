@@ -20,8 +20,8 @@ chapter 16 re-measured its own citation format (F17-13). Both are below.
 
 ```bash
 uv sync --all-extras
-uv run pytest                                   # 1682 tests, all offline
-uv run python probe_mutations_ch17.py           # 44 mutations
+uv run pytest                                   # 1781 tests, all offline
+uv run python probe_mutations_ch17.py           # 50 mutations
 uv run python probe_memory_write.py race        # offline, F17-03
 uv run python probe_memory_write.py forget      # offline, F17-06/07
 
@@ -41,9 +41,9 @@ uv run minicodex memory --forget-all            # all of it, including raw/
 | `src/minicodex/model.py` | `RateLimit` off the response headers, on a *successful* request |
 | `src/minicodex/composition.py` | `top_level_tools(remember=...)` — the one tool a model gets |
 | `src/minicodex/__main__.py` | `--remember`, `memory --jobs / --remember-now`, a wider `--forget-all` |
-| `tests/test_faults_ch17.py` | 56 tests, F17-01…F17-11 |
+| `tests/test_faults_ch17.py` | 66 tests, F17-01…F17-13 |
 | `probe_memory_write.py` | nine sections: sessions, signal, secrets, quota, time, race, handedits, ab, forget |
-| `probe_mutations_ch17.py` | 44 mutations |
+| `probe_mutations_ch17.py` | 50 mutations |
 
 ## The headline: a generated memory against a hand-written one
 
@@ -239,6 +239,29 @@ Also inherited: because ids are derived from headings, an entry the merge
 the safe direction — it looks new, not unused — which is what
 `test_F17_13_an_entry_whose_heading_the_merge_reworded_is_new_not_ancient`
 checks.
+
+## Found when the chapter was rewritten
+
+- **Stage 2 only locked the write.** Two runs each read the memory, each
+  spent a model call merging, and wrote one after the other; the second
+  write was built on a memory from before the first. Both reported success,
+  and one session's material was in neither file -- its `raw/` file deleted.
+  Stage 2 now holds `MERGE_LOCK` from its first read to its last delete, and
+  re-reads the memory under it; a run that finds the lock taken leaves its
+  `raw/` file and reports `merge left to another minicodex`.
+- **A provider error during the merge printed a traceback after the answer.**
+  `_finish_writer` caught four named types; the writer calls the client
+  directly, so its errors are `ModelHTTPError`/`httpx`, not `ModelFailed`.
+  And a failure during the grace wait escaped by a second route. Both now
+  catch `Exception`.
+- **A session whose process was killed was never remembered, silently.** Its
+  chapter-7 lock stays forever and `pending_sessions` skips it. It is still
+  skipped (liveness of a pid cannot be asked portably), but `--jobs` now
+  names it with its pid.
+- **`--jobs` counted done sessions as eligible.** It counts sessions not yet
+  in the table.
+- **The select-then-update race is intermittent on Linux** (3 of 6 runs), not
+  deterministic as first recorded on Windows.
 
 ## Deliberately not done
 

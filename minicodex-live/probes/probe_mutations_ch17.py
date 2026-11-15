@@ -6,6 +6,9 @@ claim, the usage table subtracted instead of rebuilt, and the secret count that
 counted regexes -- so the list starts as a record of real mistakes rather than
 as a list of invented ones.
 
+The last six were added when the chapter was rewritten, one per defect that
+rewrite found.
+
     uv run python probe_mutations_ch17.py
 """
 
@@ -295,6 +298,43 @@ MUTATIONS = [
         "        age_days = max(0.0, (now - first_seen) / 86400.0)",
         '        first_seen = float(row.get("first_seen", 0) or 0)\n'
         "        age_days = max(0.0, (now - first_seen) / 86400.0)",
+    ),
+    # ---- found when the chapter was rewritten -------------------------------
+    (
+        "memory_write.py",
+        "a run that finds the merge lock taken fails instead of leaving its raw file",
+        '        return report(deferred="another minicodex")',
+        "        raise",
+    ),
+    (
+        "memory_write.py",
+        "stage 2 reads, merges and writes without holding the merge lock",
+        "        fd = await asyncio.to_thread(_lock, lock_path)\n    except MemoryWriteError:",
+        "        fd = os.open(os.devnull, os.O_RDONLY)\n    except MemoryWriteError:",
+    ),
+    (
+        "__main__.py",
+        "a writer failure reported by the task itself escapes after the answer",
+        "    except Exception as exc:\n        # Never fatal.",
+        "    except OSError as exc:\n        # Never fatal.",
+    ),
+    (
+        "__main__.py",
+        "a writer failure during the grace wait escapes after the answer",
+        "        except Exception:\n            # The writer failed while",
+        "        except ZeroDivisionError:\n            # The writer failed while",
+    ),
+    (
+        "memory_jobs.py",
+        "a session locked by a dead process is skipped without being named",
+        "        if not lock.exists():\n            continue",
+        "        if True:\n            continue",
+    ),
+    (
+        "__main__.py",
+        "--jobs counts sessions that are already done as waiting",
+        "            if store.state_of(session_id) is None",
+        "            if True",
     ),
 ]
 

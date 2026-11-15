@@ -462,7 +462,6 @@ async def run_turn(
                 # Global, like the memory it books work against (F17-12): one
                 # queue per machine, not one per workspace the server hosts.
                 jobs_path=DEFAULT_JOBS_PATH,
-                memory=memory,
                 exclude=(current.session_id,),
                 headroom=lambda: llm.rate_limit.headroom() if llm.rate_limit else None,
             )

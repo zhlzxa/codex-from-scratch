@@ -20,7 +20,7 @@ import json
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -42,6 +42,7 @@ from minicodex.memory_jobs import (
     MAX_ATTEMPTS,
     MAX_PER_STARTUP,
     JobStore,
+    locked_sessions,
     pending_sessions,
 )
 from minicodex.memory_write import (
@@ -1268,6 +1269,147 @@ def test_F17_13_an_entry_whose_heading_the_merge_reworded_is_new_not_ancient() -
     renamed = (_entry("how-to-run-tests", "How to run tests"),)
     kept = prune(renamed, counts, now=now).kept
     assert [e.title for e in kept] == ["How to run tests"]
+
+
+# ---------------------------------------------------------------------------
+# Found when the chapter was rewritten
+# ---------------------------------------------------------------------------
+
+
+class _GatedMerge:
+    """Stage 1 answers at once with `fact`; stage 2 waits for `gate`, then
+    keeps every section it was shown and adds `title`."""
+
+    tools: ClassVar[list[dict[str, Any]]] = []
+
+    def __init__(self, fact: str, title: str, gate: asyncio.Event | None = None) -> None:
+        self.fact, self.title, self.gate = fact, title, gate
+
+    async def _stream(self, messages: Any) -> Any:
+        from minicodex.model import Completed, TextDelta
+
+        if "maintain one repository's memory" in messages[0]["content"]:
+            if self.gate is not None:
+                await self.gate.wait()
+            current = [e.title for e in load(self.directory).entries]
+            sections = "\n\n".join(f"## {t}\n\nkept." for t in [*current, self.title])
+            yield TextDelta(f"{SUMMARY_MARK}\n- s\n{BODY_MARK}\n{sections}\n")
+        else:
+            yield TextDelta(f"DURABLE: yes\n## Preference signals\n- {self.fact}\n")
+        yield Completed("stop")
+
+    def stream(self, messages: Any) -> Any:
+        return self._stream(messages)
+
+
+def test_two_overlapping_writers_do_not_lose_a_merge(tmp_path: Path) -> None:
+    """The lock used to be taken inside `write_memory` only.
+
+    Two runs each read the memory, each spent a model call merging, and then
+    wrote one after the other: the later write was built on a memory from
+    before the earlier one. Both reported success, one session's material
+    was in neither file, and its `raw/` file had been deleted. Now the lock
+    covers all of stage 2, and a run that finds it taken leaves its `raw/`
+    file for whoever holds it.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "a", ["use uv"])
+    _write_session(sessions, "b", ["use ruff"])
+    directory = tmp_path / "mem"
+    kw: dict[str, Any] = {
+        "directory": directory,
+        "sessions_dir": sessions,
+        "jobs_path": tmp_path / "jobs.db",
+        "lock_path": tmp_path / "merge.lock",
+        "limit": 1,
+    }
+
+    async def scenario() -> tuple[Any, Any]:
+        gate = asyncio.Event()
+        slow, fast = (
+            _GatedMerge("Use uv.", "Tooling A", gate),
+            _GatedMerge("Use ruff.", "Tooling B"),
+        )
+        slow.directory = fast.directory = directory  # type: ignore[attr-defined]
+        first = asyncio.create_task(run_pipeline(slow, **kw))
+        await asyncio.sleep(0.2)  # the first run is inside its merge, lock held
+        second = await run_pipeline(fast, **kw)
+        gate.set()
+        return await first, second
+
+    first, second = asyncio.run(scenario())
+    assert first.merged
+    assert second.deferred and not second.merged
+    assert "merge left to" in second.describe()
+    # The second run's extraction is waiting, not lost...
+    assert [p.name for p, _ in pending_raw(directory)] == ["b.md"]
+    # ...and the next run merges it on top of the first run's result.
+    final = _GatedMerge("", "Tooling B")
+    final.directory = directory  # type: ignore[attr-defined]
+    asyncio.run(run_pipeline(final, **kw))
+    assert [e.title for e in load(directory).entries] == ["Tooling A", "Tooling B"]
+
+
+def test_a_provider_error_in_the_merge_is_reported_not_raised(tmp_path: Path) -> None:
+    """`_finish_writer` caught four named exception types, and `ModelFailed`
+    -- the agent loop's -- was one of them. The writer has no loop: a 500
+    during the merge arrives as the client's own `ModelHTTPError`, which was
+    not on the list, and the CLI printed the user's answer followed by a
+    traceback and exit code 1."""
+    from minicodex.__main__ import _finish_writer
+    from minicodex.model import ModelHTTPError
+
+    async def failing() -> Any:
+        raise ModelHTTPError(status=500, url="u", headers={}, body="boom")
+
+    async def scenario(already_finished: bool) -> str:
+        task = asyncio.ensure_future(failing())
+        if already_finished:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        return await _finish_writer(task, grace=1.0)
+
+    # Both orders: failed before the answer was printed, and failed while the
+    # CLI was waiting for it -- the second escaped by a different route.
+    for already_finished in (True, False):
+        line = asyncio.run(scenario(already_finished))
+        assert line.startswith("memory writer: failed, nothing written (ModelHTTPError"), line
+
+
+def test_a_session_left_locked_by_a_dead_process_is_named(tmp_path: Path, capsys: Any) -> None:
+    """A lock beside a rollout means "still open" -- and also "killed before
+    its `finally` ran". Such a session was skipped forever, with nothing
+    anywhere saying so. It is still skipped (whether pid 4127 is alive cannot
+    be asked portably), but `minicodex memory --jobs` names it."""
+    from minicodex.__main__ import main
+
+    sessions = tmp_path / "sessions"
+    path = _write_session(sessions, "killed", ["use uv"])
+    path.with_suffix(".jsonl.lock").write_text("4127", encoding="utf-8")
+
+    assert pending_sessions(sessions) == []
+    assert locked_sessions(sessions) == [(path, "4127")]
+
+    jobs = tmp_path / "jobs.db"
+    assert main(["memory", "--jobs", "--jobs-db", str(jobs), "--session-dir", str(sessions)]) == 0
+    out = capsys.readouterr().out
+    assert "locked, skipped: killed.jsonl (pid 4127)" in out
+    assert "delete killed.jsonl.lock" in out
+
+
+def test_jobs_counts_only_sessions_not_yet_picked_up(tmp_path: Path, capsys: Any) -> None:
+    from minicodex.__main__ import main
+
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "done-one", ["a"])
+    _write_session(sessions, "new-one", ["b"])
+    jobs = tmp_path / "jobs.db"
+    with JobStore(jobs) as store:
+        store.enrol([("done-one", sessions / "done-one.jsonl")])
+        store.finish("done-one")
+
+    main(["memory", "--jobs", "--jobs-db", str(jobs), "--session-dir", str(sessions)])
+    assert "1 session file(s)" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
