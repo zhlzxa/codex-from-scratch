@@ -34,12 +34,11 @@ from minicodex.memory import (
     usage_kinds_touched,
 )
 from minicodex.memory import load as load_memory  # `replay.load` is already here
-from minicodex.memory_jobs import DEFAULT_JOBS_PATH, JobStore, pending_sessions
+from minicodex.memory_jobs import DEFAULT_JOBS_PATH, JobStore, locked_sessions, pending_sessions
 from minicodex.memory_write import (
     NOTE_NAME,
     NOTES_DIR,
     RAW_DIR,
-    MemoryWriteError,
     pending_notes,
     remember_instructions,
     run_pipeline,
@@ -373,7 +372,6 @@ async def _ask(
                 directory=remember,
                 sessions_dir=session_dir,
                 jobs_path=jobs_path,
-                memory=memory,
                 exclude=(current.session_id,),
                 # A question, not a number: nothing has seen a rate-limit
                 # header yet at this line.  See `run_pipeline`.
@@ -494,15 +492,30 @@ async def _finish_writer(task: asyncio.Task[Any], *, grace: float = WRITER_GRACE
         except asyncio.TimeoutError:
             task.cancel()
             return f"memory writer: still going after {grace:.0f}s, left for the next run"
+        except Exception:
+            # The writer failed while it was being waited for. `wait_for`
+            # re-raises the task's own exception, and the first version let
+            # it out of this function from here, before the handler below
+            # was ever reached.
+            pass
     try:
         return (await task).describe()
     except asyncio.CancelledError:
         return "memory writer: stopped, left for the next run"
-    except (MemoryWriteError, MemoryError_, OSError, ModelFailed) as exc:
+    except Exception as exc:
         # Never fatal.  A run that answered the user's question correctly does
         # not become a failed run because a note-taking job could not write a
         # file -- chapter 16's `record_uses` swallows for the same reason, one
         # size up.
+        #
+        # `Exception`, and the first version listed four types instead:
+        # `MemoryWriteError`, `MemoryError_`, `OSError`, `ModelFailed`. The
+        # last of those is what the *agent loop* raises after chapter 12's
+        # retries; the writer has no loop, so a provider error reaches here as
+        # the client's own `ModelHTTPError` or an `httpx` error, which were not
+        # on the list. A 500 during the merge printed the user's answer and
+        # then a traceback, exit code 1 -- the exact thing this comment says
+        # cannot happen. Found when the chapter was rewritten.
         return f"memory writer: failed, nothing written ({type(exc).__name__}: {exc})"
 
 
@@ -1018,19 +1031,33 @@ def _memory_jobs(jobs_path: Path, session_dir: Path) -> int:
     """
     if not Path(jobs_path).exists():
         print(f"no job records at {jobs_path} (nothing has been remembered yet)")
-        return 0
-    with JobStore(jobs_path) as store:
-        rows = store.rows()
-        counts = store.counts()
-        if not rows:
-            print(f"no job records at {jobs_path}")
-            return 0
-        for row in rows[:20]:
-            detail = f"  {row['detail']}" if row["detail"] else ""
-            print(f"  {row['session_id']:<28} {row['state']:<8} attempt {row['attempts']}{detail}")
-        print(f"\n  {', '.join(f'{k}: {v}' for k, v in sorted(counts.items()))}")
-        waiting = len(pending_sessions(session_dir))
-        print(f"  {waiting} session file(s) in {session_dir} are eligible")
+    else:
+        with JobStore(jobs_path) as store:
+            rows = store.rows()
+            counts = store.counts()
+            for row in rows[:20]:
+                detail = f"  {row['detail']}" if row["detail"] else ""
+                print(
+                    f"  {row['session_id']:<28} {row['state']:<8} attempt {row['attempts']}{detail}"
+                )
+            if counts:
+                print(f"\n  {', '.join(f'{k}: {v}' for k, v in sorted(counts.items()))}")
+            # Not yet in the table. The first version printed every finished
+            # session as "eligible", including the ones already `done`.
+            waiting = sum(
+                1
+                for session_id, _ in pending_sessions(session_dir)
+                if store.state_of(session_id) is None
+            )
+            print(f"  {waiting} session file(s) in {session_dir} not picked up yet")
+    # Printed whether or not anything has been remembered: the case it exists
+    # for -- a session killed before it could release its lock -- is as likely
+    # on the first day as on the hundredth.
+    for path, holder in locked_sessions(session_dir):
+        print(
+            f"  locked, skipped: {path.name} (pid {holder}). If that process is gone, "
+            f"delete {path.name}.lock and it will be picked up."
+        )
     return 0
 
 
@@ -1069,7 +1096,10 @@ def _remember_now(
                 # quota rule is about work nobody requested.
             )
         )
-    except (MemoryWriteError, MemoryError_, ModelFailed, OSError) as exc:
+    except Exception as exc:
+        # Every failure is a sentence and an exit code here, for the reason in
+        # `_finish_writer`: the writer calls the client directly, so its
+        # provider errors are not `ModelFailed`.
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     print(f"  {report.describe()}")

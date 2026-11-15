@@ -111,7 +111,10 @@ class JobStore:
     `claim()` -- select the pending rows, then update them -- runs its select
     outside any transaction at all.  Two processes select the same rows, both
     update them, and both do the work.  Measured: 4 duplicate claims out of 6
-    jobs across 3 processes, with no error anywhere.  Autocommit plus an
+    jobs across 3 processes, with no error anywhere -- every run, on the
+    Windows machine this was first written on; 3 runs in 6 on Linux, which is
+    worse rather than better, because a race that shows up half the time is
+    one that passes a check half the time.  Autocommit plus an
     explicit `BEGIN IMMEDIATE` takes the write lock *before* the select, which
     is the only ordering that makes the pair atomic.
     """
@@ -313,6 +316,37 @@ def pending_sessions(
     return out
 
 
+def locked_sessions(directory: Path) -> list[tuple[Path, str]]:
+    """Session files skipped because a lock file sits beside them, and whose pid.
+
+    `pending_sessions` reads a lock as "still open", which is right while the
+    process is alive and wrong forever after it is not: chapter 7's lock is
+    removed in a `finally`, and a process that is killed outright -- the
+    terminal window closed, `kill -9` -- runs no `finally`. Its session is then
+    never turned into memory, and nothing anywhere said so. Found when the
+    chapter was rewritten.
+
+    Listed rather than taken: whether pid 4127 is still a `minicodex` cannot be
+    answered portably (`os.kill(pid, 0)` on Windows *terminates* the process),
+    and chapter 7's answer to the same question was to name the pid and let
+    the person decide. `minicodex memory --jobs` prints these.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+    out: list[tuple[Path, str]] = []
+    for path in sorted(directory.glob("*.jsonl")):
+        lock = path.with_suffix(path.suffix + ".lock")
+        if not lock.exists():
+            continue
+        try:
+            holder = lock.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:  # pragma: no cover
+            holder = ""
+        out.append((path, holder or "?"))
+    return out
+
+
 __all__ = [
     "BACKOFF_BASE_SECONDS",
     "DEFAULT_JOBS_PATH",
@@ -321,5 +355,6 @@ __all__ = [
     "MAX_PER_STARTUP",
     "Job",
     "JobStore",
+    "locked_sessions",
     "pending_sessions",
 ]

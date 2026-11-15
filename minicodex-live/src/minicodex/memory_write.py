@@ -1091,7 +1091,7 @@ def write_memory(
     summary: str,
     body: str,
     now: float | None = None,
-    lock_path: Path = MERGE_LOCK,
+    lock_path: Path | None = MERGE_LOCK,
 ) -> Prune:
     """The one function in this program that writes `MEMORY.md`.
 
@@ -1103,6 +1103,10 @@ def write_memory(
     that parses into no entries at all is refused rather than written, for
     the reason an empty summary is an error: that is not a smaller
     memory, it is a destroyed one.
+
+    `lock_path=None` means the caller already holds the lock, which is what
+    `run_pipeline` does: it has to hold it across the whole of stage 2, not
+    only across this write (see the comment there).
     """
     stamp = now if now is not None else time.time()
     directory = Path(directory)
@@ -1117,7 +1121,7 @@ def write_memory(
     kept = prune(entries, counts, now=stamp)
     summary = trim_summary(summary.strip(), kept.kept)
 
-    fd = _lock(lock_path)
+    fd = _lock(lock_path) if lock_path is not None else None
     try:
         directory.mkdir(parents=True, exist_ok=True)
         (directory / SUMMARY_FILE).write_text(f"{FORMAT_VERSION}\n\n{summary}\n", encoding="utf-8")
@@ -1128,7 +1132,8 @@ def write_memory(
         )
         _record_first_seen(directory, kept, counts, now=stamp)
     finally:
-        _unlock(fd, lock_path)
+        if fd is not None and lock_path is not None:
+            _unlock(fd, lock_path)
     return kept
 
 
@@ -1294,6 +1299,9 @@ class WriteReport:
     secrets_removed: int = 0
     seconds: float = 0.0
     failed: tuple[tuple[str, str], ...] = ()
+    # Set when another process held the merge lock: this run's extraction is
+    # on disk in `raw/` and the other process, or the next run, merges it.
+    deferred: str = ""
 
     def describe(self) -> str:
         if self.skipped:
@@ -1305,6 +1313,8 @@ class WriteReport:
             parts.append(f"{len(self.empty)} had nothing to keep")
         if self.merged and self.pruned is not None:
             parts.append(self.pruned.describe())
+        elif self.deferred:
+            parts.append(f"merge left to {self.deferred}")
         elif not self.merged:
             parts.append("no merge")
         if self.secrets_removed:
@@ -1320,7 +1330,6 @@ async def run_pipeline(
     directory: Path,
     sessions_dir: Path,
     jobs_path: Path,
-    memory: Memory | None = None,
     limit: int = 2,
     exclude: Sequence[str] = (),
     headroom: float | Callable[[], float | None] | None = None,
@@ -1399,46 +1408,67 @@ async def run_pipeline(
                 empty.append(job.session_id)
             store.finish(job.session_id, now=stamp)
 
-    raw = await asyncio.to_thread(pending_raw, directory)
-    notes = await asyncio.to_thread(pending_notes, directory)
-    if not raw and not notes:
+    def report(**extra: Any) -> WriteReport:
         return WriteReport(
             sessions=tuple(read),
             empty=tuple(empty),
             secrets_removed=secrets,
             seconds=time.monotonic() - began,
             failed=tuple(failed),
+            **extra,
         )
 
-    # Every git call below shells out with a 30s timeout; off the loop, all
-    # of it, or one slow `git` freezes every socket and running turn.
-    await asyncio.to_thread(ensure_repo, directory)
-    await asyncio.to_thread(write_gitignore, directory)
-    from minicodex.memory import load as load_memory
+    # Stage 2 runs under the merge lock from the first read to the last
+    # delete, not only around the write. The first version took the lock
+    # inside `write_memory`, so two processes could each read the memory, each
+    # spend a model call merging, and then write one after the other: the
+    # second write was built on a memory from before the first, and silently
+    # replaced it. A run that finds the lock taken leaves its `raw/` file for
+    # whoever holds it, or for the next run. Found when chapter 17 was
+    # rewritten.
+    try:
+        fd = await asyncio.to_thread(_lock, lock_path)
+    except MemoryWriteError:
+        return report(deferred="another minicodex")
+    try:
+        raw = await asyncio.to_thread(pending_raw, directory)
+        notes = await asyncio.to_thread(pending_notes, directory)
+        if not raw and not notes:
+            return report()
 
-    current = memory if memory is not None else await asyncio.to_thread(load_memory, directory)
-    hand_edits_diff = await asyncio.to_thread(hand_edits, directory)
-    merged = await consolidate(
-        model, memory=current, raw=raw, notes=notes, hand_edits=hand_edits_diff
-    )
-    pruned = await asyncio.to_thread(
-        write_memory,
-        directory,
-        summary=merged.summary,
-        body=merged.body,
-        now=stamp,
-        lock_path=lock_path,
-    )
-    message = f"memory: {len(raw)} session(s), {len(notes)} note(s)"
-    await asyncio.to_thread(commit, directory, message)
-    # Consumed only once the write succeeded.  The other order loses the
-    # extraction work on any failure in the merge, and the extraction is the
-    # expensive half.
-    for path, _ in (*raw, *notes):
-        try:
-            path.unlink()
-        except OSError:  # pragma: no cover
-            pass
+        # Every git call below shells out with a 30s timeout; off the loop, all
+        # of it, or one slow `git` freezes every socket and running turn.
+        await asyncio.to_thread(ensure_repo, directory)
+        await asyncio.to_thread(write_gitignore, directory)
+        from minicodex.memory import load as load_memory
+
+        # Read under the lock, never taken from the caller: a memory loaded
+        # when the session started may have been rewritten since.
+        current = await asyncio.to_thread(load_memory, directory)
+        hand_edits_diff = await asyncio.to_thread(hand_edits, directory)
+        merged = await consolidate(
+            model, memory=current, raw=raw, notes=notes, hand_edits=hand_edits_diff
+        )
+        pruned = await asyncio.to_thread(
+            write_memory,
+            directory,
+            summary=merged.summary,
+            body=merged.body,
+            now=stamp,
+            lock_path=None,
+        )
+        message = f"memory: {len(raw)} session(s), {len(notes)} note(s)"
+        await asyncio.to_thread(commit, directory, message)
+        # Consumed only once the write succeeded.  The other order loses the
+        # extraction work on any failure in the merge, and the extraction is the
+        # expensive half.
+        for path, _ in (*raw, *notes):
+            try:
+                path.unlink()
+            except OSError:  # pragma: no cover
+                pass
+    finally:
+        _unlock(fd, lock_path)
     return WriteReport(
         sessions=tuple(read),
         empty=tuple(empty),

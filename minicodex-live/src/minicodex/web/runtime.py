@@ -530,7 +530,6 @@ async def run_turn(
                 sessions_dir=thread_dir,
                 jobs_path=owner.jobs_db(),
                 lock_path=owner.merge_lock(),
-                memory=memory,
                 exclude=(current.session_id,),
                 headroom=lambda: llm.rate_limit.headroom() if llm.rate_limit else None,
             )
