@@ -46,7 +46,7 @@ from minicodex.memory import (
     record_uses,
 )
 from minicodex.memory import load as load_memory
-from minicodex.memory_write import MemoryWriteError, run_pipeline
+from minicodex.memory_write import run_pipeline
 from minicodex.model import ChatCompletionsModel
 from minicodex.plan import TaskPlan, unfinished_note
 from minicodex.recorder import Recorder
@@ -143,6 +143,12 @@ async def _finish_writer(task: asyncio.Task[Any], *, grace: float = WRITER_GRACE
     The original catches the builtin `TimeoutError` around an `asyncio.wait_for`
     -- which on 3.10 is an unrelated class, so the grace period does not end,
     it raises.
+
+    And `Exception` at both points: chapter 17's rewrite found the writer's
+    failures escaping `__main__`'s version by two routes (a provider error is
+    the client's own `ModelHTTPError` or an `httpx` error, and `wait_for`
+    re-raises the task's exception before the second `try`), and fixed
+    `__main__`. This copy kept the four types until chapter 19 was rewritten.
     """
     if not task.done():
         try:
@@ -150,11 +156,13 @@ async def _finish_writer(task: asyncio.Task[Any], *, grace: float = WRITER_GRACE
         except asyncio.TimeoutError:
             task.cancel()
             return f"memory writer: still going after {grace:.0f}s, left for the next run"
+        except Exception:
+            pass  # reported below, from the task itself
     try:
         return (await task).describe()
     except asyncio.CancelledError:
         return "memory writer: stopped, left for the next run"
-    except (MemoryWriteError, MemoryLoadError, OSError, ModelFailed) as exc:
+    except Exception as exc:
         return f"memory writer: failed, nothing written ({type(exc).__name__}: {exc})"
 
 
@@ -290,7 +298,7 @@ async def run_turn(
         mode=settings["sandbox_mode"],
         policy=settings["approval_policy"],
         rules=RuleStore(root / ".minicodex" / "rules.json"),
-        approver=WebApprover(broker, emit, audit=audit, actor=actor),
+        approver=WebApprover(broker, emit, audit=audit, actor=actor, thread=str(thread_dir)),
     )
 
     # The turn itself is the first audit record: everything after it happened

@@ -28,6 +28,18 @@ when the last socket goes.
 `History`'s observer, three frames below `agent.run` -- and the thing it is
 called from cannot await. `put_nowait` on an unbounded queue is the only shape
 that fits there without the core learning what a WebSocket is.
+
+**A pump belongs to its own queue and its own set of sockets**, which arrived
+when chapter 19 was rewritten. The first version looked both up by thread id
+every time. When the last socket left, it queued the stop sentinel and left the
+queue in the table until the pump got round to reading it -- and a socket that
+subscribed in between (a reload, a second tab, a pump still busy sending a
+backlog) found that queue, was told a pump existed, and joined a pump that was
+about to stop. From then on every event for that thread was dropped at `emit`,
+with a subscriber registered and nothing logged: the "page stopped updating"
+failure this module exists to prevent, rebuilt one layer down. Now the last
+socket out detaches the queue and the set at once, so a newcomer always starts
+a fresh pump.
 """
 
 from __future__ import annotations
@@ -84,11 +96,12 @@ class Channel:
         sockets.discard(socket)
         if sockets:
             return
-        # Last one out: drop the set, the queue and the pump together. A
-        # sentinel rather than `task.cancel()`, so anything already queued is
-        # still delivered to whoever is left before the pump stops.
+        # Last one out: detach the set and the queue *now*, so the next
+        # subscriber starts its own pump instead of joining this one on its
+        # way out. A sentinel rather than `task.cancel()`, so the pump finishes
+        # what it was doing before it stops.
         self._sockets.pop(thread_id, None)
-        queue = self._queues.get(thread_id)
+        queue = self._queues.pop(thread_id, None)
         if queue is not None:
             queue.put_nowait(None)
 
@@ -124,11 +137,20 @@ class Channel:
             return
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._queues[thread_id] = queue
-        task = asyncio.get_running_loop().create_task(self._pump(thread_id, queue))
+        sockets = self._sockets.setdefault(thread_id, set())
+        task = asyncio.get_running_loop().create_task(self._pump(thread_id, queue, sockets))
         self._pumps[thread_id] = task  # the strong reference; see the docstring
-        task.add_done_callback(lambda _t, tid=thread_id: self._pumps.pop(tid, None))
+        task.add_done_callback(lambda done, tid=thread_id: self._forget_pump(tid, done))
 
-    async def _pump(self, thread_id: str, queue: asyncio.Queue[str | None]) -> None:
+    def _forget_pump(self, thread_id: str, task: asyncio.Task[None]) -> None:
+        # Only if it is still the current one: a newer pump may already have
+        # taken this thread's slot.
+        if self._pumps.get(thread_id) is task:
+            del self._pumps[thread_id]
+
+    async def _pump(
+        self, thread_id: str, queue: asyncio.Queue[str | None], sockets: set[Socket]
+    ) -> None:
         try:
             while True:
                 payload = await queue.get()
@@ -139,11 +161,11 @@ class Channel:
                 # not have enough sockets for the difference to be measurable,
                 # and out-of-order transcripts are not a thing a person can
                 # debug from the browser.
-                for socket in list(self._sockets.get(thread_id, ())):
+                for socket in list(sockets):
                     try:
                         await socket.send_text(payload)
                     except Exception:
-                        self._sockets.get(thread_id, set()).discard(socket)
+                        sockets.discard(socket)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -153,7 +175,8 @@ class Channel:
             # indistinguishable from "the model is thinking".
             log.exception("event pump for thread %s stopped", thread_id)
         finally:
-            self._queues.pop(thread_id, None)
+            if self._queues.get(thread_id) is queue:
+                del self._queues[thread_id]
 
     async def aclose(self) -> None:
         """Stop every pump. Called from the app's shutdown hook."""

@@ -60,7 +60,7 @@ from minicodex.memory import (
 )
 from minicodex.memory import load as load_memory
 from minicodex.memory_jobs import DEFAULT_JOBS_PATH
-from minicodex.memory_write import NOTE_NAME, MemoryWriteError, remember_instructions, run_pipeline
+from minicodex.memory_write import NOTE_NAME, remember_instructions, run_pipeline
 from minicodex.model import ChatCompletionsModel
 from minicodex.plan import PLAN_INSTRUCTIONS, TaskPlan, unfinished_note
 from minicodex.recorder import Recorder
@@ -184,6 +184,16 @@ async def _finish_writer(task: asyncio.Task[Any], *, grace: float = WRITER_GRACE
     The original catches the builtin `TimeoutError` around an `asyncio.wait_for`
     -- which on 3.10 is an unrelated class, so the grace period does not end,
     it raises. Same fault as F15-02, one module over, still there.
+
+    And `Exception` at both points, which is chapter 17's rewrite arriving one
+    copy late. That rewrite found the writer's failures escaping `__main__`'s
+    version by two routes -- a provider error is the client's own
+    `ModelHTTPError` or an `httpx` error, not one of the four types listed, and
+    `wait_for` re-raises the task's exception before the second `try` is ever
+    reached -- and fixed `__main__`. This copy still had the four types, so in
+    the console a failed note-taking job turned an answered turn into an
+    `error` line and lost every report after it. Found when chapter 19 was
+    rewritten.
     """
     if not task.done():
         try:
@@ -191,11 +201,13 @@ async def _finish_writer(task: asyncio.Task[Any], *, grace: float = WRITER_GRACE
         except asyncio.TimeoutError:
             task.cancel()
             return f"memory writer: still going after {grace:.0f}s, left for the next run"
+        except Exception:
+            pass  # reported below, from the task itself
     try:
         return (await task).describe()
     except asyncio.CancelledError:
         return "memory writer: stopped, left for the next run"
-    except (MemoryWriteError, MemoryError_, OSError, ModelFailed) as exc:
+    except Exception as exc:
         return f"memory writer: failed, nothing written ({type(exc).__name__}: {exc})"
 
 
@@ -283,7 +295,7 @@ async def run_turn(
         mode=settings["sandbox_mode"],
         policy=settings["approval_policy"],
         rules=RuleStore(root / ".minicodex" / "rules.json"),
-        approver=WebApprover(broker, emit),
+        approver=WebApprover(broker, emit, thread=str(thread_dir)),
     )
 
     def make_model(tools: list[dict[str, Any]]) -> ChatCompletionsModel:

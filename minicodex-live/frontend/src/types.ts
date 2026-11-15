@@ -119,25 +119,31 @@ export interface Skill {
   catalog_line: string;
 }
 
+/** One pending approval, as the socket sends it and as `GET /api/threads/{id}` repeats it. */
+export interface ApprovalRequestEvent {
+  type: "approval_request";
+  id: string;
+  what: string;
+  reason: string;
+  risk: string;
+  suggested_rule: string[] | null;
+}
+
 /** Every event the backend can put on the socket. Exhaustive on purpose. */
 export type ServerEvent =
   | { type: "turn_started"; text: string }
   | { type: "turn_finished" }
-  | { type: "history_item"; item: HistoryItem }
-  | { type: "mark"; mark: string; payload: Record<string, unknown> }
+  // `index` is the item's place in the history the thread loads back as, and
+  // `position` is how long that history is once a mark is written; see
+  // useThread for what they are for.
+  | { type: "history_item"; index: number; item: HistoryItem }
+  | { type: "mark"; mark: string; payload: Record<string, unknown>; position: number }
   | { type: "notice"; text: string }
   | { type: "error"; text: string }
   | { type: "mcp_status"; name: string; status: string; detail?: string; tools?: number }
   | { type: "plan_updated"; steps: PlanStep[]; revisions: number }
   | { type: "session_mode_changed"; from: SandboxMode; mode: SandboxMode; policy: ApprovalPolicy }
-  | {
-      type: "approval_request";
-      id: string;
-      what: string;
-      reason: string;
-      risk: string;
-      suggested_rule: string[] | null;
-    }
+  | ApprovalRequestEvent
   | { type: "approval_resolved"; id: string; approved: boolean; remember: string | null }
   | { type: "approval_timeout"; id: string }
   | {

@@ -1,10 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { HistoryItem, PlanStep, SandboxMode, ServerEvent } from "./types";
+import type {
+  ApprovalRequestEvent,
+  HistoryItem,
+  PlanStep,
+  SandboxMode,
+  ServerEvent,
+} from "./types";
 
 /** One renderable thing in the transcript, in arrival order. */
 export type Entry =
-  | { kind: "item"; key: string; item: HistoryItem }
+  // `pending`: typed here and not yet written down by the server -- the echo
+  // that `send` shows before the request has even gone out.
+  | { kind: "item"; key: string; item: HistoryItem; pending?: boolean }
   | { kind: "note"; key: string; text: string; tone: "plain" | "danger" }
   | { kind: "mark"; key: string; mark: string; payload: Record<string, unknown> }
   | {
@@ -68,6 +76,23 @@ export interface ThreadView {
  * rollout file the events were derived from. The socket is an optimisation over
  * polling that file; it is not the only copy of the truth, and that is what
  * makes losing it survivable.
+ *
+ * Three things here arrived when chapter 19 was rewritten, all found by
+ * driving the built console in a real browser rather than by reading it:
+ *
+ * - **Every item the server streams carries its `index`** in the history the
+ *   thread loads back as, and `knownRef` is how many of those the screen
+ *   already shows. A turn begins by replaying the whole conversation into its
+ *   new rollout file, and the first version drew every replayed item again:
+ *   after the second message the page showed the first exchange twice.
+ * - **Subscribe, then fetch, and hold events until the fetch lands.** The
+ *   first version fetched first and subscribed after, the very gap the comment
+ *   on `onopen` warns about, on the path every page load takes: a
+ *   `turn_finished` sent in between left the composer disabled for good.
+ *   Events that arrive while a snapshot is in flight are buffered and applied
+ *   on top of it; the index says which of them it already contains.
+ * - **The snapshot includes pending approvals.** Without them a reload made
+ *   the card vanish while the turn waited on it for ten minutes.
  */
 export function useThread(threadId: string | null): ThreadView {
   const [entries, setEntries] = useState<Entry[]>([]);
@@ -82,7 +107,10 @@ export function useThread(threadId: string | null): ThreadView {
   const socketRef = useRef<WebSocket | null>(null);
   const retriesRef = useRef(0);
   const timerRef = useRef<number | null>(null);
-  const liveRef = useRef(true);
+  /** How many history positions the screen already reflects. */
+  const knownRef = useRef(0);
+  /** Events that arrived while a snapshot was being fetched. */
+  const bufferRef = useRef<ServerEvent[] | null>(null);
 
   const push = useCallback((entry: Unkeyed<Entry>) => {
     setEntries((current) => [...current, { ...entry, key: nextKey() } as Entry]);
@@ -91,6 +119,7 @@ export function useThread(threadId: string | null): ThreadView {
   const resync = useCallback(async (id: string) => {
     const record = await api.thread(id);
     const items = record.items as HistoryItem[];
+    knownRef.current = items.length;
     const answers: Record<string, string> = {};
     const calls = new Set<string>();
     for (const item of items) {
@@ -105,6 +134,7 @@ export function useThread(threadId: string | null): ThreadView {
     const fresh: Entry[] = items
       .filter((item) => item.type !== "tool_result" || !calls.has(item.call_id))
       .map((item) => ({ kind: "item", key: nextKey(), item }));
+    for (const asked of record.approvals ?? []) fresh.push(approvalEntry(asked));
     setEntries(fresh);
     setResults(answers);
     setBusy(record.busy);
@@ -122,6 +152,10 @@ export function useThread(threadId: string | null): ThreadView {
           setBusy(false);
           break;
         case "history_item": {
+          // Already on screen: a replay of the conversation into this turn's
+          // file, or a compaction's new baseline, or part of a snapshot.
+          if (event.index < knownRef.current) return;
+          knownRef.current = event.index + 1;
           const item = event.item;
           if (item.type === "tool_result") {
             // Folded into the call it answers rather than appended as its own
@@ -131,21 +165,29 @@ export function useThread(threadId: string | null): ThreadView {
           }
           // The optimistic echo is replaced by the real thing rather than
           // duplicated: the server's copy is the one that got written down.
+          // Found by text among the pending entries, not by "is it the last
+          // entry": the first version checked the last one, and a turn's first
+          // item is often a note, so the question was drawn twice.
           setEntries((current) => {
-            const last = current[current.length - 1];
-            if (
-              item.type === "user" &&
-              last?.kind === "item" &&
-              last.item.type === "user" &&
-              last.item.text === item.text
-            ) {
-              return current;
-            }
-            return [...current, { kind: "item", key: nextKey(), item }];
+            const echo =
+              item.type === "user"
+                ? current.findIndex(
+                    (entry) =>
+                      entry.kind === "item" &&
+                      entry.pending === true &&
+                      entry.item.type === "user" &&
+                      entry.item.text === item.text,
+                  )
+                : -1;
+            const rest = echo >= 0 ? current.filter((_, i) => i !== echo) : current;
+            return [...rest, { kind: "item", key: nextKey(), item }];
           });
           break;
         }
         case "mark":
+          // After a compaction the history is the new baseline, and the next
+          // new item is numbered from there.
+          if (event.mark === "compacted") knownRef.current = event.position;
           push({ kind: "mark", mark: event.mark, payload: event.payload });
           break;
         case "notice":
@@ -177,15 +219,12 @@ export function useThread(threadId: string | null): ThreadView {
           });
           break;
         case "approval_request":
-          push({
-            kind: "approval",
-            id: event.id,
-            what: event.what,
-            reason: event.reason,
-            risk: event.risk,
-            suggested_rule: event.suggested_rule,
-            status: null,
-          });
+          // Possibly already drawn from a snapshot taken while it was pending.
+          setEntries((current) =>
+            current.some((entry) => entry.kind === "approval" && entry.id === event.id)
+              ? current
+              : [...current, approvalEntry(event)],
+          );
           break;
         case "approval_resolved":
         case "approval_timeout":
@@ -216,7 +255,6 @@ export function useThread(threadId: string | null): ThreadView {
   );
 
   useEffect(() => {
-    liveRef.current = true;
     if (!threadId) {
       setEntries([]);
       setResults({});
@@ -239,20 +277,30 @@ export function useThread(threadId: string | null): ThreadView {
       socket.onopen = () => {
         if (cancelled) return;
         setConnection("open");
+        retriesRef.current = 0;
         // Resync *after* the socket is listening, not before: doing it the
         // other way round leaves a gap where an event fires between the fetch
-        // and the subscription and is lost with nothing to notice it.
-        const wasRetry = retriesRef.current > 0;
-        retriesRef.current = 0;
-        if (wasRetry) void resync(threadId).catch(() => undefined);
+        // and the subscription and is lost with nothing to notice it. Every
+        // open, the first one included, and whatever arrives meanwhile waits.
+        bufferRef.current = [];
+        void resync(threadId)
+          .catch((exc: Error) => setError(exc.message))
+          .finally(() => {
+            const waiting = bufferRef.current ?? [];
+            bufferRef.current = null;
+            if (!cancelled) waiting.forEach(apply);
+          });
       };
       socket.onmessage = (evt) => {
         if (cancelled) return;
+        let event: ServerEvent;
         try {
-          apply(JSON.parse(evt.data) as ServerEvent);
+          event = JSON.parse(evt.data) as ServerEvent;
         } catch {
-          /* a frame we cannot parse is not worth taking the page down for */
+          return; // a frame we cannot parse is not worth taking the page down for
         }
+        if (bufferRef.current !== null) bufferRef.current.push(event);
+        else apply(event);
       };
       socket.onclose = () => {
         if (cancelled) return;
@@ -270,12 +318,9 @@ export function useThread(threadId: string | null): ThreadView {
     setReports([]);
     setError(null);
     retriesRef.current = 0;
-    void resync(threadId)
-      .then(() => open())
-      .catch((exc: Error) => {
-        setError(exc.message);
-        open();
-      });
+    knownRef.current = 0;
+    bufferRef.current = null;
+    open();
 
     return () => {
       cancelled = true;
@@ -295,7 +340,7 @@ export function useThread(threadId: string | null): ThreadView {
       setError(null);
       // Shown before the request, so a dead socket or a 409 cannot make the
       // typed message disappear with nothing on screen to say it existed.
-      push({ kind: "item", item: { type: "user", text } });
+      push({ kind: "item", item: { type: "user", text }, pending: true });
       setBusy(true);
       try {
         await api.send(threadId, text);
@@ -353,5 +398,18 @@ export function useThread(threadId: string | null): ThreadView {
     stop,
     respond,
     error,
+  };
+}
+
+function approvalEntry(event: ApprovalRequestEvent): Entry {
+  return {
+    kind: "approval",
+    key: nextKey(),
+    id: event.id,
+    what: event.what,
+    reason: event.reason,
+    risk: event.risk,
+    suggested_rule: event.suggested_rule,
+    status: null,
   };
 }

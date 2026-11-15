@@ -558,6 +558,9 @@ def get_thread(request: Request, thread_id: str) -> dict[str, Any]:
         "marks": marks,
         "busy": turn_key(auth.account.key, thread_id) in console.busy,
         "turns": len(list_sessions(directory)),
+        # Asked while nobody was watching, or before a reload: the event is
+        # gone, the turn is still waiting. See approver.py.
+        "approvals": console.broker_for(auth.account.key).asked(str(directory)),
     }
 
 

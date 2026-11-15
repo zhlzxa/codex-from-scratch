@@ -51,7 +51,7 @@ MUTATIONS = [
         "a socket that raises takes the whole pump down with it",
         "                    try:\n                        await socket.send_text(payload)\n"
         "                    except Exception:\n"
-        "                        self._sockets.get(thread_id, set()).discard(socket)",
+        "                        sockets.discard(socket)",
         "                    await socket.send_text(payload)",
     ),
     # ---- approvals -----------------------------------------------------------
@@ -174,7 +174,8 @@ MUTATIONS = [
     (
         "src/minicodex/web/events.py",
         "marks are written to disk but never reach the browser",
-        '        self._emit({"type": "mark", "mark": kind, "payload": payload})',
+        '        self._emit({"type": "mark", "mark": kind, "payload": payload, '
+        '"position": self._position})',
         "        pass",
     ),
     (
@@ -231,6 +232,74 @@ MUTATIONS = [
         "every module becomes an entry point, so the forbidden edge means nothing",
         'TOP_LEVEL_ENTRY_POINTS = {"__main__"}',
         "TOP_LEVEL_ENTRY_POINTS = set()",
+    ),
+    # ---- added when the chapter was rewritten, one per fix -------------------
+    (
+        "src/minicodex/web/events.py",
+        "every streamed item gets the same index, so the browser cannot skip a replay",
+        "        index, self._position = self._position, self._position + 1",
+        "        index = self._position",
+    ),
+    (
+        "src/minicodex/web/events.py",
+        "a compaction's baseline is numbered after the history it replaced",
+        '        if kind == "compacting":\n            self._position = 0',
+        "        if False:\n            self._position = 0",
+    ),
+    (
+        "src/minicodex/web/approver.py",
+        "a pending request is not remembered, so a reload cannot show it",
+        "            self._asked[approval_id] = (thread, event)",
+        "            pass",
+    ),
+    (
+        "src/minicodex/web/approver.py",
+        "one thread is shown another thread's pending approvals",
+        "            if who == thread",
+        "            if True",
+    ),
+    (
+        "src/minicodex/web/routes.py",
+        "the thread snapshot leaves out what the turn is waiting on",
+        '        "approvals": console.broker.asked(str(directory)),',
+        '        "approvals": [],',
+    ),
+    (
+        "src/minicodex/web/runtime.py",
+        "a turn's approver does not know which thread is asking",
+        "        approver=WebApprover(broker, emit, thread=str(thread_dir)),",
+        "        approver=WebApprover(broker, emit),",
+    ),
+    (
+        "src/minicodex/web/channel.py",
+        "the last socket out leaves its queue for the next socket to join",
+        "        queue = self._queues.pop(thread_id, None)",
+        "        queue = self._queues.get(thread_id)",
+    ),
+    (
+        "src/minicodex/web/store.py",
+        'a switch spelled "false" is switched on',
+        "        if not isinstance(merged[flag], bool):\n"
+        '            raise ValueError(f"{flag} must be true or false, not {merged[flag]!r}")',
+        "        merged[flag] = bool(merged[flag])",
+    ),
+    (
+        "src/minicodex/web/runtime.py",
+        "the console's writer report catches four types again, not chapter 17's Exception",
+        '    except Exception as exc:\n        return f"memory writer: failed',
+        '    except (OSError, ModelFailed) as exc:\n        return f"memory writer: failed',
+    ),
+    (
+        "src/minicodex/web/runtime.py",
+        "a writer that fails during the grace wait escapes before it is reported",
+        "        except Exception:\n            pass  # reported below, from the task itself\n",
+        "",
+    ),
+    (
+        "frontend/src/useThread.ts",
+        "the browser draws replayed items a second time",
+        "          if (event.index < knownRef.current) return;\n",
+        "",
     ),
 ]
 

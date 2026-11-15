@@ -18,6 +18,15 @@ lose; it loses under load, once, and the turn hangs until the timeout. Two
 defences, because one of them is a convention and conventions travel badly:
 the route is `async def` (see `routes.py`), and `resolve` goes through
 `loop.call_soon_threadsafe` regardless of who calls it.
+
+The broker also keeps *what* it is waiting on, per thread, and that arrived
+when chapter 19 was rewritten. The request reaches the browser as one event;
+an event sent while no tab was watching that thread is dropped (channel.py),
+and a tab that reconnects rebuilds itself from `GET /api/threads/{id}`. The
+first version's reply to that request had no approvals in it, so a reload, a
+dropped socket or switching to another thread and back made the card vanish
+while the turn stayed suspended on it -- for `APPROVAL_TIMEOUT_SECONDS`, after
+which it counted as a refusal nobody had made.
 """
 
 from __future__ import annotations
@@ -44,9 +53,13 @@ class ApprovalBroker:
 
     def __init__(self) -> None:
         self._pending: dict[str, asyncio.Future[ApprovalReply]] = {}
+        #: The `approval_request` event for each pending id, and which thread asked.
+        self._asked: dict[str, tuple[str | None, dict[str, Any]]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
 
-    def register(self, approval_id: str) -> asyncio.Future[ApprovalReply]:
+    def register(
+        self, approval_id: str, *, thread: str | None = None, event: dict[str, Any] | None = None
+    ) -> asyncio.Future[ApprovalReply]:
         # `get_running_loop`, not `get_event_loop`: the latter is deprecated
         # from 3.10 and, when there is no running loop, creates one -- so the
         # future would belong to a loop nothing ever runs.
@@ -54,15 +67,29 @@ class ApprovalBroker:
         self._loop = loop
         future: asyncio.Future[ApprovalReply] = loop.create_future()
         self._pending[approval_id] = future
+        if event is not None:
+            self._asked[approval_id] = (thread, event)
         return future
 
     def pending(self) -> list[str]:
         return [key for key, fut in self._pending.items() if not fut.done()]
 
+    def asked(self, thread: str) -> list[dict[str, Any]]:
+        """The requests `thread` is still waiting on an answer for."""
+        return [
+            event
+            for approval_id, (who, event) in self._asked.items()
+            if who == thread
+            and approval_id in self._pending
+            and not self._pending[approval_id].done()
+        ]
+
     def discard(self, approval_id: str) -> None:
         self._pending.pop(approval_id, None)
+        self._asked.pop(approval_id, None)
 
     def resolve(self, approval_id: str, reply: ApprovalReply) -> bool:
+        self._asked.pop(approval_id, None)
         future = self._pending.pop(approval_id, None)
         if future is None or future.done():
             return False
@@ -81,6 +108,7 @@ class ApprovalBroker:
         cancellation lands there anyway -- this is for the entries whose
         coroutine is already gone, so the table does not grow.
         """
+        self._asked.clear()
         for approval_id in list(self._pending):
             future = self._pending.pop(approval_id, None)
             if future is not None and not future.done():
@@ -97,25 +125,27 @@ def _running_loop() -> asyncio.AbstractEventLoop | None:
 class WebApprover:
     """Suspend the tool call, ask the browser, resume with what it said."""
 
-    def __init__(self, broker: ApprovalBroker, emit: EventSink) -> None:
+    def __init__(self, broker: ApprovalBroker, emit: EventSink, thread: str | None = None) -> None:
         self._broker = broker
         self._emit = emit
+        #: Which thread is asking, so a reconnecting tab can be told (see the
+        #: module docstring). `None` for a broker nobody will ever query.
+        self._thread = thread
 
     async def ask(self, request: ApprovalRequest) -> ApprovalReply:
         approval_id = uuid.uuid4().hex[:12]
-        future = self._broker.register(approval_id)
-        self._emit(
-            {
-                "type": "approval_request",
-                "id": approval_id,
-                "what": request.what,
-                "reason": request.reason,
-                "risk": request.risk.name,
-                "suggested_rule": (
-                    list(request.suggested_rule) if request.suggested_rule is not None else None
-                ),
-            }
-        )
+        event = {
+            "type": "approval_request",
+            "id": approval_id,
+            "what": request.what,
+            "reason": request.reason,
+            "risk": request.risk.name,
+            "suggested_rule": (
+                list(request.suggested_rule) if request.suggested_rule is not None else None
+            ),
+        }
+        future = self._broker.register(approval_id, thread=self._thread, event=event)
+        self._emit(event)
         try:
             reply = await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
