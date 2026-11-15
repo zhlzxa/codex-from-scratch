@@ -314,12 +314,18 @@ async def _ask(
         root=root,
         shown=resume_from.developer_notes() if resume_from is not None else (),
     )
-    skills_watcher = SkillsWatcher(skills) if skills is not None else None
+    # Always built, for the reason `memory_watcher` is: a resumed session may
+    # hold a catalog an earlier process delivered.
+    skills_watcher = SkillsWatcher(
+        skills, shown=resume_from.developer_notes() if resume_from is not None else ()
+    )
 
     def _on_turn_start() -> str | None:
-        notes = [agents_watcher.refresh(Path(context.shell.cwd)), memory_watcher.refresh()]
-        if skills_watcher is not None:
-            notes.append(skills_watcher.refresh())
+        notes = [
+            agents_watcher.refresh(Path(context.shell.cwd)),
+            memory_watcher.refresh(),
+            skills_watcher.refresh(),
+        ]
         said = [note for note in notes if note is not None]
         return "\n\n".join(said) if said else None
 
@@ -580,8 +586,8 @@ def main(argv: list[str] | None = None) -> int:
     # Counterpart to `--dedicated-tools`, and the one flag in this program
     # with no codex equivalent: codex's `skills.read` serves a kind of skill
     # this program cannot have, and its `file` skills are opened by path with
-    # no tool in the way.  Kept because it measured better than that
-    # default.
+    # no tool in the way.  It ties with that default (17/20 against 18/20)
+    # and is kept as a demonstration of the shape.
     ask.add_argument(
         "--skill-tool",
         action="store_true",

@@ -29,8 +29,8 @@ MUTATIONS = [
     (
         "skills.py",
         "two skills may claim the same name; both stay in the catalog",
-        "        if skill is None or skill.name in seen:",
-        "        if skill is None:",
+        "        if skill.name in seen:",
+        "        if False:",
     ),
     (
         "skills.py",
@@ -48,33 +48,34 @@ MUTATIONS = [
         "skills.py",
         "an unreadable SKILL.md takes the run down with it",
         '    try:\n        text = skill_md.read_text(encoding="utf-8", errors="replace")\n'
-        "    except OSError:\n        return None",
+        "    except OSError as exc:\n"
+        '        return f"unreadable: {type(exc).__name__}"',
         '    text = skill_md.read_text(encoding="utf-8", errors="replace")',
     ),
     # ---- parsing -------------------------------------------------------------
     (
         "skills.py",
         "a skill with no description is admitted to the catalog",
-        "    if not name or not description:",
-        "    if not name:",
+        "    if not description:\n        return",
+        "    if False:\n        return",
     ),
     (
         "skills.py",
         "a skill with no name is admitted to the catalog",
-        "    if not name or not description:",
-        "    if not description:",
+        "    if not name:\n        return",
+        "    if False:\n        return",
     ),
     (
         "skills.py",
         "a file with no frontmatter at all is parsed as a skill",
-        "    if parsed is None:\n        return None",
+        '    if parsed is None:\n        return "no --- frontmatter --- block at the top"',
         "    if parsed is None:\n        parsed = ({}, text)",
     ),
     (
         "skills.py",
         "a quoted description keeps its quotes",
-        '        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\\"\'":',
-        "        if False:",
+        '        elif len(value) >= 2 and value[0] == value[-1] and value[0] in "\\"\'":',
+        "        elif False:",
     ),
     (
         "skills.py",
@@ -190,8 +191,8 @@ MUTATIONS = [
     (
         "skills.py",
         "the watcher never delivers the catalog at all",
-        "        self._delivered = True\n        return catalog_block",
-        "        self._delivered = True\n        return None  # catalog_block",
+        "        block = catalog_block(self._skills, budget=self._budget)",
+        "        block = None",
     ),
     # ---- wiring --------------------------------------------------------------
     (
@@ -215,9 +216,8 @@ MUTATIONS = [
     (
         "__main__.py",
         "the catalog is assembled but never reaches the model",
-        "        if skills_watcher is not None:\n"
-        "            notes.append(skills_watcher.refresh())",
-        "        if False:\n            notes.append(skills_watcher.refresh())",
+        "            skills_watcher.refresh(),\n",
+        "",
     ),
     (
         "__main__.py",
@@ -231,16 +231,54 @@ MUTATIONS = [
         '        skill_tool = tools is not None and "read_skill" in tools.handlers',
         "        skill_tool = True",
     ),
+    # -- added when the chapter was rewritten, one per fix ------------------
+    (
+        "skills.py",
+        "a folded `description: >` is catalogued as the symbol itself",
+        "        if value in _BLOCK_SCALARS:",
+        "        if False:",
+    ),
+    (
+        "skills.py",
+        "an indented `name:` under `metadata:` replaces the skill's name",
+        "        field_match = _FIELD.match(line.rstrip())",
+        "        field_match = _FIELD.match(line.strip())",
+    ),
+    (
+        "skills.py",
+        "a skipped skill is named without the reason",
+        '            skipped.append(f"{where} ({skill})")',
+        "            skipped.append(where)",
+    ),
+    (
+        "skills.py",
+        "a resumed session is shown the same catalog again",
+        "        if block in self._earlier:\n            return None\n",
+        "",
+    ),
+    (
+        "skills.py",
+        "--resume without --skills leaves the old catalog standing",
+        "            return SKILLS_WITHDRAWN if self._earlier is not None and not withdrawn"
+        " else None",
+        "            return None",
+    ),
+    (
+        "__main__.py",
+        "the CLI does not tell the skills watcher what a resumed session holds",
+        "        skills, shown=resume_from.developer_notes() if resume_from is not None else ()",
+        "        skills",
+    ),
 ]
 
-# One survivor that stayed a survivor. It is an *equivalent mutant*: letting a
-# file with no frontmatter through `_parse_frontmatter` hands `_load_one` an
-# empty field dict, and the very next check ("no name, or no description") drops
-# it anyway. Both versions of the code skip the file. There is no test that can
-# tell them apart, because there is no behaviour that differs -- so it is listed
-# here as expected rather than deleted, which would hide the fact that the
-# frontmatter check and the required-fields check overlap.
-EQUIVALENT = {"a file with no frontmatter at all is parsed as a skill"}
+# The first version listed one *equivalent mutant* here: letting a file with
+# no frontmatter through `_parse_frontmatter` handed `_load_one` an empty field
+# dict, the next check dropped it anyway, and no test could tell the two apart.
+# It stopped being equivalent when the chapter was rewritten and every skipped
+# skill started saying why: the mutant now says "no name" where the code says
+# "no frontmatter block", and `test_a_skipped_skill_says_why` sees the
+# difference. The overlap the comment used to point at is now a behaviour.
+EQUIVALENT: set[str] = set()
 
 SRC = Path("src/minicodex")
 ORIGINALS = {name: (SRC / name).read_text(encoding="utf-8") for name, *_ in MUTATIONS}

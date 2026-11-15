@@ -3,7 +3,7 @@ read on demand.
 
 Offline, all of it.  Discovery and rendering are pure functions over the
 filesystem, and `read_skill` is exercised the same way `memory_read` is in
-chapter 17's suite -- by calling the tool handler directly, no model in the
+chapter 16's suite -- by calling the tool handler directly, no model in the
 loop.  The one question that genuinely needs a model -- does it reach a
 skill's body more reliably when told to open a path than when handed a tool
 -- is answered by `probe_skills.py reach`, against the real API, not
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -30,6 +31,8 @@ from minicodex.skills import (
     DEFAULT_SKILLS_DIR,
     READ_BUDGET,
     SKILL_CLOSE_FENCE,
+    SKILLS_REPLACED,
+    SKILLS_WITHDRAWN,
     Skill,
     Skills,
     SkillsWatcher,
@@ -311,7 +314,7 @@ async def test_F18_06_a_skill_body_cannot_close_its_own_fence_early(tmp_path: Pa
     result = await _call(tools, "read_skill", {"name": "sneaky"})
     # Exactly one real closing fence, at the very end -- the one embedded in
     # the body was neutralised, the same defence `memory._fence` has had
-    # against `</memory>` since chapter 17.
+    # against `</memory>` since chapter 16.
     assert result.count(SKILL_CLOSE_FENCE) == 1
     assert result.rstrip().endswith(SKILL_CLOSE_FENCE)
 
@@ -440,7 +443,7 @@ def test_F18_10_an_unreadable_skill_md_is_skipped_rather_than_raised(tmp_path: P
     """
     from minicodex.skills import _load_one
 
-    assert _load_one(tmp_path) is None
+    assert str(_load_one(tmp_path)).startswith("unreadable: ")
 
 
 def test_F18_11_missing_name_is_skipped_too(tmp_path: Path) -> None:
@@ -867,3 +870,101 @@ def test_F18_15_the_catalog_arrives_as_a_developer_note_not_a_system_one(
     # And the static half went the other way, into the cached system prefix.
     system = json.dumps([m for m in messages if m["role"] == "system"])
     assert skills_instructions()[:60] in system
+
+
+# ---------------------------------------------------------------------------
+# Found when the chapter was rewritten
+# ---------------------------------------------------------------------------
+
+
+def _raw_skill(root: Path, dirname: str, text: str) -> None:
+    (root / dirname).mkdir(parents=True)
+    (root / dirname / "SKILL.md").write_text(text, encoding="utf-8")
+
+
+def test_a_folded_description_is_read_not_catalogued_as_a_symbol(tmp_path: Path) -> None:
+    """`description: >` is ordinary YAML for a long description. The first
+    parser catalogued that skill's description as the single character `>`."""
+    _raw_skill(
+        tmp_path,
+        "deploy",
+        "---\nname: deploy\ndescription: >\n  Deploy the service to staging,\n"
+        "  then smoke-test it.\n---\nbody\n",
+    )
+    _raw_skill(
+        tmp_path, "release", "---\nname: release\ndescription: |\n  Cut a release.\n---\nb\n"
+    )
+    skills = discover(tmp_path)
+    descriptions = {skill.name: skill.description for skill in skills.skills}
+    assert descriptions == {
+        "deploy": "Deploy the service to staging, then smoke-test it.",
+        "release": "Cut a release.",
+    }
+
+
+def test_a_nested_name_does_not_replace_the_skills_name(tmp_path: Path) -> None:
+    """Every line used to be stripped before it was matched, so an indented
+    `name:` under `metadata:` replaced the top-level one -- `run-tests` was
+    catalogued as `internal-id-7`."""
+    _raw_skill(
+        tmp_path,
+        "run-tests",
+        "---\nname: run-tests\ndescription: Run the suite.\nmetadata:\n  name: internal-id-7\n"
+        "---\nbody\n",
+    )
+    (skill,) = discover(tmp_path).skills
+    assert skill.name == "run-tests"
+
+
+def test_a_skipped_skill_says_why(tmp_path: Path) -> None:
+    """`[skills: skipped lint/SKILL.md]` named the file and not the problem."""
+    _raw_skill(tmp_path, "a-first", "---\nname: lint\ndescription: d\n---\nb\n")
+    _raw_skill(tmp_path, "b-second", "---\nname: lint\ndescription: d\n---\nb\n")
+    _raw_skill(tmp_path, "c-nodesc", "---\nname: c\n---\nb\n")
+    _raw_skill(tmp_path, "d-nofront", "just text\n")
+    assert discover(tmp_path).skipped == (
+        "b-second/SKILL.md (name 'lint' is already taken)",
+        "c-nodesc/SKILL.md (frontmatter has no description)",
+        "d-nofront/SKILL.md (no --- frontmatter --- block at the top)",
+    )
+
+
+def _catalog_of(skills: Skills) -> str:
+    block = SkillsWatcher(skills).refresh()
+    assert block is not None
+    return block
+
+
+def test_a_resumed_session_is_not_shown_the_same_catalog_again(tmp_path: Path) -> None:
+    """Three `--resume last` runs left three catalogs in every later request;
+    chapter 16's rewrite fixed `MemoryWatcher` and not this one."""
+    _write_skill(tmp_path, "lint", name="lint", description="Run the linter.", body="b")
+    skills = discover(tmp_path)
+    earlier = _catalog_of(skills)
+    assert SkillsWatcher(skills, shown=(earlier,)).refresh() is None
+
+    _write_skill(tmp_path, "fmt", name="fmt", description="Format.", body="b")
+    changed = SkillsWatcher(discover(tmp_path), shown=(earlier,)).refresh()
+    assert changed is not None and changed.startswith(SKILLS_REPLACED)
+
+    assert SkillsWatcher(None, shown=(earlier,)).refresh() == SKILLS_WITHDRAWN
+    assert SkillsWatcher(None, shown=(earlier, SKILLS_WITHDRAWN)).refresh() is None
+
+
+def test_the_cli_resumes_without_repeating_the_catalog(
+    tmp_path: Path, stub_url: str, served_requests: list[dict], monkeypatch: Any
+) -> None:
+    from minicodex.__main__ import main
+
+    monkeypatch.chdir(tmp_path)
+    _write_skill(tmp_path / "skills", "lint", name="lint", description="Run it.", body="b")
+    base = ["--base-url", stub_url, "--yes", "--session-dir", str(tmp_path / "s")]
+    with_skills = ["--skills", "--skills-dir", str(tmp_path / "skills")]
+    assert main(["ask", "what does this define?", *base, *with_skills]) == 0
+    assert main(["ask", "and again?", *base, *with_skills, "--resume", "last"]) == 0
+    assert main(["ask", "and now?", *base, "--resume", "last"]) == 0
+
+    last = served_requests[-1]["messages"]
+    notes = [m["content"] for m in last if m["role"] == "developer"]
+    assert sum("<skill-catalog>" in note for note in notes) == 1
+    assert notes[-1] == SKILLS_WITHDRAWN

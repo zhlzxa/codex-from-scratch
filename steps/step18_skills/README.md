@@ -13,8 +13,8 @@ ships is 411.
 
 ```bash
 uv sync --all-extras
-uv run pytest                                   # 1719 tests, all offline
-uv run python probe_mutations_ch18.py           # 32 mutations
+uv run pytest                                   # 1826 tests, all offline
+uv run python probe_mutations_ch18.py           # 38 mutations
 uv run python probe_skills.py cost              # offline, F18-05
 
 uv run minicodex ask "how do I run the linter here?" \
@@ -103,6 +103,24 @@ different_file` passed against an implementation that **did** rebuild
 happen to exist. A security test that passes against the insecure version is
 not testing anything.
 
+## Found when the chapter was rewritten
+
+- **`description: >` was catalogued as `>`.** A folded block scalar is
+  ordinary YAML for a long description; the parser now joins the indented
+  lines below it into one line.
+- **An indented `name:` under `metadata:` replaced the skill's name** --
+  every line was stripped before it was matched. Lines are now matched as
+  they stand, and `_FIELD` only accepts a key at column 0. Both parser faults
+  lived because every fixture came from one helper that writes one shape.
+- **A skipped skill did not say why.** `[skills: skipped lint/SKILL.md (name
+  'lint' is already taken)]` now; the old equivalent mutant (no frontmatter
+  vs. no name) stopped being equivalent.
+- **`--resume` repeated the catalog**, and resuming without `--skills` left
+  the old one standing. `SkillsWatcher` now takes `shown` like
+  `MemoryWatcher`, and says `SKILLS_REPLACED` / `SKILLS_WITHDRAWN`. The web
+  console resumes on every message; chapters 19-23 and `minicodex-live` got
+  the same fix in `web/runtime.py`.
+
 ## Deliberately not done
 
 - **One directory, not five.** codex discovers skills across a project root,
@@ -124,10 +142,10 @@ not testing anything.
 - **No recursion.** One level of subdirectory. `MAX_SKILLS = 200` is the same
   argument as codex's `MAX_SCAN_DEPTH = 6` / `MAX_SKILLS_DIRS_PER_ROOT = 2000`
   (`core-skills/src/loader.rs:109-110`), at a smaller scale.
-- **Not a YAML parser.** Two fields, both one-line strings. codex's repairs
-  malformed scalars (`skills/src/parser.rs:98-181`) because a real `SKILL.md`
-  nests lists under `metadata`; anything that is not the shape above is skipped
-  here rather than guessed at.
+- **Not a YAML parser.** Two top-level fields, one-line strings or block
+  scalars; nested keys are ignored. codex's repairs malformed scalars
+  (`skills/src/parser.rs:98-181`); anything this cannot read is skipped, with
+  the reason, rather than guessed at.
 - **The skills directory did not move to `~/.minicodex/` when memory did.**
   codex keeps them apart too: its skill roots do not include the memory root,
   and a `skills/<name>/SKILL.md` written by memory consolidation is an ordinary

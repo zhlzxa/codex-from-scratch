@@ -494,12 +494,16 @@ async def run_turn(
     # Three watchers, one hook -- `__main__._ask`'s arrangement. Each watcher
     # decides for itself whether it has anything to say this turn.
     memory_watcher = MemoryWatcher(memory, root=root, shown=shown)
-    skills_watcher = SkillsWatcher(skills) if skills is not None else None
+    # Always built, for the reason `memory_watcher` is: a resumed session may
+    # hold a catalog an earlier process delivered (chapter 18's rewrite).
+    skills_watcher = SkillsWatcher(skills, shown=shown)
 
     def _on_turn_start() -> str | None:
-        notes = [agents_watcher.refresh(Path(context.shell.cwd)), memory_watcher.refresh()]
-        if skills_watcher is not None:
-            notes.append(skills_watcher.refresh())
+        notes = [
+            agents_watcher.refresh(Path(context.shell.cwd)),
+            memory_watcher.refresh(),
+            skills_watcher.refresh(),
+        ]
         said = [note for note in notes if note is not None]
         return "\n\n".join(said) if said else None
 
