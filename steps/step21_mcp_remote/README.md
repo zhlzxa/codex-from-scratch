@@ -9,9 +9,9 @@ chapter.
 
 ```bash
 uv sync --all-extras
-uv run pytest                                  # 1854 tests, all offline
+uv run pytest                                  # 1972 tests, all offline
 uv run python scripts/check_layers.py
-uv run python probe_mutations_ch21.py          # 11 mutations, 0 survivors
+uv run python probe_mutations_ch21.py          # 17 mutations, 0 survivors
 uv run python probe_mcp_remote.py all          # network: two public MCP
                                                 # endpoints, read-only
 ```
@@ -26,7 +26,7 @@ uv run python probe_mcp_remote.py all          # network: two public MCP
 | `src/minicodex/registry.py` | `load_config` now accepts `url` beside `command`; `connect` passes a sandbox and an owner through |
 | `tests/mcp_http_stub.py` | a stateless streamable-HTTP MCP stub and a combined authorization-server/resource-server stub, `asyncio.start_server` and nothing else |
 | `probe_mcp_remote.py` | four sections measuring real servers: an unauthenticated challenge, `.well-known` discovery (including whether GitHub advertises RFC 7591), a bearer-token connection (skips without `GITHUB_MCP_TOKEN`), and network latency |
-| `probe_mutations_ch21.py` | 11 mutations against this chapter's own code |
+| `probe_mutations_ch21.py` | 17 mutations against this chapter's own code (11 in the first version, 6 added when the chapter was rewritten) |
 
 Deleted, not kept "just in case": `transport.py` (347 lines), `http_transport.py`
 (290 lines), and the discovery/PKCE/refresh internals of the old `mcp_oauth.py`
@@ -63,7 +63,7 @@ measurement.
 
 ## What real GitHub said
 
-`probe_mcp_remote.py wellknown`, read-only, no token:
+`probe_mcp_remote.py wellknown`, read-only, no token (measured for the first version; the machine the chapter was rewritten on cannot reach GitHub):
 
 ```
 hop 1  https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp/
@@ -122,8 +122,38 @@ applied) rather than rewritten here.
 | token expiry across a restart | `StoredOAuthTokens.expires_at` | `OwnerTokenStorage`'s `expires_at` — independently arrived at, same idea |
 | stdio server sandboxing | `executor_process_transport.rs`, separate from `run_shell`'s sandbox | `_sandboxed_stdio_params`, same separation |
 | network isolation for a remote server | `network-proxy` (15k lines, MITM, per-domain rules) | chapter 20's `--unshare-net`, coarser, said so |
-| auth/sessions/quotas | present | chapter 22, same boundary chapter 20 already drew |
+| auth/sessions/quotas | present | chapter 23, same boundary chapter 20 already drew |
 
 Nothing here goes beyond codex. The one place this project's own measurement
 led somewhere codex had already gone (persisting an absolute token expiry) is
 noted as independent convergence, not copying.
+
+## Found when the chapter was rewritten
+
+None of the first version's 35 tests went through `McpClient` with OAuth
+configured. The first one that did found the first bug below, and the rest
+followed from reading each docstring against its code:
+
+- **Every remote server with OAuth failed to start.** `McpClient` stored the
+  `Owner` and chapter 9's connection-holding task under one name, `_owner`;
+  the task's `None` overwrote the `Owner`. Renamed to `_tenant`.
+- **The startup deadline included a person at a consent screen.** Slower than
+  30s and they were told the server never answered. The clock now stops while
+  the OAuth callback waits on a person.
+- **Every remote failure read `unhandled errors in a TaskGroup`.** `_explain`
+  reports what is inside the group: `ProxyError: 403 Forbidden`,
+  `ConnectError: ...`, `OAuthRegistrationError: Registration failed: 404`.
+- **The OAuth stub's metadata document had no `resource`**, so the SDK
+  discarded it and every OAuth test ran on the same-origin fallback.
+- **The token file** was written with the umask's mode and `chmod`ed after,
+  in place, and a broken file was silently replaced with one holding a single
+  server. Now created 0600, renamed into place, and an unreadable file is
+  refused with `OAuthStorageError`.
+- **`probe_mcp_remote.py wellknown`** raised a traceback when offline and
+  stopped `all`.
+- Docstrings that described things that do not exist: a resources
+  measurement, a probe section called `oauth-401`, `mcp_tokens()` "added ahead
+  of this chapter", `FakeSandbox` running the interpreter.
+
+Still not wired in, as in chapter 20: no code passes `sandbox=` to
+`connect()`, and nothing calls `list_resources`.
