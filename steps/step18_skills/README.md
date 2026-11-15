@@ -13,7 +13,7 @@ ships is 411.
 
 ```bash
 uv sync --all-extras
-uv run pytest                                   # 1719 tests, all offline
+uv run pytest                                   # 1826 tests, all offline
 uv run python probe_mutations_ch18.py           # 38 mutations
 uv run python probe_skills.py cost              # offline, F18-05
 
