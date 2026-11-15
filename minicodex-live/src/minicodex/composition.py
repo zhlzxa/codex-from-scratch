@@ -244,8 +244,9 @@ def top_level_tools(
     `skills` and `skill_tool` are the same shape one more time: a skill
     catalog prints each entry's path, `extra_read_roots` makes that path
     readable, and the model opens it with `read_file`. `skill_tool` adds
-    `read_skill` on top, kept only because it measured better than the default
-    path (see docs/history.md).
+    `read_skill` on top. It once measured better than the default path;
+    measured against the right alternative it ties (17/20 against 18/20), and
+    it stays as a demonstration behind a flag (see docs/history.md).
     """
     tools = local_tools(
         root,

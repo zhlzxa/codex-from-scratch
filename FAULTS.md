@@ -832,11 +832,22 @@ written six chapters ago, and two from the F18-14 correction:
 | **Three real test holes behind that, plus one bad mutation of my own.** The locator test fed `discover()` an absolute `tmp_path`, where `str(p)` and `str(p.resolve())` are the same string, so deleting `.resolve()` was invisible; nothing tested `top_level_tools` actually handing the skills directory to `extra_read_roots` (both halves were tested, never their meeting); and `_instructions` hard-coded to `skill_tool=True` was invisible because only `skills_instructions()` was tested directly, never its caller. The fourth "survivor" was my mutation being an equivalent mutant — `return None or catalog_block(...)` is `return catalog_block(...)` | ⚪ | Three tests added (a relative-path fixture, an end-to-end `read_file` through the composition root, a `_instructions` test with two tool tables), one mutation rewritten. **Two of the three are the same shape: a design whose two halves are each tested and whose join is not** |
 | **The arm built as the upper bound turned out to be the floor.** `bodies` — every skill's full text resident, nothing to fetch — scores **11/20**, below both arms that make the model go and get it (18/20, 17/20), consistently across both runs (4/8, then 7/12), while being the cheapest in turns (3.0 against 4.2) | 🔵 | Not fixed, because it is not a defect — it is a finding, and it contradicts the framing the arm was built with. A model handed an instruction for free follows it *less* often than one that spent a round trip on it. Recorded rather than smoothed over; the chapter says plainly that it was not looking for this |
 
-One mutation is listed in `probe_mutations_ch18.py` as **expected to survive**:
+One mutation was listed in `probe_mutations_ch18.py` as **expected to survive**:
 letting a file with no frontmatter through the parser hands `_load_one` an
 empty field dict, and the very next check drops it anyway. Both versions skip
-the file, so no test can tell them apart. It is kept rather than deleted,
-because deleting it would hide the fact that two checks overlap.
+the file, so no test can tell them apart. It was kept rather than deleted,
+because deleting it would hide the fact that two checks overlap -- and the
+rewrite below made it killable: once a skipped skill says why, "no frontmatter"
+and "no name" are different outputs.
+
+Found when the chapter was rewritten for beginners (2026-11):
+
+| Fault | Found | Fix |
+|---|---|---|
+| **`description: >` was catalogued as the single character `>`.** A folded block scalar is ordinary YAML for a long description; the parser read only the rest of the `description:` line. The model was shown a skill whose description said nothing. | 🟣 | Block scalars (`>`, `\|` and their `-`/`+` forms) are read: the indented lines below are joined with spaces, so the catalog line stays one line |
+| **An indented `name:` under `metadata:` replaced the skill's name** -- `run-tests` was catalogued as `internal-id-7`. Every frontmatter line was stripped before it was matched, so nesting was invisible. Both parser faults survived because every fixture was written by one helper that only writes the two-flat-fields shape. | 🟣 | Lines are matched as they stand; `_FIELD` is anchored at column 0, so an indented key is not a top-level field. The first fix also skipped indented lines explicitly -- its mutation survived, because that line did nothing, and it was removed |
+| **A skipped skill was named without the reason**: `[skills: skipped lint/SKILL.md]`, four possible causes, none stated | 🟣 | `_load_one` returns the reason (`no --- frontmatter --- block at the top`, `frontmatter has no name`, `... is already taken`, ...). The equivalent mutant above stopped being equivalent |
+| **`--resume` repeated the skill catalog, and resuming without `--skills` left the old one standing.** Three runs in one session put two catalogs in the last request; the third, without `--skills`, still had both and nothing withdrawing them -- naming paths `read_file` could no longer open. Chapter 16's rewrite gave `MemoryWatcher` `shown=` and left `SkillsWatcher`, in the same `_on_turn_start`, without it. The web console resumes on every message, so there every follow-up added a copy. | 🟣 | `SkillsWatcher(skills, shown=...)`, always built; says nothing when the catalog is unchanged, `SKILLS_REPLACED` + the new one when it changed, `SKILLS_WITHDRAWN` once when skills are off. Same fix in `web/runtime.py` for chapters 19-23 and `minicodex-live`, with a web test |
 
 Distribution (17):
 

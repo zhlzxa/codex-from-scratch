@@ -213,8 +213,9 @@ def top_level_tools(
     it to do for a `file` entry (`ext/skills/src/catalog_prompt.rs:7`).
     `skill_tool` adds `read_skill` on top. Unlike `dedicated_tools` it has no
     counterpart in codex at all -- codex's `skills.read` serves a kind of
-    skill this program cannot have -- and it is kept only because it measured
-    better than the default path. See `skills.py`.
+    skill this program cannot have. It was kept because it once measured
+    better; measured against the right alternative it ties (17/20 against
+    18/20), and it stays as a demonstration behind a flag. See `skills.py`.
     """
     tools = local_tools(
         root,

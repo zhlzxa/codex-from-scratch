@@ -972,3 +972,44 @@ async def test_a_follow_up_message_does_not_repeat_agents_md_or_memory(
     notes = [m["content"] for m in served_requests[-1]["messages"] if m["role"] == "developer"]
     assert sum(DATA_PREAMBLE in note for note in notes) == 1
     assert sum("Use uv, not pip." in note for note in notes) == 1
+
+
+async def test_a_follow_up_message_does_not_repeat_the_skill_catalog(
+    tmp_path: Path, stub_url: str, served_requests: list[dict]
+) -> None:
+    """The skills watcher's half of the test above, found when chapter 18 was
+    rewritten: the same resume fix reached `__main__` and, again, not this
+    file. A thread whose skills are switched off afterwards is told so once.
+    """
+    from minicodex.skills import DEFAULT_SKILLS_DIR, SKILLS_WITHDRAWN
+    from minicodex.web import runtime
+
+    workspace = tmp_path / "ws"
+    skill_dir = workspace / DEFAULT_SKILLS_DIR / "run-tests"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: run-tests\ndescription: how this project runs its tests\n---\n\n"
+        "uv run pytest\n",
+        encoding="utf-8",
+    )
+    on = {**DEFAULT_THREAD_SETTINGS, "skills": True}
+    off = {**DEFAULT_THREAD_SETTINGS, "skills": False}
+
+    for question, settings in (("one?", on), ("two?", on), ("three?", off), ("four?", off)):
+        await runtime.run_turn(
+            thread_dir=tmp_path / "thread",
+            workspace_root=workspace,
+            question=question,
+            settings=settings,
+            provider_name="ollama",
+            base_url=stub_url,
+            model="m",
+            api_key=None,
+            mcp_servers=[],
+            broker=ApprovalBroker(),
+            emit=lambda _event: None,
+        )
+
+    notes = [m["content"] for m in served_requests[-1]["messages"] if m["role"] == "developer"]
+    assert sum("<skill-catalog>" in note for note in notes) == 1
+    assert notes.count(SKILLS_WITHDRAWN) == 1

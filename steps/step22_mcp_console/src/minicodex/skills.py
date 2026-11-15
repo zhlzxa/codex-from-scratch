@@ -54,6 +54,7 @@ skill's instructions.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,8 @@ _FRONTMATTER = re.compile(
     r"\A---[ \t]*\r?\n(?P<yaml>.*?)\r?\n---[ \t]*\r?\n?(?P<body>.*)\Z", re.DOTALL
 )
 _FIELD = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*?)[ \t]*$")
+# YAML's block-scalar indicators: the value is on the indented lines below.
+_BLOCK_SCALARS = frozenset({"|", ">", "|-", ">-", "|+", ">+"})
 
 
 @dataclass(frozen=True)
@@ -178,9 +181,9 @@ class Skills:
 
     directory: Path
     skills: tuple[Skill, ...] = ()
-    # Relative paths of `SKILL.md` files that exist but were not usable:
-    # malformed frontmatter, a missing `name` or `description`, or a `name`
-    # that collided with one already found. Kept rather than dropped
+    # `SKILL.md` files that exist but were not usable, each as "relative
+    # path (why)": malformed frontmatter, a missing `name` or `description`,
+    # a `name` that collided with one already found, or the cap. Kept rather than dropped
     # silently -- a skill that never shows up and never says why is the
     # `2>&1` trap this whole book keeps finding new copies of.
     skipped: tuple[str, ...] = ()
@@ -218,38 +221,73 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str] | None:
     shape or the file is treated as unusable -- the same trade chapter -1 made
     everywhere else in this book: match the shape actually in front of you,
     refuse (not guess at) anything wider.
+
+    Two widenings were forced on that rule when the chapter was rewritten,
+    both found by feeding it frontmatter of the kind published skills use
+    rather than the kind this chapter's fixtures use, and both were silent:
+
+    * **Only unindented lines are top-level fields.** The first version
+      stripped every line before matching it, so a nested `metadata:` block
+      with its own `name:` line *replaced* the skill's name -- `run-tests`
+      was catalogued as `internal-id-7`.
+    * **A block scalar is read, not taken literally.** `description: >`
+      followed by indented lines is ordinary YAML for a long description, and
+      the first version catalogued that skill's description as the single
+      character `>`. The indented lines are now joined with spaces -- the
+      catalog line is one line either way.
     """
     match = _FRONTMATTER.match(text)
     if match is None:
         return None
     fields: dict[str, str] = {}
-    for line in match["yaml"].splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+    lines = match["yaml"].splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        field_match = _FIELD.match(stripped)
+        # Matched as it stands, not stripped: `_FIELD` starts at column 0, so
+        # an indented `name:` under `metadata:` is not a top-level field.
+        field_match = _FIELD.match(line.rstrip())
         if field_match is None:
             continue
         key, value = field_match.groups()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        if value in _BLOCK_SCALARS:
+            block: list[str] = []
+            while index < len(lines) and (not lines[index].strip() or lines[index][:1] in " \t"):
+                block.append(lines[index].strip())
+                index += 1
+            value = " ".join(part for part in block if part)
+        elif len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         fields[key] = value
     return fields, match["body"]
 
 
-def _load_one(skill_md: Path) -> Skill | None:
+def _load_one(skill_md: Path) -> Skill | str:
+    """A parsed skill, or the reason there is not one.
+
+    A reason rather than `None`, added when the chapter was rewritten: the
+    startup line said `[skills: skipped lint/SKILL.md]` and nothing about
+    why, which leaves the person who wrote the file to work out which of four
+    things they got wrong. F18-02's own fix was "skip it, but say so"; saying
+    *what* is the other half of saying so.
+    """
     try:
         text = skill_md.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
+    except OSError as exc:
+        return f"unreadable: {type(exc).__name__}"
     parsed = _parse_frontmatter(text)
     if parsed is None:
-        return None
+        return "no --- frontmatter --- block at the top"
     fields, body = parsed
     name = fields.get("name", "").strip()
     description = fields.get("description", "").strip()
-    if not name or not description:
-        return None
+    if not name:
+        return "frontmatter has no name"
+    if not description:
+        return "frontmatter has no description"
     if len(description) > MAX_DESCRIPTION_CHARS:
         description = description[: MAX_DESCRIPTION_CHARS - 1] + "…"
     return Skill(name=name, description=description, body=body.strip(), path=skill_md)
@@ -285,12 +323,16 @@ def discover(directory: Path = DEFAULT_SKILLS_DIR, *, max_skills: int = MAX_SKIL
         skill_md = entry / SKILL_FILENAME
         if not skill_md.is_file():
             continue
+        where = skill_md.relative_to(directory).as_posix()
         if len(found) >= max_skills:
-            skipped.append(str(skill_md.relative_to(directory)))
+            skipped.append(f"{where} (over the {max_skills}-skill limit)")
             continue
         skill = _load_one(skill_md)
-        if skill is None or skill.name in seen:
-            skipped.append(str(skill_md.relative_to(directory)))
+        if isinstance(skill, str):
+            skipped.append(f"{where} ({skill})")
+            continue
+        if skill.name in seen:
+            skipped.append(f"{where} (name {skill.name!r} is already taken)")
             continue
         seen.add(skill.name)
         found.append(skill)
@@ -446,16 +488,53 @@ class SkillsWatcher:
     delivery could say that the first did not.
     """
 
-    def __init__(self, skills: Skills, *, budget: int = CATALOG_TOKEN_BUDGET) -> None:
+    def __init__(
+        self,
+        skills: Skills | None,
+        *,
+        budget: int = CATALOG_TOKEN_BUDGET,
+        shown: Sequence[str] = (),
+    ) -> None:
         self._skills = skills
         self._budget = budget
         self._delivered = False
+        # `shown` is for `--resume`, and it arrived late for the same reason
+        # `MemoryWatcher`'s did: a resumed process builds a watcher that has
+        # not spoken, joining a conversation that already holds the catalog
+        # an earlier process delivered. Measured when the chapter was
+        # rewritten: three `--resume last` runs, three catalogs in every later
+        # request. Chapter 16's rewrite fixed the memory block and not this.
+        self._earlier = next((t for t in reversed(list(shown)) if _is_catalog(t)), None)
 
     def refresh(self) -> str | None:
         if self._delivered:
             return None
         self._delivered = True
-        return catalog_block(self._skills, budget=self._budget)
+        withdrawn = self._earlier is not None and self._earlier.startswith(SKILLS_WITHDRAWN)
+        if self._skills is None:
+            # `--resume` without `--skills`: the old catalog names paths
+            # `read_file` can no longer open. Said once.
+            return SKILLS_WITHDRAWN if self._earlier is not None and not withdrawn else None
+        block = catalog_block(self._skills, budget=self._budget)
+        if block is None or self._earlier is None or withdrawn:
+            return block
+        if block in self._earlier:
+            return None
+        return f"{SKILLS_REPLACED}\n\n{block}"
+
+
+SKILLS_REPLACED = (
+    "The skill catalog shown earlier in this conversation is out of date. "
+    "This replaces it; disregard the earlier copy."
+)
+SKILLS_WITHDRAWN = (
+    "Skills have been switched off for this session. The skill catalog shown "
+    "earlier in this conversation no longer applies: do not open those paths."
+)
+
+
+def _is_catalog(text: str) -> bool:
+    return OPEN_FENCE in text or text.startswith((SKILLS_WITHDRAWN, SKILLS_REPLACED))
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +660,8 @@ __all__ = [
     "MAX_SKILLS",
     "READ_BUDGET",
     "SKILLS_INSTRUCTIONS",
+    "SKILLS_REPLACED",
+    "SKILLS_WITHDRAWN",
     "SKILL_FILENAME",
     "Skill",
     "Skills",
