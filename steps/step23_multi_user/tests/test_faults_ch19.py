@@ -593,7 +593,12 @@ async def test_F19_09_marks_are_emitted_as_their_own_event(tmp_path: Path) -> No
         writer.release()
 
     assert events == [
-        {"type": "mark", "mark": "compacted", "payload": {"generation": 1, "replaced": 12}}
+        {
+            "type": "mark",
+            "mark": "compacted",
+            "payload": {"generation": 1, "replaced": 12},
+            "position": 0,
+        }
     ]
 
 
@@ -1013,3 +1018,236 @@ async def test_a_follow_up_message_does_not_repeat_the_skill_catalog(
     notes = [m["content"] for m in served_requests[-1]["messages"] if m["role"] == "developer"]
     assert sum("<skill-catalog>" in note for note in notes) == 1
     assert notes.count(SKILLS_WITHDRAWN) == 1
+
+
+# ---------------------------------------------------------------------------
+# Found when the chapter was rewritten: driving the built console in a browser
+# ---------------------------------------------------------------------------
+
+
+async def _two_turns(tmp_path: Path, stub_url: str) -> tuple[list[dict], list[dict], int]:
+    """Two messages in one thread; the events of each, and how many items the
+    thread loads back as after the first."""
+    from minicodex.rollout import read_rollout, resolve
+    from minicodex.web import runtime
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    batches: list[list[dict]] = []
+    after_first = 0
+    for question in ("what does this define?", "and again?"):
+        events: list[dict] = []
+        await runtime.run_turn(
+            thread_dir=tmp_path / "thread",
+            workspace_root=workspace,
+            question=question,
+            settings=dict(DEFAULT_THREAD_SETTINGS),
+            provider_name="ollama",
+            base_url=stub_url,
+            model="m",
+            api_key=None,
+            mcp_servers=[],
+            broker=ApprovalBroker(),
+            emit=events.append,
+        )
+        batches.append([e for e in events if e["type"] == "history_item"])
+        if not after_first:
+            history, _ = read_rollout(resolve("last", tmp_path / "thread")).history()
+            after_first = len(history.items)
+    return batches[0], batches[1], after_first
+
+
+async def test_every_streamed_item_says_where_it_sits_in_the_thread(
+    tmp_path: Path, stub_url: str
+) -> None:
+    """A turn starts by replaying the conversation into its new rollout file,
+    and that replay goes through the same `append` the browser listens to. The
+    first version streamed it as if it were new, so the second message drew the
+    first exchange on screen a second time -- 5 messages and 2 tool calls
+    where a reload showed 2 and 1. The index is what lets the browser tell the
+    replay from the new items; it has to agree with what a reload loads.
+    """
+    first, second, known = await _two_turns(tmp_path, stub_url)
+    assert [e["index"] for e in first] == list(range(len(first)))
+    assert known == len(first)
+    # The second turn replays positions 0..known-1, then continues from there.
+    assert [e["index"] for e in second] == list(range(len(second)))
+    assert [e["item"] for e in second[:known]] == [e["item"] for e in first]
+    assert [e["item"]["type"] for e in second[known:]] == ["user", "assistant"]
+
+
+def test_a_compaction_numbers_its_new_baseline_from_zero(tmp_path: Path) -> None:
+    """`read_rollout` keeps what follows the last `compacting` marker, so the
+    count restarts there, and `compacted` says how long the new history is."""
+    from minicodex.history import History
+    from minicodex.rollout import SessionMeta, new_session_id, read_rollout
+    from minicodex.web.events import StreamingRolloutWriter
+
+    events: list[dict[str, Any]] = []
+    meta = SessionMeta(
+        session_id=new_session_id(),
+        created=0.0,
+        cwd=str(tmp_path),
+        provider="ollama",
+        model="m",
+        sandbox_mode="read-only",
+        approval_policy="on-request",
+    )
+    writer = StreamingRolloutWriter(tmp_path / "s.jsonl", meta, events.append)
+    try:
+        history = History(observer=writer.append)
+        for text in ("one", "two", "three"):
+            history.add_user(text)
+        writer.mark("compacting", generation=1, replaced=2)
+        baseline = History(observer=writer.append)
+        baseline.add_system_note("summary")
+        baseline.add_user("three")
+        writer.mark("compacted", generation=1, replaced=2)
+    finally:
+        writer.release()
+
+    assert [e["index"] for e in events if e["type"] == "history_item"] == [0, 1, 2, 0, 1]
+    assert events[-1]["mark"] == "compacted" and events[-1]["position"] == 2
+    loaded, _ = read_rollout(tmp_path / "s.jsonl").history()
+    assert len(loaded.items) == 2
+
+
+async def test_a_pending_approval_is_listed_for_its_own_thread_only() -> None:
+    broker = ApprovalBroker()
+    request = ApprovalRequest("rm -rf build", "deletes files", Risk.WRITE, None)
+    asking = asyncio.ensure_future(WebApprover(broker, lambda _e: None, thread="a").ask(request))
+    await asyncio.sleep(0)
+
+    (pending,) = broker.asked("a")
+    assert pending["what"] == "rm -rf build"
+    assert broker.asked("b") == []
+
+    assert broker.resolve(pending["id"], ApprovalReply(True, "rm -rf build"))
+    assert (await asking).approved
+    assert broker.asked("a") == []
+
+
+def test_a_reload_still_shows_the_approval_the_turn_is_waiting_on(
+    console: TestClient, workspace: Path, tmp_path: Path
+) -> None:
+    """The request reached the browser as one event; a tab that was not
+    watching, or reloaded, never saw it, and `GET /api/threads/{id}` -- what a
+    tab rebuilds itself from -- did not mention it. The card vanished and the
+    turn waited ten minutes for an answer nobody could give."""
+    thread_id = _thread(console, workspace)
+    # Chapter 23: one store per owner and one broker per account.
+    thread = str(next(p for p in tmp_path.rglob(thread_id) if p.is_dir()))
+    broker = console.app.state.console.broker_for(CONSOLE_ACCOUNT)
+    request = ApprovalRequest("make deploy", "runs the deploy", Risk.WRITE, ("make",))
+    asking = console.portal.start_task_soon(
+        WebApprover(broker, lambda _e: None, thread=thread).ask, request
+    )
+    for _ in range(100):
+        approvals = console.get(f"/api/threads/{thread_id}").json()["approvals"]
+        if approvals:
+            break
+    assert [a["what"] for a in approvals] == ["make deploy"]
+
+    answer = console.post(f"/api/approvals/{approvals[0]['id']}/respond", json={"approved": False})
+    assert answer.status_code == 200
+    assert asking.result(timeout=5).approved is False
+    assert console.get(f"/api/threads/{thread_id}").json()["approvals"] == []
+
+
+def test_the_frontend_skips_what_it_already_shows_and_buffers_while_it_syncs() -> None:
+    """Source assertions, like F19-05's: pytest cannot drive a browser. What
+    the browser does with these is measured by `probe_web.py browser`."""
+    source = (FRONTEND / "src" / "useThread.ts").read_text(encoding="utf-8")
+    assert "event.index < knownRef.current" in source, "replayed items are drawn again"
+    assert "bufferRef.current.push(event)" in source, "events during a resync are lost"
+    assert "record.approvals" in source, "a reload loses the pending approval card"
+    assert "pending: true" in source, "the optimistic echo is never matched"
+    # Subscribe first, on every page load -- not fetch-then-subscribe.
+    assert "void resync(threadId)\n      .then(() => open())" not in source
+
+
+async def test_a_socket_that_arrives_while_the_last_one_is_leaving_still_hears_events() -> None:
+    """The last socket out queued the pump's stop sentinel and left the queue
+    in place; a socket that subscribed before the pump read it joined a pump
+    that was about to stop, and every later event was dropped at `emit`."""
+    channel = Channel()
+    leaving, arriving = Recorder(), Recorder()
+    channel.subscribe("t", leaving)
+    await asyncio.sleep(0)
+    channel.unsubscribe("t", leaving)
+    channel.subscribe("t", arriving)  # before the old pump has run again
+    for _ in range(5):
+        await asyncio.sleep(0)
+    channel.emit("t", {"type": "notice", "text": "still here"})
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert arriving.sent == [{"type": "notice", "text": "still here"}]
+    await channel.aclose()
+
+
+def test_a_switch_spelled_as_a_string_is_refused_not_switched_on() -> None:
+    """`bool("false")` is `True`: the first version turned memory on for a
+    request that asked for it to be off."""
+    for flag in ("memory", "remember", "skills"):
+        with pytest.raises(ValueError):
+            validate_settings({flag: "false"})
+    assert validate_settings({"memory": True})["memory"] is True
+
+
+async def test_a_failing_memory_writer_does_not_fail_the_turn() -> None:
+    """Chapter 17's rewrite fixed `__main__._finish_writer`; the console's copy
+    kept the four exception types, so a provider error in the background writer
+    reached the browser as the turn's error."""
+    from minicodex.web.runtime import _finish_writer
+
+    class ProviderSaidNo(Exception):
+        pass
+
+    async def failing() -> Any:
+        raise ProviderSaidNo("HTTP 500")
+
+    done = asyncio.ensure_future(failing())
+    await asyncio.sleep(0)
+    assert "failed" in await _finish_writer(done)
+
+    slow = asyncio.ensure_future(asyncio.sleep(0.01, result=None))
+
+    async def fails_later() -> Any:
+        await slow
+        raise ProviderSaidNo("HTTP 500")
+
+    assert "failed" in await _finish_writer(asyncio.ensure_future(fails_later()), grace=5.0)
+
+
+async def test_a_turn_tells_its_approver_which_thread_is_asking(
+    tmp_path: Path, stub_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route lists approvals by thread directory; `run_turn` is the one
+    place that knows which directory a turn belongs to. The two meet only if
+    the approver is built with it."""
+    from minicodex.web import runtime
+
+    built: list[str | None] = []
+
+    class Spy(WebApprover):
+        def __init__(self, *args: Any, thread: str | None = None, **kwargs: Any) -> None:
+            built.append(thread)
+            super().__init__(*args, thread=thread, **kwargs)
+
+    monkeypatch.setattr(runtime, "WebApprover", Spy)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    await runtime.run_turn(
+        thread_dir=tmp_path / "thread",
+        workspace_root=workspace,
+        question="what does this define?",
+        settings=dict(DEFAULT_THREAD_SETTINGS),
+        provider_name="ollama",
+        base_url=stub_url,
+        model="m",
+        api_key=None,
+        mcp_servers=[],
+        broker=ApprovalBroker(),
+        emit=lambda _event: None,
+    )
+    assert built == [str(tmp_path / "thread")]

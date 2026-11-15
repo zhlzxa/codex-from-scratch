@@ -5,6 +5,7 @@
         order      network* how often the naive fan-out delivers events out of order
         bundle     offline  what replacing one HTML file with a React build costs
         stream     network  per-history-item streaming vs per-token: what a reader waits
+        browser    offline  two messages in the built console, live view against a reload
 
     * `order` opens no socket: "network" here means only that it drives a real
       event loop. It is offline like everything else but `stream`.
@@ -329,7 +330,127 @@ def stream(samples: int = 3) -> None:
     asyncio.run(run())
 
 
-SECTIONS = {"core-diff": core_diff, "order": order, "bundle": bundle, "stream": stream}
+_DRIVER = r"""
+// Two messages in one thread; count what is on screen, live and after a reload.
+const { chromium } = require("playwright");
+(async () => {
+  const base = process.argv[2];
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  await page.goto(base);
+  await page.click(".thread-item");
+  const count = async () => [
+    await page.locator(".msg-user").count(),
+    await page.locator(".msg-agent").count(),
+    await page.locator(".toolcall").count(),
+  ];
+  const rows = [];
+  for (const question of ["what does this define?", "and again?"]) {
+    await page.locator("textarea").fill(question);
+    await page.locator("textarea").press("Enter");
+    await page.waitForTimeout(300);
+    await page.waitForSelector(".composer-box:not(.disabled)", { timeout: 20000 });
+    await page.waitForTimeout(500);
+    rows.push(["live, after " + JSON.stringify(question), ...(await count())]);
+  }
+  await page.reload();
+  await page.click(".thread-item");
+  await page.waitForTimeout(1500);
+  rows.push(["after a reload", ...(await count())]);
+  console.log(JSON.stringify(rows));
+  await browser.close();
+})();
+"""
+
+
+def browser() -> None:
+    """Drive the built console in a real browser, against the stub model.
+
+    Added when chapter 19 was rewritten, because the three faults it found in
+    the live view were invisible from pytest: every test fed events to a list,
+    and none of them asked what a person sees after a second message. A reload
+    rebuilds the page from the rollout file, so it is the reference: the live
+    view should agree with it. Needs Node, Playwright and `npm run build`.
+    """
+    import socket
+    import subprocess
+    import tempfile
+    import threading
+    from http.server import HTTPServer
+
+    import httpx
+    import uvicorn
+
+    from minicodex import stub
+    from minicodex.web import create_app
+
+    dist = ROOT / "frontend" / "dist"
+    if not (dist / "index.html").exists():
+        print("no frontend build: npm --prefix frontend ci && npm --prefix frontend run build")
+        return
+
+    def free_port() -> int:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    stub_port, web_port = free_port(), free_port()
+    model_server = HTTPServer(("127.0.0.1", stub_port), stub._Handler)
+    threading.Thread(target=model_server.serve_forever, daemon=True).start()
+    scratch = Path(tempfile.mkdtemp())
+    (scratch / "ws").mkdir()
+    server = uvicorn.Server(
+        uvicorn.Config(
+            create_app(scratch / "console", frontend=dist),
+            host="127.0.0.1",
+            port=web_port,
+            log_level="warning",
+        )
+    )
+    threading.Thread(target=server.run, daemon=True).start()
+    base = f"http://127.0.0.1:{web_port}"
+    for _ in range(100):
+        try:
+            httpx.get(f"{base}/api/policy")
+            break
+        except httpx.HTTPError:
+            time.sleep(0.1)
+    provider = httpx.post(
+        f"{base}/api/providers",
+        json={
+            "name": "stub",
+            "provider": "ollama",
+            "base_url": f"http://127.0.0.1:{stub_port}/v1",
+            "model": "m",
+        },
+    ).json()
+    httpx.post(f"{base}/api/providers/{provider['id']}/activate")
+    httpx.post(f"{base}/api/threads", json={"workspace": str(scratch / "ws"), "title": "probe"})
+
+    driver = scratch / "driver.cjs"
+    driver.write_text(_DRIVER, encoding="utf-8")
+    try:
+        out = subprocess.run(
+            ["node", str(driver), base], capture_output=True, text=True, timeout=120, check=True
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"could not drive a browser: {exc}")
+        return
+    finally:
+        server.should_exit = True
+        model_server.shutdown()
+    print(f"  {'':<38}{'you':>5}{'agent':>7}{'tool calls':>12}")
+    for label, you, agent, tools in json.loads(out.stdout):
+        print(f"  {label:<38}{you:>5}{agent:>7}{tools:>12}")
+
+
+SECTIONS = {
+    "core-diff": core_diff,
+    "order": order,
+    "bundle": bundle,
+    "stream": stream,
+    "browser": browser,
+}
 
 
 def main() -> None:

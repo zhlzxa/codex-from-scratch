@@ -21,13 +21,14 @@ npm --prefix frontend run build
 uv run minicodex serve                          # http://127.0.0.1:8000
 npm --prefix frontend run dev                   # or: 5173, hot reload, proxied
 
-uv run pytest                                   # 1774 tests, all offline
+uv run pytest                                   # 1880 tests, all offline
 uv run python scripts/check_layers.py           # now reads subpackages too
-uv run python probe_mutations_ch19.py           # 32 mutations, 0 survivors
+uv run python probe_mutations_ch19.py           # 43 mutations, 0 survivors
 uv run python probe_web.py core-diff            # offline: the headline
 uv run python probe_web.py order                # offline: F19-03, 0% then 100%
 uv run python probe_web.py bundle               # offline: what the rewrite cost
 uv run python probe_web.py stream               # network: OPENAI_API_KEY, a few cents
+uv run python probe_web.py browser              # offline: what a person sees (Node + Playwright)
 ```
 
 ## What is new
@@ -44,23 +45,23 @@ uv run python probe_web.py stream               # network: OPENAI_API_KEY, a few
 | `src/minicodex/__main__.py` | `minicodex serve --host --port --data-dir`, imported lazily |
 | `frontend/` | React + Vite. The design is the previous console's, ported unchanged; the panels are new |
 | `scripts/check_layers.py` | `rglob` instead of `glob`, relative imports resolved, one new forbidden edge |
-| `tests/test_faults_ch19.py` | 40 tests, F19-01…F19-11, all offline |
+| `tests/test_faults_ch19.py` | 54 tests, F19-01…F19-11 and the rewrite's six, all offline |
 | `probe_web.py` | `core-diff`, `order`, `bundle` (offline) and `stream` (network) |
-| `probe_mutations_ch19.py` | 32 mutations, three of them against `check_layers.py` itself |
+| `probe_mutations_ch19.py` | 43 mutations, three of them against `check_layers.py` itself |
 
 ## The headline: nothing in the agent changed
 
 ```
-    30 top-level modules byte-identical to chapter 18
-     4 changed only by chapter 15's fixes: agent.py, registry.py, replay.py, subagent.py
+    31 top-level modules byte-identical to chapter 18
+     3 changed only by chapter 15's fixes: registry.py, replay.py, subagent.py
      0 agent modules changed for the console  <- the headline
 
-  __main__.py: +57 lines, all of it the `serve` subcommand
-  new backend  (8 modules): 1898 lines
-  new frontend (9 files):   2216 lines
+  __main__.py: +36 lines, all of it the `serve` subcommand
+  new backend  (8 modules): 2019 lines
+  new frontend (9 files):   2291 lines
 ```
 
-The four back-ported files are chapter 15's release fixes, carried back because
+The three back-ported files are chapter 15's release fixes, carried back because
 this step reads *before* chapter 15 and shipping a console with a known
 Python-3.10 timeout bug in it to keep a number tidy would be a strange trade.
 
@@ -94,7 +95,7 @@ only if it exists on disk, because there is one call site and it does both — a
 the price is paid entirely on long prose answers. A tool-heavy turn is already
 chunky, because every call and every result is its own item.
 
-**32 mutations, 0 survivors**, including three against `check_layers.py`.
+**43 mutations, 0 survivors**, including three against `check_layers.py`.
 
 That line was wrong when it was first written, and the way it was wrong is the
 chapter's own lesson pointed back at it. Three mutations survived: the event
@@ -116,6 +117,36 @@ existed and passed with the mechanism deleted:
 `test_F19_02_a_reply_that_lost_the_race_with_the_timeout_is_refused` and
 `test_F19_02_a_reply_from_a_worker_thread_goes_through_the_loop` close them.
 The count above is now measured rather than asserted.
+
+## Found when the chapter was rewritten
+
+Every test above feeds events to a list. None of them asked what a person sees,
+so the rewrite drove the built console in a browser (`probe_web.py browser`):
+
+```
+                                          you  agent  tool calls
+  live, after "and again?"   (before)       5      5           2
+  live, after "and again?"   (after)        2      3           1
+  after a reload                            2      3           1
+```
+
+- **A follow-up redrew the conversation.** A resumed turn replays its history
+  into the new rollout file through the observer the console streams from.
+  `history_item` now carries its index in the history the file loads back as,
+  and the browser skips what it already shows.
+- **The question was drawn twice**: the optimistic echo was matched only when
+  it was the last entry. It is marked `pending` and replaced by text.
+- **First load fetched, then subscribed** -- the gap the code's own comment
+  warns about. Every open subscribes first and buffers until the snapshot.
+- **A reload lost the pending approval card** while the turn waited ten minutes.
+  The snapshot now carries pending approvals.
+- **A socket arriving as the last one left heard nothing ever again.** Each
+  pump owns its queue and sockets; the last one out detaches both.
+- `web/runtime._finish_writer` still had the exception list chapter 17's
+  rewrite replaced; and `bool("false")` switched memory on.
+
+Not fixed here: the memory panel reads `<workspace>/.minicodex/memories`, not
+the `~/.minicodex/memories` every turn uses. Chapter 23 finds it (F23-05).
 
 ## Deliberately not done
 

@@ -1,5 +1,6 @@
 import type {
   ApprovalPolicy,
+  ApprovalRequestEvent,
   McpServer,
   MemoryEntry,
   Provider,
@@ -56,7 +57,15 @@ export const api = {
 
   workspaces: () => call<WorkspaceGroup[]>("GET", "/api/workspaces"),
   thread: (id: string) =>
-    call<Thread & { items: unknown[]; marks: unknown[]; busy: boolean; turns: number }>(
+    call<
+      Thread & {
+        items: unknown[];
+        marks: unknown[];
+        busy: boolean;
+        turns: number;
+        approvals: ApprovalRequestEvent[];
+      }
+    >(
       "GET",
       `/api/threads/${id}`,
     ),

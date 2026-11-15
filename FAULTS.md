@@ -933,6 +933,25 @@ finding, and it is not about browsers: a rule that was correct when it was
 written can stop applying without ever failing, and the thing that told you it
 still applied is the same thing that had quietly stopped looking.
 
+Found when the chapter was rewritten for beginners (2026-11), the first two by
+driving the built console in a real browser (`probe_web.py browser`) -- the one
+question none of the forty tests had asked:
+
+| Fault | Found | Fix |
+|---|---|---|
+| **A follow-up message redrew the whole conversation.** A resumed turn replays its history into the new rollout file through `History`'s observer -- the same `append` the console streams from -- so every earlier item reached the browser again as new. Measured: after the second message the live page showed 5 user bubbles, 5 agent messages and 2 tool calls; a reload of the same thread showed 2, 3 and 1. Compaction's new baseline goes through the same path. | 🟠 observability | `history_item` carries its `index` in the history the file loads back as (restarting at `compacting`, as `read_rollout` does); the browser skips what it already shows. No change to the agent |
+| **The optimistic echo was matched only if it was the last entry**, and a turn often begins with a system note, so the question was drawn twice | 🟠 observability | The echo is marked `pending` and replaced by text |
+| **First page load fetched, then subscribed** -- the gap the `onopen` comment warns about, on the path every load takes; a `turn_finished` in it left the composer disabled. Found by reading, not reproduced | 🟣 review | Every open subscribes first and buffers events until the snapshot lands; the index deduplicates |
+| **A reload lost the pending approval card**: `GET /api/threads/{id}` carried no approvals, so the turn waited `APPROVAL_TIMEOUT_SECONDS` on a card nobody could see, then counted as a refusal nobody made | 🟣 review | The broker keeps each request's event and its thread; the snapshot includes them |
+| **A socket that subscribed while the last one was leaving never heard another event**: the queue stayed in the table until the pump read its stop sentinel, so the newcomer joined a pump about to stop, and every later `emit` was dropped with a subscriber registered | 🟣 review | Each pump owns its queue and socket set; the last socket out detaches both at once |
+| **`web/runtime._finish_writer` never got chapter 17's rewrite fix** (the four exception types and the grace-wait route), so a failing memory writer turned an answered turn into an error -- the third fix to reach `__main__` and not this copy; and **`bool("false")` is `True`**, so a switch spelled as a string was switched on | 🟣 review | `Exception` at both points; a non-boolean switch is refused with a 400 |
+
+Not fixed here, on purpose: the memory panel and *Erase everything* read
+`<workspace>/.minicodex/memories` while every turn reads `~/.minicodex/memories`
+(chapter 16's move). Chapter 23 finds it as F23-05 and its chapter is built
+around how; the rewritten chapter 19 points at it (§10.4) instead of erasing
+that history.
+
 The twelfth arrived late enough to be the argument's last word. This chapter
 wrote that sentence about `check_layers.py`, shipped three tests that had
 stopped covering their own subject, and printed **0 survivors** in its README

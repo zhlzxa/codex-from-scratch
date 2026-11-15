@@ -146,7 +146,13 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("context window must be a positive number of tokens")
         merged["context_window"] = window
     for flag in ("memory", "remember", "skills"):
-        merged[flag] = bool(merged[flag])
+        # Refused, not coerced. The first version did `bool(value)`, and
+        # `bool("false")` is `True`: a request that spelled the switch as a
+        # string turned memory *on* -- a consent F17-11 says must be explicit,
+        # granted by the word for refusing it. Found when chapter 19 was
+        # rewritten.
+        if not isinstance(merged[flag], bool):
+            raise ValueError(f"{flag} must be true or false, not {merged[flag]!r}")
     return merged
 
 
