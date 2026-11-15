@@ -30,7 +30,7 @@ History 三者关系的辨析结论。
 
   ```python
   shell = ShellSession(timeout=ctx.parent_shell.timeout)
-  shell.cwd = ctx.parent_shell.cwd      # 没有 shell.sandbox = ctx.parent_shell.sandbox
+  shell.cwd = ctx.parent_shell.cwd  # 没有 shell.sandbox = ctx.parent_shell.sandbox
   ```
 
   子代理的 shell 是 `sandbox=None`，命令裸跑宿主机。而 `runtime.py:277` 的注释

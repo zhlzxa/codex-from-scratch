@@ -483,16 +483,21 @@ async def run_turn(
             "skills": str(skills.directory) if skills else None,
         },
     )
-    agents_watcher = AgentsMdWatcher(root)
+    # Every message in a browser thread is a resume (the thread is reloaded
+    # from its rollout file), so both watchers are told what the conversation
+    # already holds. Without it, each follow-up message added another copy of
+    # AGENTS.md and of the memory block -- chapter 13's resume fix and chapter
+    # 16's, which reached `__main__` and not this file. Found when chapter 16
+    # was rewritten.
+    shown = resume_from.developer_notes() if resume_from is not None else ()
+    agents_watcher = AgentsMdWatcher(root, shown=shown)
     # Three watchers, one hook -- `__main__._ask`'s arrangement. Each watcher
     # decides for itself whether it has anything to say this turn.
-    memory_watcher = MemoryWatcher(memory, root=root) if memory is not None else None
+    memory_watcher = MemoryWatcher(memory, root=root, shown=shown)
     skills_watcher = SkillsWatcher(skills) if skills is not None else None
 
     def _on_turn_start() -> str | None:
-        notes = [agents_watcher.refresh(Path(context.shell.cwd))]
-        if memory_watcher is not None:
-            notes.append(memory_watcher.refresh())
+        notes = [agents_watcher.refresh(Path(context.shell.cwd)), memory_watcher.refresh()]
         if skills_watcher is not None:
             notes.append(skills_watcher.refresh())
         said = [note for note in notes if note is not None]

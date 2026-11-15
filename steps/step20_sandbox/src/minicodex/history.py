@@ -63,7 +63,8 @@ class SystemNote:
 @dataclass(frozen=True)
 class DeveloperNote:
     """Something a *person* wrote down, not the user typing and not the code
-    narrating -- currently just AGENTS.md (chapter 13, F13-12).
+    narrating -- AGENTS.md (chapter 13, F13-12), and from chapter 16 the
+    memory block, which reuses this type rather than adding a sixth.
 
     Kept apart from `SystemNote` for the same reason `SystemNote` is kept
     apart from `UserMessage`: they render to different wire roles.  A

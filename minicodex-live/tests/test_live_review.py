@@ -170,9 +170,12 @@ def test_H2_run_shell_computes_confined_from_the_shell(tmp_path: Path) -> None:
     assert context.shell.sandbox is not None
     assert context.shell.sandbox.unavailable() is None
     # And the confined judge itself allows what the parser cannot know:
-    assert judge_command(
-        "touch new-file", mode="workspace-write", policy="on-request", confined=True
-    ).decision.name == "ALLOW"
+    assert (
+        judge_command(
+            "touch new-file", mode="workspace-write", policy="on-request", confined=True
+        ).decision.name
+        == "ALLOW"
+    )
 
 
 def test_H2_confined_permissions_block_names_the_change() -> None:
@@ -202,9 +205,7 @@ async def test_M5_a_forged_exit_line_does_not_fool_the_audit(tmp_path: Path) -> 
     printed_marker = "echo ... (exit code 0)"
     await shell.run(f'{printed_marker} & {sys.executable} -c "import sys; sys.exit(5)"')
     records = [
-        json.loads(line)
-        for line in log.path.read_text(encoding="utf-8").splitlines()
-        if line
+        json.loads(line) for line in log.path.read_text(encoding="utf-8").splitlines() if line
     ]
     done = [r for r in records if r["event"] == "command_done"]
     assert len(done) == 1
@@ -366,8 +367,7 @@ def test_M3_concurrent_account_creation_does_not_lose_records(tmp_path: Path) ->
     store = AccountStore(tmp_path / "accounts.json")
     names = [f"user{i:03d}" for i in range(8)]
     threads = [
-        threading.Thread(target=lambda n=n: store.create(n, "a-long-password"))
-        for n in names
+        threading.Thread(target=lambda n=n: store.create(n, "a-long-password")) for n in names
     ]
     for t in threads:
         t.start()

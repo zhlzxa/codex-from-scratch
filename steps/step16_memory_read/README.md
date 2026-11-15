@@ -44,7 +44,7 @@ uv sync --all-extras
 uv run pytest                                  # offline, all of it
 uv run python probe_memory.py cost             # offline
 uv run python probe_memory.py usage            # offline
-uv run python probe_mutations_ch16.py          # 24 mutations
+uv run python probe_mutations_ch16.py          # 29 mutations
 
 uv run minicodex memory                        # where it lives, what is in it
 uv run minicodex ask "..." --memory            # off unless you ask for it
@@ -66,9 +66,9 @@ uv run python probe_memory.py ab               # needs a provider
 | `src/minicodex/tools.py` | `read_file` accepts an extra read-only root, threaded from `ToolContext.extra_read_roots` |
 | `src/minicodex/__main__.py` | `--memory`, `--memory-dir`, `--dedicated-tools`, `minicodex memory [--forget-all]`, citation stripping, usage-kind reporting |
 | `src/minicodex/evals.py` | `MEMORY_TASKS`, `Task.memory`, `used_a_tool()`, `shell_command_has()`, `run_task(on_turn_start=..., extra_read_roots=...)` |
-| `tests/test_faults_ch16.py` | 71 tests, F16-01…F16-14 |
+| `tests/test_faults_ch16.py` | 80 tests, F16-01…F16-14 |
 | `probe_memory.py` | eight sections: inject, cache, cost, ab, stages, skip, cite, usage |
-| `probe_mutations_ch16.py` | 24 mutations |
+| `probe_mutations_ch16.py` | 29 mutations |
 
 ## What was measured
 
@@ -169,6 +169,25 @@ needed a second, read-only boundary to reach it (`paths.resolve`'s
 `extra_roots`); `apply_patch` does not get one, matching codex's own
 `helper_readable_roots`, which only ever widens what a sandbox may read.
 
+## Found when the chapter was rewritten
+
+- **Every citation line number was wrong**, and the tests agreed with it: the
+  `v1` line was cut off before counting and a section's end was counted from
+  its stripped body (lines 3-6 parsed as 3-4). Every test built its citations
+  from `entry.lines`, the parser's own output. The new test reads the expected
+  line out of the file.
+- **Every `--resume` added another copy of the memory block.** `MemoryWatcher`
+  now takes `shown=History.developer_notes()`, like chapter 13's watcher.
+- **Resuming without `--memory` left the old block in the conversation** while
+  the system message lost `INJECTION_RULE`. The watcher now says
+  `MEMORY_WITHDRAWN`, once.
+- **The web console (chapters 19 on) re-sent AGENTS.md and memory on every
+  message**; fixed there too.
+- **The drift check called `github.com` and `MEMORY.md` missing files.** It now
+  takes an extension list. `Node.js` is still flagged.
+- **`probe_memory.py`'s memory-off arm could `ls ..` its way to a memory
+  directory.** Memory now lives in a temporary directory outside the repo.
+
 ## Deliberately not done
 
 - **No memory generation.** That is the whole point of splitting the chapter.
@@ -183,7 +202,12 @@ needed a second, read-only boundary to reach it (`paths.resolve`'s
   gone; `SEARCH_BUDGET` stays, because a bound is not a request.
 - **No fix for the citation line-number problem.** Measured, not solved:
   0 of 9 citations resolved either wording tried, including one that told the
-  model to `grep -n` first. Recorded as an open gap rather than hidden.
+  model to `grep -n` first. Recorded as an open gap rather than hidden. That
+  measurement predates the line-number fix below, so some of the nine
+  "invented" ranges may have been right; it has not been re-run.
+- **The memory prompt still says "prior sessions in this repository"**, copied
+  from codex's wording, while memory here is global across repositories. Not
+  changed: a prompt edit is a measurement, and the rewrite had no API key.
 - **No embedding search.** Word overlap over a dozen sections, and a ranking
   problem would be indistinguishable from the thing being measured here.
 - **Sub-agents get no memory.** An absence in one function, like their missing

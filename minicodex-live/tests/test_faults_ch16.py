@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import pytest
 
@@ -41,7 +41,9 @@ from minicodex.memory import (
     ENTRIES_OPEN,
     INJECTION_RULE,
     MEMORY_MD_KIND,
+    MEMORY_REPLACED,
     MEMORY_SUMMARY_KIND,
+    MEMORY_WITHDRAWN,
     SEARCH_BUDGET,
     SUMMARY_FILE,
     SUMMARY_TOKEN_BUDGET,
@@ -93,12 +95,14 @@ def call(name: str, **arguments: object) -> ToolCall:
 
 
 def citation(memory: Memory, entry_id: str, note: str = "why it mattered") -> str:
-    """Build a real citation-entry line from an entry's actual line numbers.
+    """Build a citation-entry line from an entry's line numbers.
 
-    Never hand-typed line numbers: `parse_entries`/`load` are the only source
-    of truth for where a section actually starts and ends, and a test that
-    guesses would silently stop testing anything the day the fixture's
-    wording changed by one line.
+    Convenient, and it has a blind spot worth knowing about: a citation built
+    from `entry.lines` agrees with `parse_entries` by construction, so no test
+    using this helper can notice those numbers being wrong. They were -- one
+    too small at the start and short at the end -- until the chapter was
+    rewritten. `test_F16_13_line_numbers_are_the_ones_in_the_file` checks them
+    against the file itself, which is the test this helper cannot be.
     """
     entry = memory.by_id(entry_id)
     assert entry is not None, entry_id
@@ -1065,3 +1069,152 @@ def _sub_context(root: Path) -> SubAgentContext:
         parent_shell=ShellSession(cwd=root),
         wiring=Wiring(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Found when the chapter was rewritten
+# ---------------------------------------------------------------------------
+
+
+def test_F16_13_line_numbers_are_the_ones_in_the_file(tmp_path: Path) -> None:
+    """What a person sees in an editor, and what `grep -n` prints.
+
+    The first version cut the `v1` line off before counting, and counted a
+    section's end from its stripped body: a section on lines 3-6 came out as
+    3-4. Every test built its citations from `entry.lines`, so a citation and
+    the parser agreed with each other about the wrong numbers, and a model
+    citing the real lines had every one of them discarded as invented.
+    """
+    directory = tmp_path / "memories"
+    directory.mkdir()
+    text = (
+        "v1\n\n## Running tests\n\nUse `python -m pytest`.\nNever bare pytest.\n\n"
+        "## Code style\n\nDocstrings everywhere.\n"
+    )
+    (directory / BODY_FILE).write_text(text, encoding="utf-8")
+    lines = text.splitlines()
+    memory = load(directory)
+
+    first, second = memory.entries
+    assert first.lines == (3, 6) and second.lines == (8, 10)
+    assert lines[first.lines[0] - 1] == "## Running tests"
+    assert lines[first.lines[1] - 1] == "Never bare pytest."
+
+    cited = parse_citations("Done.\n" + citation_block(f"{BODY_FILE}:5-6|note=[runner]"), memory)
+    assert [c.entry for c in cited.used] == [first]
+    assert cited.discarded == ()
+
+
+def test_F16_13_blank_lines_above_the_marker_do_not_shift_the_count(tmp_path: Path) -> None:
+    directory = tmp_path / "memories"
+    directory.mkdir()
+    (directory / BODY_FILE).write_text("\n\nv1\n## Only\nbody\n", encoding="utf-8")
+    (entry,) = load(directory).entries
+    assert entry.lines == (4, 5)
+
+
+def test_F16_05_a_drift_note_does_not_cry_wolf_on_ordinary_prose(tmp_path: Path) -> None:
+    """Domains, and memory talking about its own files, are not repository paths.
+
+    Found by feeding the check a sentence a person would write instead of a
+    fixture written for the check: four "missing files", none of them files.
+    `Node.js` is still flagged -- `.js` is a real extension -- and this test
+    says so rather than pretending the list is a parser.
+    """
+    (tmp_path / "calc.py").write_text("x", encoding="utf-8")
+    summary = (
+        "- Docs live on docs.python.org; CI runs on github.com.\n"
+        "- The frontend is Node.js.\n"
+        "- Never edit helpers.py; see calc.py.\n"
+        "- e.g. this. Details are in MEMORY.md and memory_summary.md."
+    )
+    memory = Memory(directory=tmp_path / "memories", summary=summary)
+    assert missing_paths(memory, tmp_path) == ("Node.js", "helpers.py")
+
+
+def _block_of(memory: Memory) -> str:
+    block = MemoryWatcher(memory).refresh()
+    assert block is not None
+    return block
+
+
+def test_F16_11_a_resumed_session_is_not_shown_the_same_memory_again(tmp_path: Path) -> None:
+    """Three `--resume last` runs used to leave three copies in every request."""
+    memory = load(write_memory(tmp_path / "memories"))
+    earlier = _block_of(memory)
+    assert MemoryWatcher(memory, shown=(earlier,)).refresh() is None
+    # ...and the same when the block shared a note with AGENTS.md (`__main__`
+    # joins whatever both watchers say into one developer note).
+    joined = "## Project conventions (AGENTS.md)\n\nUse uv.\n\n" + earlier
+    assert MemoryWatcher(memory, shown=(joined,)).refresh() is None
+
+
+def test_F16_11_a_memory_that_changed_between_runs_replaces_the_old_one(tmp_path: Path) -> None:
+    directory = write_memory(tmp_path / "memories")
+    earlier = _block_of(load(directory))
+    (directory / SUMMARY_FILE).write_text("v1\n\n- Something new.\n", encoding="utf-8")
+    note = MemoryWatcher(load(directory), shown=(earlier,)).refresh()
+    assert note is not None
+    assert note.startswith(MEMORY_REPLACED)
+    assert "Something new" in note
+
+
+def test_F16_11_resuming_without_memory_withdraws_what_was_shown(tmp_path: Path) -> None:
+    """The fenced block stays in the conversation; the system message that
+    carried `INJECTION_RULE` does not. Said once, then never again."""
+    earlier = _block_of(load(write_memory(tmp_path / "memories")))
+    assert MemoryWatcher(None, shown=(earlier,)).refresh() == MEMORY_WITHDRAWN
+    assert MemoryWatcher(None, shown=(earlier, MEMORY_WITHDRAWN)).refresh() is None
+    assert MemoryWatcher(None).refresh() is None
+
+
+def test_F16_11_switching_memory_back_on_shows_it_plainly(tmp_path: Path) -> None:
+    memory = load(write_memory(tmp_path / "memories"))
+    earlier = _block_of(memory)
+    note = MemoryWatcher(memory, shown=(earlier, MEMORY_WITHDRAWN)).refresh()
+    assert note == earlier
+
+
+def test_F16_11_the_cli_resumes_without_repeating_memory(
+    tmp_path: Path, stub_url: str, served_requests: list[dict], monkeypatch: Any
+) -> None:
+    """The same thing through `main()`, which is where the watcher is built."""
+    from minicodex.__main__ import main
+
+    monkeypatch.chdir(tmp_path)
+    directory = write_memory(tmp_path / "memories")
+    base = ["--base-url", stub_url, "--yes", "--session-dir", str(tmp_path / "s")]
+    with_memory = ["--memory", "--memory-dir", str(directory)]
+    assert main(["ask", "what does this define?", *base, *with_memory]) == 0
+    assert main(["ask", "and again?", *base, *with_memory, "--resume", "last"]) == 0
+    assert main(["ask", "and now?", *base, "--resume", "last"]) == 0
+
+    last = served_requests[-1]["messages"]
+    notes = [m["content"] for m in last if m["role"] == "developer"]
+    assert sum(DATA_PREAMBLE in note for note in notes) == 1
+    assert notes[-1] == MEMORY_WITHDRAWN
+
+
+def test_F14_08_the_probe_keeps_memory_out_of_reach_of_every_workspace(
+    repo_root: Path,
+) -> None:
+    """`probe_memory.py` wrote each arm's memory next to the workspaces, one
+    `ls ..` away from every agent's shell -- the memory-off arm's included.
+    Memory now goes to a temporary directory outside the repository."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "probe_memory", repo_root / "probes" / "probe_memory.py"
+    )
+    assert spec is not None and spec.loader is not None
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+
+    memory = probe.memory_for(by_name("runner"), "test")
+    try:
+        assert not memory.directory.is_relative_to(repo_root)
+        assert not memory.directory.is_relative_to(probe.SCRATCH)
+    finally:
+        import shutil
+
+        shutil.rmtree(probe.MEMORY_SCRATCH, ignore_errors=True)
