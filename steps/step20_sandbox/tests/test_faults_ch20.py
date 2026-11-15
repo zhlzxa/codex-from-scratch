@@ -125,16 +125,26 @@ def test_F20_02_a_missing_binary_is_reported_before_anything_runs(tmp_path: Path
     assert "full-access" in why  # names the way out, not just the problem
 
 
-def test_F20_02_for_mode_does_not_silently_fall_back(tmp_path: Path) -> None:
+def test_F20_02_for_mode_does_not_silently_fall_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The fault this whole fault-id is about.
 
     A factory that returned `NoSandbox()` when bubblewrap is missing would be
     the tidy version and the dangerous one: `read-only` would keep its name
     and lose its meaning. `for_mode` always returns the real thing and lets
     `unavailable()` speak.
+
+    bubblewrap is made missing here rather than assumed missing. The first
+    version relied on the machine: it was written where there is no `bwrap`,
+    so the fallback it guards against would have triggered there -- and on a
+    machine that has `bwrap` the fallback never triggers and the test passed
+    with it in place. Found when chapter 20 was rewritten, on such a machine.
     """
+    monkeypatch.setattr("minicodex.sandbox.shutil.which", lambda _name: None)
     sandbox = for_mode("read-only", tmp_path)
     assert isinstance(sandbox, BubblewrapSandbox)
+    assert sandbox.unavailable() is not None
 
 
 def test_F20_02_no_sandbox_says_so_when_asked(tmp_path: Path) -> None:
@@ -200,16 +210,6 @@ def test_F20_05_the_message_survives_leading_whitespace() -> None:
     assert setup_failure("\n  bwrap: Unknown option --nope\n", 1) == "Unknown option --nope"
 
 
-def test_F20_05_an_unreachable_cwd_is_detected_before_running(tmp_path: Path) -> None:
-    """Chapter 13 recorded that `cd` is not containment-checked and a cwd can
-    wander outside the sandbox root. For nineteen chapters that was harmless;
-    with a fixed bind set it makes every later command fail with a message
-    naming the wrong cause."""
-    sandbox = BubblewrapSandbox(SandboxSpec.for_mode("workspace-write", tmp_path))
-    assert sandbox.chdir_is_reachable(str(tmp_path)) is True
-    assert sandbox.chdir_is_reachable(str(tmp_path / "nope" / "nothing")) is False
-
-
 # ---------------------------------------------------------------------------
 # F20-06  the timeout has to reach through the wrapper
 # ---------------------------------------------------------------------------
@@ -231,10 +231,10 @@ def test_F20_06_the_pid_namespace_is_requested(tmp_path: Path) -> None:
 
 def test_F20_07_extra_read_roots_reach_the_bind_set(tmp_path: Path) -> None:
     """Chapter 16 gave `read_file` a second boundary so it could reach
-    `~/.minicodex/memories`. That boundary is enforced in Python. The shell's
-    is enforced by the kernel, and neither knows about the other -- a path
-    added to one and not the other produces a tool that can read a file its
-    sibling cannot.
+    `~/.minicodex/memories`. That boundary is enforced in Python. The sandbox
+    already lets the shell *read* everything (`--ro-bind / /`), so what
+    passing the same root here buys is that it stays read-only inside a
+    writable workspace -- see the two tests below.
     """
     memories = tmp_path / "home" / "memories"
     memories.mkdir(parents=True)
@@ -522,3 +522,51 @@ def test_F20_08_a_tenant_layout_differs_from_the_default_by_a_prefix(tmp_path: P
     assert tenant.memories().relative_to(tenant.root()) == single.memories().relative_to(
         single.root()
     )
+
+
+# ---------------------------------------------------------------------------
+# Found when the chapter was rewritten
+# ---------------------------------------------------------------------------
+
+
+def test_full_access_without_the_network_can_still_write_everywhere(tmp_path: Path) -> None:
+    """`full-access` minus the network is the one wrapped `full-access`, and
+    `writable()` used to give it nothing -- so it could not write anywhere,
+    not even its own workspace, under the name that means "no boundary"."""
+    spec = SandboxSpec(mode="full-access", root=tmp_path, network=False)
+    argv = BubblewrapSandbox(spec).wrap("echo hi", cwd=str(tmp_path))
+    assert argv is not None
+    assert "--unshare-net" in argv
+    assert ("/", "/") in _pairs(argv, "--bind")
+    # The writable bind comes after the read-only one, so it is the one that wins.
+    assert argv.index("--bind") > argv.index("--ro-bind")
+
+
+@needs_bwrap
+def test_full_access_without_the_network_writes_against_a_kernel(tmp_path: Path) -> None:
+    import subprocess
+
+    target = tmp_path / "written.txt"
+    spec = SandboxSpec(mode="full-access", root=tmp_path, network=False)
+    argv = BubblewrapSandbox(spec).wrap(f"echo hi > {target}", cwd=str(tmp_path))
+    assert argv is not None
+    got = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    assert got.returncode == 0, got.stderr
+    assert target.read_text() == "hi\n"
+
+
+@needs_bwrap
+def test_a_read_root_inside_the_workspace_cannot_be_written(tmp_path: Path) -> None:
+    """What `read_roots` is actually for. Reading needs no bind at all under
+    `--ro-bind / /`; a read root earns its place by staying read-only inside
+    a writable hole."""
+    import subprocess
+
+    ws = tmp_path / "ws"
+    inner = ws / "memories"
+    inner.mkdir(parents=True)
+    (inner / "MEMORY.md").write_text("keep\n")
+    argv = _wrap("workspace-write", ws, f"echo more >> {inner / 'MEMORY.md'}", read_roots=(inner,))
+    got = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    assert got.returncode != 0
+    assert (inner / "MEMORY.md").read_text() == "keep\n"
