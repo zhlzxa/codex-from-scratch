@@ -2,19 +2,73 @@
 
 > **代码**：`steps/step17_memory_write/`
 > **分支**：`feat/memory-write`
-> **产出**：`memory_write.py`（抽取、合并、脱敏、遗忘、单写者）、`memory_jobs.py`
-> （认领/租约/退避，本书第一个数据库）、`--remember` 开关、
-> `minicodex memory --jobs / --remember-now`
-> **你需要**：本章 56 个测试全部离线。`probe_memory_write.py` 九节里三节离线，
-> 六节要真调 API（openai，几美分）
->
-> **阅读顺序在第 15 章之前，编号在其之后。** 理由在第 16 章 §1.3。
+> **产出**：上一章的记忆是人手写的；这一章让程序自己从过去的会话里**写**记忆，并且学会**删**。两个新模块：`memory_write.py`（抽取、合并、脱敏、遗忘、单写者）和 `memory_jobs.py`（本书第一个数据库：哪些会话已经变成记忆了、谁在处理）。命令行多一个 `--remember` 开关，`minicodex memory` 多 `--jobs` 和 `--remember-now`
+> **前置**：做完第 16 章。本章 66 个测试全部不联网。探针 `probe_memory_write.py` 九段里 `race`、`forget` 两段不联网，其余要真的请求 OpenAI；这次改写时手边没有 key，那几段的数字是第一次写这一章时（2026-08-15 至 16）量的，正文每处都照原样保留并注明。不联网的输出这次在 Linux 上重跑过，和原来不一样的地方都说了
+> **阅读顺序在第 15 章之前，编号在其之后。**
+> **这一章可以分四次读**：§1–§4 是结构、时机和那个数据库；§5–§7 是"记什么、不记什么"（抽取、脱敏、额度）；§8–§12 是"谁能写、怎么合、怎么忘、怎么让用户看见"；§13 往后是结果、验证和收工
+
+---
+
+## §0 开工前的准备
+
+### 0.1 本章会遇到的新概念
+
+- **抽取（extract）**：读一次已经结束的会话，判断里面有没有值得长期记住的东西，有就写成几句话。这一章的"第一段"。
+- **合并（merge / consolidate）**：把好几次抽取的结果、模型提议的笔记、用户手改的内容，合进第 16 章那两个文件里。"第二段"。
+- **后台任务**：和用户的问题**同时**跑、用户不用等它的工作。在 Python 里是一个 `asyncio.Task`。
+- **任务表（job table）**：一张表，每一行是一次会话，记着它的状态——等着处理（`pending`）、有人在处理（`claimed`）、处理完了（`done`）、放弃了（`failed`）。
+- **认领（claim）**：一个进程说"这几行归我了"。关键是**两个进程不能认领到同一行**。
+- **租约（lease）**：认领带一个过期时间。进程如果死了，过期之后别人可以重新认领。
+- **退避（backoff）**：失败了不马上重试，等一会儿，而且每次等更久。
+- **SQLite**：一个装在一个文件里的数据库，Python 自带（`import sqlite3`）。它能保证"同一时间只有一个进程在改这张表"。
+- **事务（transaction）**：一组数据库操作，要么全部生效，要么全部不生效；在它进行时别人看不到一半的状态。
+- **脱敏（redaction）**：把看起来像密钥、令牌的字符串换成 `<redacted>`。
+- **单写者（single writer）**：一个文件同一时间只允许一个进程写。第 7 章用一个"锁文件"做到过。
+- **`git diff`**：比较"现在的文件"和"上次提交的版本"差在哪。这一章拿它来回答"用户手改了什么"。
+- **遗忘（forgetting / pruning）**：记忆不能只增不减；按某种规则把条目删掉。
+
+### 0.2 本章会遇到的新 Python 写法
+
+| 写法 | 意思 |
+|---|---|
+| `sqlite3.connect(path, isolation_level=None)` | 打开一个数据库文件。`isolation_level=None` 表示"别替我自动开事务"，事务由我自己写 `BEGIN`/`COMMIT` |
+| `db.execute("SELECT ... WHERE x = ?", (value,))` | 执行一条 SQL。`?` 是占位符，值放在后面的元组里——**不要**把值拼进字符串（那会让数据变成 SQL） |
+| `cursor.fetchall()` / `fetchone()` | 取出查询结果的全部行 / 第一行 |
+| `db.row_factory = sqlite3.Row` | 让每一行可以按列名取：`row["state"]` |
+| `cursor.rowcount` | 这条语句影响了几行 |
+| `with JobStore(path) as store:` | 用完自动关掉。类上写了 `__enter__` 和 `__exit__` 就能这么用 |
+| `asyncio.ensure_future(coro)` | 把一个协程变成一个**马上开始在后台跑**的任务 |
+| `asyncio.wait_for(x, timeout)` | 最多等 `timeout` 秒，超时抛 `TimeoutError` |
+| `asyncio.shield(task)` | 等它，但超时的时候**别取消它**（`wait_for` 默认会取消） |
+| `task.cancel()` / `task.done()` | 取消一个任务 / 它结束了没有 |
+| `subprocess.run([...], capture_output=True, text=True, timeout=30)` | 启动一个外部程序（这一章是 `git`），等它结束，拿回它的输出 |
+| `re.compile(..., re.S)` | 同 `re.DOTALL`：`.` 也匹配换行 |
+| `pattern.subn(repl, text)` | 替换，并且告诉你替换了几处：返回 `(新文字, 次数)` |
+| `os.open(path, os.O_CREAT \| os.O_EXCL \| os.O_WRONLY)` | 创建一个文件，**已经存在就失败**——第 7 章的锁就是这么做的 |
+| `callable(x)` | `x` 能不能被调用（是不是一个函数） |
+| `getattr(obj, name)` | 按名字取属性：`getattr(stage1, "preferences")` 就是 `stage1.preferences` |
+| `dict.fromkeys(xs)` | 用 `xs` 当键造一个字典；常用来"去重并保持顺序" |
+| `**extra` 写在函数调用里 | 把一个字典展开成关键字参数 |
+
+### 0.3 开分支
+
+```bash
+git switch main
+git pull
+git switch -c feat/memory-write
+```
+
+### 0.4 读这一章要注意的一件事
+
+这一章是在第 16 章**重写之前**写的，后来第 16 章重写了两次（一次对照 codex，一次是给新手改写），每次都回头改过这一章。所以正文里会提到"第 16 章重测之后"这样的话。有几个第 16 章的数字后来又变得不可靠了（第 16 章 §5.3 的行号 bug），用到它们的地方都标了。
 
 ---
 
 ## §1 这一章要做出来的东西
 
 ### 1.1 先看见它动
+
+（这一节和后面大多数的模型输出，都是第一次写这一章时在 Windows 上实测的，2026-08-15 至 16，`gpt-4o-mini`。这次改写手边没有 key，没有重量。）
 
 一个空目录，两个文件，什么记忆都没有。第一次运行，多带一个 `--remember`：
 
@@ -250,6 +304,201 @@ MERGE_LOCK = MINICODEX_HOME / "memory_merge.lock"
 
 ---
 
+### 2.5 代码：一个家目录，和写路径的几个常量
+
+第 16 章把记忆目录写成了完整路径。这一章要在它**旁边**再放两样东西（锁和任务库），"旁边"只有在"上一层"有名字之后才说得出来。`src/minicodex/memory.py` 里改成：
+
+```python
+# This program's equivalent of codex's `codex_home` -- the one directory
+# everything durable about *this user*, across every repository, lives under.
+# Chapter 16 wrote the memory path out in full; this chapter needs the parent
+# to have a name, because the write path adds two more things beside the
+# memory directory rather than inside it (`memory_write.MERGE_LOCK`,
+# `memory_jobs.DEFAULT_JOBS_PATH`) and "beside" is only sayable once "the
+# parent" is. codex has exactly this shape: `memory_root()` is
+# `codex_home.join("memories")` (`memories/write/src/lib.rs:116-117`, and the
+# same function again on the read side at `memories/read/src/lib.rs:13-15`),
+# while the job and lease rows live in their own SQLite database elsewhere
+# under the same home (`state/memory_migrations/0001_memories.sql`), never
+# inside the directory the model is shown.
+MINICODEX_HOME = Path.home() / ".minicodex"
+
+# Global, under the user's own home directory, on purpose: a memory is a fact
+# about *this person* working in many repositories, not a fact pinned to one
+# checkout. The first version of this module put it at `.minicodex/memories`,
+# inside the repository, and that was simply wrong -- not a defensible
+# simplification, a design nobody checked (F16-10). Moving it here is why
+# `read_file` needed a second boundary (`paths.resolve`'s `extra_roots`,
+# `composition.local_tools`' `extra_read_roots`): the memory directory is not
+# under `sandbox_root` any more, and it still has to be reachable.
+DEFAULT_MEMORY_DIR = MINICODEX_HOME / "memories"
+```
+
+> `MINICODEX_HOME` 是"这个用户、跨所有仓库的东西放在哪"。记忆在它下面的 `memories/`，锁和任务库也在它下面，但**不在** `memories/` 里（§2.1 说了为什么）。
+
+新建 `src/minicodex/memory_write.py`。开头是模块说明、导入和常量：
+
+```python
+"""Memory, write side: extract, merge, and forget.
+
+Chapter 16 read a memory a person had written.  This module is what writes one,
+and it is two stages with a temporary file between them, because they are two
+different jobs:
+
+* **Stage 1, per session.**  One finished conversation in, at most a handful of
+  durable statements out.  Cheap, parallelisable, and allowed -- encouraged --
+  to produce nothing at all.  codex runs its equivalent eight at a time
+  (`CONCURRENCY_LIMIT: usize = 8`, `memories/write/src/lib.rs:81`); this one
+  runs them one after another, because two is the batch size and a pool for
+  two items is a pool for nobody.
+* **Stage 2, per memory.**  Every pending stage-1 output, plus whatever the
+  model proposed during a session, plus whatever the *user* edited by hand,
+  merged into the two files chapter 16 reads.  Runs under a lock, once.
+
+The seam between them is `raw/<session id>.md`, and it says in its own first
+lines that it is temporary.  codex writes the same kind of file with the same
+warning -- "Temporary file: merged raw memories from Phase 1. Input for Phase
+2." (`memories/write/templates/memories/consolidation.md:29`) -- and the
+reason is not tidiness: an intermediate product that does not say it is
+intermediate is one somebody starts maintaining.
+
+Three rules that shape everything below.
+
+**The model never writes the memory files.**  It writes stage-1 output, it can
+append a note, and that is the whole of its access.  Both of those are
+*proposals*; this module is the only thing that opens `MEMORY.md` for writing,
+it validates before it does, and it holds a lock while it does.  Chapter 7
+refused two writers on a rollout and chapter 8 refused two concurrent writers
+of a file; this is the same rule arriving a third time, and F17-09 is what it
+looks like when it is missing.
+
+**Forgetting is a feature, not a maintenance script.**  A memory that only
+grows is one nobody dares read and nobody dares delete.  Entries leave by
+citation count first (chapter 16's `usage.json`), recency second, and age only
+as a tie-breaker -- the nine-month-old entry consulted every week is the one a
+by-age rule deletes first (F17-07).
+
+**Nothing here is on by default.**  `--remember` is a flag, the directory is
+somewhere a user can see, and one command deletes all of it (F17-11).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from minicodex.agent_types import ToolSet
+from minicodex.clip import clip
+from minicodex.history import (
+    AssistantMessage,
+    ToolResult,
+    UserMessage,
+)
+from minicodex.memory import (
+    BODY_FILE,
+    FORMAT_VERSION,
+    MINICODEX_HOME,
+    SUMMARY_FILE,
+    SUMMARY_TOKEN_BUDGET,
+    USAGE_FILE,
+    Entry,
+    Memory,
+    overflows,
+    parse_entries,
+)
+from minicodex.rollout import Rollout
+from minicodex.tokens import estimate_messages
+from minicodex.tool_errors import tool_error
+
+# Stage-1 output, one file per session.  Inside the memory directory rather
+# than beside the sessions, because it is memory-shaped material and because
+# `--forget-all` has to be able to find it: a user who deletes their memory and
+# leaves a directory of extracted preferences behind has not deleted their
+# memory.
+RAW_DIR = "raw"
+
+# What a *model* may add, and the only thing it may add.  codex calls the same
+# directory `extensions/ad_hoc/notes/` and its read-path prompt states the rule
+# in as many words: propose, never edit.  One file per note, named by time and
+# pid, so two writers cannot collide and nothing is ever overwritten -- chapter
+# 7's append-only, applied to a directory instead of to a file.
+NOTES_DIR = "notes"
+
+# The single-writer lock for stage 2.  Outside the memory directory, next to
+# the jobs database, for the same reason: the memory directory is a git
+# repository and its contents are the material being diffed.
+#
+# Under `MINICODEX_HOME` rather than under the repository, and that moved in
+# this chapter's rewrite along with the memory directory itself (F17-12).  It
+# has to: the lock guards writes to `~/.minicodex/memories`, which is one
+# directory shared by every checkout on the machine, so a per-repository lock
+# would let two repositories merge the same memory at the same time -- the
+# exact race the lock exists to prevent, reintroduced by the lock being in the
+# wrong place.  codex keeps the same separation for the same reason: the
+# memory root is global (`memories/write/src/lib.rs:116-117`) and its job and
+# lease state is global too, in its own database
+# (`state/memory_migrations/0001_memories.sql`), never inside the directory
+# the model reads.
+#
+# This is the *second* implementation of chapter 7's `O_EXCL` lock file and it
+# is a deliberate copy, not an extraction.  The rule of three says the second
+# occurrence is copied with a note pointing at the first; a third site --
+# something else in this program needing "one process at a time, and say whose
+# pid it is" -- is what would justify a `locks.py`.  Two sites of twelve lines
+# do not.
+MERGE_LOCK = MINICODEX_HOME / "memory_merge.lock"
+
+# How much of one session goes to the extractor.  Sessions are long, the useful
+# part of them is not, and the alternative to a bound here is chapter 6 all
+# over again in a place with no compaction loop.
+TRANSCRIPT_TOKEN_BUDGET = 6000
+
+# How much of one tool result survives into the transcript.  Chapter 2's clip,
+# at chapter 2's shape (head and tail): the beginning of a stack trace is where
+# the failure is named and the end is where the exit code is.
+TOOL_RESULT_CHARS = 800
+
+# How many entries the body file may hold, and how long an uncited entry lives.
+# Both are ceilings rather than targets -- a memory of eight good sections
+# never approaches either.
+MAX_ENTRIES = 40
+UNUSED_DAYS = 30.0
+
+# Below this much remaining quota, the background writer does not run at all.
+# codex's own number and its own default: `DEFAULT_MEMORIES_MIN_RATE_LIMIT_
+# REMAINING_PERCENT: i64 = 25` (`config/src/types.rs:49`), configurable as
+# `memories.min_rate_limit_remaining_percent` (`config/src/types.rs:314,333`)
+# and checked before the pipeline runs at all -- `guard::rate_limits_ok`
+# (`memories/write/src/guard.rs:9,38`), which reads it, asks the backend for a
+# rate-limit snapshot, and skips the whole run if the remaining capacity is
+# under it.  The general rule it encodes is worth more than the number:
+# **background work gives way to foreground work**, and the failure it prevents
+# is the one where a user's actual task fails because the program was busy
+# writing notes to itself.
+MIN_RATE_LIMIT_REMAINING_PERCENT = 25.0
+
+
+class MemoryWriteError(RuntimeError):
+    """The write path refused to do something."""
+```
+
+> - 模块说明里那三条规则是整章的骨架：**模型永远不直接写记忆文件**（它只能提案，§8）；**遗忘是功能，不是维护脚本**（§10）；**默认什么都不开**（§12）。
+> - **`RAW_DIR`**、**`NOTES_DIR`**：记忆目录里的两个子目录。前者放第一段的输出，后者放模型提议的笔记。
+> - **`MERGE_LOCK`**：第二段的单写者锁，在 `MINICODEX_HOME` 下、记忆目录外。注释里第二段讲了为什么它必须跟着记忆一起搬到家目录：一份全局共享的记忆，配一把每个仓库各一份的锁，等于没有锁。第三段是 §2.4 那个"抄一份，不抽象"的决定。
+> - **`TRANSCRIPT_TOKEN_BUDGET`**、**`TOOL_RESULT_CHARS`**：一次会话交给抽取器之前最多多大、每条工具结果最多留多少字。会话可能很长，有用的部分不长。
+> - **`MAX_ENTRIES`**、**`UNUSED_DAYS`**：记忆最多几节、一条没被引用过的条目最多活多久（§10）。
+> - **`MIN_RATE_LIMIT_REMAINING_PERCENT`**：服务商剩余额度低于 25% 时，后台写入一次都不跑（§7）。这是 codex 的数字。
+> - `MemoryWriteError`：写路径拒绝做某件事时抛的异常。
+
+`render_stage1`（§2.3 里那个"说自己是临时文件"的函数）完整的样子在 §5.9。
+
 ## §3 F17-01：把它挪到下一次会话的开头
 
 ### 3.1 先量它有多贵
@@ -371,6 +620,172 @@ MAX_PER_STARTUP = 2
 
 ---
 
+### 3.5 代码：在 `_ask` 里启动它，在答案之后收它
+
+`_ask` 里，在 `agent.run(question)` 之前：
+
+```python
+# Started here, before the first request, and left to run beside it.  This
+# is F17-01's whole fix: the same work at the *end* of a run is fourteen
+# measured seconds between the answer and the user's prompt coming back,
+# for something the user did not ask for.  Beside the run it costs nothing
+# anybody waits for, and what it consumes is the *previous* sessions --
+# this one is not finished and is excluded by name.
+#
+# Its own client, built with an empty tool list: the writer is two model
+# calls with no tools, and handing it this run's schemas would pay for
+# them on every request it makes for nothing.
+writer_task: asyncio.Task[Any] | None = None
+if remember is not None:
+    writer_task = asyncio.ensure_future(
+        run_pipeline(
+            make_model([]),
+            directory=remember,
+            sessions_dir=session_dir,
+            jobs_path=jobs_path,
+            exclude=(current.session_id,),
+            # A question, not a number: nothing has seen a rate-limit
+            # header yet at this line.  See `run_pipeline`.
+            headroom=lambda: llm.rate_limit.headroom() if llm.rate_limit else None,
+        )
+    )
+```
+
+> - **`asyncio.ensure_future(run_pipeline(...))`**：§0.2。这一行之后，写入管线就在后台开始跑了；下面的 `agent.run(question)` 不等它。两者交替使用同一个事件循环——谁在等网络，谁就让出来。
+> - **`exclude=(current.session_id,)`**：这次会话还没结束（问题都还没回答），不能拿去抽取。
+> - **`headroom=lambda: ...`**：§7.4 那个"为什么是函数而不是数"。
+> - `run_pipeline` 本身在 §13.4。
+
+前台失败的那条路上（`except ModelFailed`）：
+
+```python
+        if writer_task is not None:
+            print(f"[{await _finish_writer(writer_task, grace=0.0)}]", file=sys.stderr)
+```
+
+正常结束时，打印完那几行状态之后：
+
+```python
+    if writer_task is not None:
+        print(f"[{await _finish_writer(writer_task)}]")
+```
+
+`_finish_writer` 和它的宽限期：
+
+```python
+# How long the run waits for the background writer once the answer is on
+# screen.  Not zero -- a one-turn session is over before the writer's first
+# request comes back, and a feature that only works on long sessions is a
+# feature nobody can predict.  Not unbounded either, for the reason the writer
+# is in the background at all.
+WRITER_GRACE_SECONDS = 30.0
+
+
+async def _finish_writer(task: asyncio.Task[Any], *, grace: float = WRITER_GRACE_SECONDS) -> str:
+    """Collect the background writer's report, or leave it for the next run.
+
+    `wait_for(shield(...))` rather than a bare `wait_for`, which is chapter
+    10's measured lesson (F10-07) in a second place: a bare one cancels the
+    task it is waiting on, and a cancelled pipeline that has already written
+    its raw files would look, from here, exactly like one that did nothing.
+
+    Cancelling is a normal outcome and not an error.  The claim it took is
+    still in the database with a lease on it, and the lease expiring is how the
+    next run picks the work up -- which is the answer to "why a lease and not a
+    flag" (F17-03).  Nothing needs undoing, because the only write that ever
+    happens is the last thing the pipeline does.
+    """
+    if not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), grace)
+        except TimeoutError:
+            task.cancel()
+            return f"memory writer: still going after {grace:.0f}s, left for the next run"
+        except Exception:
+            # The writer failed while it was being waited for. `wait_for`
+            # re-raises the task's own exception, and the first version let
+            # it out of this function from here, before the handler below
+            # was ever reached.
+            pass
+    try:
+        return (await task).describe()
+    except asyncio.CancelledError:
+        return "memory writer: stopped, left for the next run"
+    except Exception as exc:
+        # Never fatal.  A run that answered the user's question correctly does
+        # not become a failed run because a note-taking job could not write a
+        # file -- chapter 16's `record_uses` swallows for the same reason, one
+        # size up.
+        #
+        # `Exception`, and the first version listed four types instead:
+        # `MemoryWriteError`, `MemoryError_`, `OSError`, `ModelFailed`. The
+        # last of those is what the *agent loop* raises after chapter 12's
+        # retries; the writer has no loop, so a provider error reaches here as
+        # the client's own `ModelHTTPError` or an `httpx` error, which were not
+        # on the list. A 500 during the merge printed the user's answer and
+        # then a traceback, exit code 1 -- the exact thing this comment says
+        # cannot happen. Found when the chapter was rewritten.
+        return f"memory writer: failed, nothing written ({type(exc).__name__}: {exc})"
+```
+
+> - **`WRITER_GRACE_SECONDS = 30.0`**：答案打出来之后，最多再等写入 30 秒。不是 0——一次一轮就结束的会话，写入的第一个请求还没回来；也不是无限——那就回到了"用户在等"。
+> - **`asyncio.wait_for(asyncio.shield(task), grace)`**：最多等 `grace` 秒；超时的时候，`shield` 保证 `wait_for` 不会顺手把写入任务取消掉（第 10 章 F10-07）。然后**我们自己**决定取消它：`task.cancel()`。被取消的认领由租约在 5 分钟后收回（§4.4），什么都不用回滚。
+> - **`return (await task).describe()`**：任务结束了，取它的报告，变成一行字。
+> - 最后两个 `except`：§3.6。
+
+### 3.6 改写时发现：合并时服务商一报错，用户就看到一段 traceback
+
+`_finish_writer` 的注释第一版就写着："**绝不致命**。一次正确回答了用户问题的运行，不能因为一个记笔记的任务写不了文件就变成失败的运行。"
+
+第一版是这么接的：
+
+```python
+    except (MemoryWriteError, MemoryError_, OSError, ModelFailed) as exc:
+        return f"memory writer: failed, nothing written ({type(exc).__name__}: {exc})"
+```
+
+四种异常。看最后一个 `ModelFailed`——那是第 12 章 **Agent 循环**在重试用完之后抛的。而写入管线**没有循环**：它直接调用客户端的 `stream()`（§5.9 的 `_ask`）。所以服务商在合并时报个 500，到这里的是客户端自己的 `ModelHTTPError`；连接断了，是 `httpx` 的异常。**两个都不在名单上。**
+
+后果：用户的答案已经打印出来了，然后屏幕上是一段 traceback，退出码 1。正是注释说"不能发生"的那件事。
+
+改写时又发现第二条路：上面那个 `except` 只在 `return (await task)` 那一行生效。如果写入任务是在**宽限期里**、也就是 `await asyncio.wait_for(...)` 的时候失败的，`wait_for` 会把任务的异常原样抛出来——而那个 `try` 只接 `TimeoutError`。所以要两处都改：
+
+> - `wait_for` 那里多一个 `except Exception: pass`——失败的事交给下面统一报告；
+> - 下面那个 `except` 改成 `Exception`。注释里写了为什么列名单不行。
+
+为什么不是 `BaseException`：`KeyboardInterrupt`（Ctrl-C）和 `CancelledError` 不是"写入失败"，是用户或程序在叫停，它们得穿过去（第 7 章 F07-04）。
+
+`minicodex memory --remember-now`（§12）那条前台的路是同一个问题，同样改成 `except Exception`：那里用户就站在面前等着，一个服务商错误应该是一句话加一个退出码，不是 traceback。
+
+```python
+def test_a_provider_error_in_the_merge_is_reported_not_raised(tmp_path: Path) -> None:
+    """`_finish_writer` caught four named exception types, and `ModelFailed`
+    -- the agent loop's -- was one of them. The writer has no loop: a 500
+    during the merge arrives as the client's own `ModelHTTPError`, which was
+    not on the list, and the CLI printed the user's answer followed by a
+    traceback and exit code 1."""
+    from minicodex.__main__ import _finish_writer
+    from minicodex.model import ModelHTTPError
+
+    async def failing() -> Any:
+        raise ModelHTTPError(status=500, url="u", headers={}, body="boom")
+
+    async def scenario(already_finished: bool) -> str:
+        task = asyncio.ensure_future(failing())
+        if already_finished:
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        return await _finish_writer(task, grace=1.0)
+
+    # Both orders: failed before the answer was printed, and failed while the
+    # CLI was waiting for it -- the second escaped by a different route.
+    for already_finished in (True, False):
+        line = asyncio.run(scenario(already_finished))
+        assert line.startswith("memory writer: failed, nothing written (ModelHTTPError"), line
+```
+
+> 两种顺序都测：写入任务在答案打印之前就失败了，和在等它的时候失败。第二种走的是另一条路，第一版的修法只修了第一种——测试里这个循环就是被第二种逼出来的。
+
 ## §4 F17-03：本书第一个数据库，以及"先 select 再 update"不是认领
 
 ### 4.1 为什么现在才上数据库
@@ -424,7 +839,7 @@ $ uv run python probe_memory_write.py race
   BEGIN IMMEDIATE            3 workers claimed 6 job(s), 6 distinct, 0 duplicate(s)
 ```
 
-跑四次，四次一模一样。**三个进程认领了同一批两条，六次认领里四次是重复的。**
+跑四次，四次一模一样。**三个进程认领了同一批两条，六次认领里四次是重复的。**（这是第一次写这一章时在 Windows 上的结果。改写时在 Linux 上重跑，六次里三次有重复——§4.6。）
 
 不是"偶尔"。Python 的 `sqlite3` 默认在第一条 DML 语句上开事务，
 **`SELECT` 不算 DML**——所以那个 select 根本不在任何事务里，
@@ -505,6 +920,599 @@ $ uv run python probe_memory_write.py race
 
 ---
 
+### 4.5 代码：`memory_jobs.py`
+
+新建 `src/minicodex/memory_jobs.py`。模块说明（§4.1 引过前半段）、导入和常量：
+
+```python
+"""Which sessions have been turned into memory, which are being worked on, and by whom.
+
+This is the first database in the program, sixteen chapters in, and the reason
+is worth stating because "use a database" is the kind of decision that arrives
+with no argument attached.  Chapter 7 stores a conversation and chose an
+append-only JSONL file: one writer, no updates, and the worst case is a missing
+tail.  What is stored here is the opposite of that on every axis --
+
+* every row is **updated** (pending -> claimed -> done),
+* rows are **contended**: two `minicodex` processes starting at the same moment
+  both want the same unprocessed sessions, and one of them must lose,
+* the losing has to be **atomic**, or both of them do the work.
+
+A JSON file would need a lock around every read-modify-write, and the lock is
+the part that is hard to get right.  `sqlite3` is in the standard library, it
+has that lock, and it has been tested by more people than this program will
+ever have users.  codex keeps the same two facts in the same kind of place --
+`state/memory_migrations/0001_memories.sql`, which creates exactly two tables:
+`stage1_outputs` (one row per extracted rollout, keyed by `thread_id`) and
+`jobs` (keyed by `(kind, job_key)`, carrying `status`, `lease_until`,
+`retry_at`, `retry_remaining` and a pair of watermark columns).  The lease and
+retry columns below are that table's, one name at a time.
+
+The jobs database lives **outside** the memory directory.  That directory is a
+git repository (F17-08) and a binary file rewritten on every operation is the
+one thing that must not be in one: every commit would carry a blob no diff can
+read, which is exactly the material the merge step needs a diff of.
+"""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import time
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from minicodex.memory import MINICODEX_HOME
+from minicodex.rollout import RolloutError, read_rollout
+
+# Beside the memory directory, not inside it, and under the user's home rather
+# than under the repository -- the same move the memory directory itself made
+# in this chapter's rewrite (F17-12).  The reason it has to follow: this table
+# records which *sessions* have been turned into memory, and the memory it
+# feeds is now one global directory, so a per-repository jobs database would
+# let the same session be extracted once per checkout.
+DEFAULT_JOBS_PATH = MINICODEX_HOME / "memory_jobs.sqlite3"
+
+# How long a claim is good for.  Not "until the process says it is done": a
+# process that is killed says nothing, and a flag would leave the session
+# unprocessable forever.  Five minutes is long enough for two model calls on a
+# slow provider and short enough that a crashed run is retried the same
+# afternoon.
+LEASE_SECONDS = 300.0
+
+# How many sessions one startup will consume.  codex ships the same number as
+# a configurable default -- `DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP: usize
+# = 2` (`config/src/types.rs:46`), surfaced as `memories.max_rollouts_per_
+# startup` (`config/src/types.rs:309,331`) and read into its Phase-1 claim as
+# `max_claimed` -- and the number matters less than its existence: a user who
+# has not run the writer for a month has ninety sessions waiting, and "catch up
+# on all of them" is a program that appears to hang on the day it is switched
+# on.
+MAX_PER_STARTUP = 2
+
+# Retry, then stop.  A rollout that fails extraction three times is not going
+# to start working: the usual cause is that it is enormous, or that the model
+# refuses it, and both are properties of the file rather than of the moment.
+MAX_ATTEMPTS = 3
+
+# Doubling, from one minute.  The failure this backs off from is usually a
+# provider one, and chapter 12 already measured what an immediate retry of an
+# impossible request costs -- the quota, and then a 429 for the foreground.
+BACKOFF_BASE_SECONDS = 60.0
+```
+
+> - **`DEFAULT_JOBS_PATH`** 在 `MINICODEX_HOME` 下，不在记忆目录里（§2.1）。
+> - **`LEASE_SECONDS = 300.0`**：认领 5 分钟有效。注释说了为什么是租约而不是一个"处理中"的标记：被杀掉的进程什么都不会说，一个标记会让那条会话永远处理不了。
+> - **`MAX_PER_STARTUP = 2`**：§3.4。
+> - **`MAX_ATTEMPTS = 3`**、**`BACKOFF_BASE_SECONDS = 60.0`**：失败三次就放弃；每次重试前等 60 秒、120 秒……
+
+表结构和一行任务：
+
+```python
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    session_id  TEXT PRIMARY KEY,
+    path        TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    lease_until REAL NOT NULL DEFAULT 0,
+    claimed_by  TEXT,
+    not_before  REAL NOT NULL DEFAULT 0,
+    detail      TEXT,
+    updated     REAL NOT NULL DEFAULT 0
+);
+"""
+
+
+@dataclass(frozen=True)
+class Job:
+    """One session waiting to be, or being, turned into memory."""
+
+    session_id: str
+    path: Path
+    attempts: int = 0
+
+    def describe(self) -> str:
+        return f"{self.session_id} ({self.path.name}, attempt {self.attempts})"
+```
+
+> - `CREATE TABLE IF NOT EXISTS`：表不存在才建，所以每次打开都可以执行一遍。
+> - `session_id TEXT PRIMARY KEY`：会话 id 是主键——同一个 id 只能有一行。§下面的 `enrol` 靠它防重复。
+> - `state`：`pending` / `claimed` / `done` / `failed`。
+> - `attempts`：认领过几次。`lease_until`：租约到什么时候。`claimed_by`：哪个进程（pid）。`not_before`：退避——这个时刻之前别来认领。`detail`：最后一次失败的原因。`updated`：最后一次变动的时间。
+
+`JobStore` 的类说明——它就是 §4.2、§4.3 的结论：
+
+```python
+class JobStore:
+    """The claim table.  Every method is safe to call from a second process.
+
+    `isolation_level=None` is not a style choice and it is the whole of F17-03.
+    Python's `sqlite3` defaults to opening a transaction on the first DML
+    statement and *not* on a `SELECT`, so the obvious implementation of
+    `claim()` -- select the pending rows, then update them -- runs its select
+    outside any transaction at all.  Two processes select the same rows, both
+    update them, and both do the work.  Measured: 4 duplicate claims out of 6
+    jobs across 3 processes, with no error anywhere -- every run, on the
+    Windows machine this was first written on; 3 runs in 6 on Linux, which is
+    worse rather than better, because a race that shows up half the time is
+    one that passes a check half the time.  Autocommit plus an
+    explicit `BEGIN IMMEDIATE` takes the write lock *before* the select, which
+    is the only ordering that makes the pair atomic.
+    """
+```
+
+打开数据库（§4.3 引过）和"写"的那几个方法：
+
+```python
+def __init__(self, path: Path = DEFAULT_JOBS_PATH, *, timeout: float = 10.0) -> None:
+    self.path = Path(path)
+    self.path.parent.mkdir(parents=True, exist_ok=True)
+    self.db = sqlite3.connect(self.path, timeout=timeout, isolation_level=None)
+    self.db.row_factory = sqlite3.Row
+    # Both of these are per-connection and both are needed.  WAL lets a
+    # reader (`minicodex memory --jobs`) look at the table while a writer
+    # holds it; `busy_timeout` turns "database is locked" from an exception
+    # into a wait, which is what a second process starting one millisecond
+    # later actually wants.
+    self.db.execute("PRAGMA journal_mode=WAL")
+    self.db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
+    self.db.executescript(_SCHEMA)
+
+
+def enrol(self, sessions: Iterable[tuple[str, Path]], *, now: float | None = None) -> int:
+    """Record sessions this store has not seen.  Returns how many were new.
+
+    `INSERT OR IGNORE` rather than a select-then-insert, for the reason in
+    the class docstring one size down: the primary key is the session id,
+    so the database decides who was first.
+    """
+    stamp = now if now is not None else time.time()
+    added = 0
+    for session_id, path in sessions:
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO jobs(session_id, path, state, updated) "
+            "VALUES (?, ?, 'pending', ?)",
+            (session_id, str(path), stamp),
+        )
+        added += cursor.rowcount or 0
+    return added
+
+
+def claim(
+    self,
+    *,
+    limit: int = MAX_PER_STARTUP,
+    now: float | None = None,
+    lease: float = LEASE_SECONDS,
+) -> tuple[Job, ...]:
+    """Take up to `limit` jobs, exclusively, for `lease` seconds.
+
+    Also takes back jobs whose lease has expired, which is the only reason
+    a lease exists: the process that claimed them may have been killed, and
+    a killed process does not release anything.  A job is *not* taken back
+    because it is slow -- the lease is longer than the work.
+    """
+    stamp = now if now is not None else time.time()
+    deadline = stamp + lease
+    self.db.execute("BEGIN IMMEDIATE")
+    try:
+        rows = self.db.execute(
+            "SELECT session_id, path, attempts FROM jobs "
+            " WHERE (state = 'pending' AND not_before <= ?) "
+            "    OR (state = 'claimed' AND lease_until <= ?) "
+            " ORDER BY updated LIMIT ?",
+            (stamp, stamp, limit),
+        ).fetchall()
+        claimed = []
+        for row in rows:
+            self.db.execute(
+                "UPDATE jobs SET state='claimed', attempts=attempts+1, lease_until=?, "
+                "claimed_by=?, updated=? WHERE session_id=?",
+                (deadline, str(os.getpid()), stamp, row["session_id"]),
+            )
+            claimed.append(
+                Job(row["session_id"], Path(row["path"]), attempts=row["attempts"] + 1)
+            )
+        self.db.execute("COMMIT")
+    except BaseException:
+        self.db.execute("ROLLBACK")
+        raise
+    return tuple(claimed)
+
+
+def finish(self, session_id: str, *, now: float | None = None) -> None:
+    stamp = now if now is not None else time.time()
+    self.db.execute(
+        "UPDATE jobs SET state='done', lease_until=0, claimed_by=NULL, updated=? "
+        "WHERE session_id=?",
+        (stamp, session_id),
+    )
+
+
+def fail(self, session_id: str, detail: str, *, now: float | None = None) -> None:
+    """Hand a job back with a delay, or give up on it.
+
+    The attempt count was already incremented by `claim`, on purpose: a
+    process that dies between claiming and failing must still have used up
+    an attempt, or a rollout that crashes the extractor is claimed forever
+    by whoever starts next.
+    """
+    stamp = now if now is not None else time.time()
+    row = self.db.execute(
+        "SELECT attempts FROM jobs WHERE session_id=?", (session_id,)
+    ).fetchone()
+    attempts = row["attempts"] if row else MAX_ATTEMPTS
+    if attempts >= MAX_ATTEMPTS:
+        self.db.execute(
+            "UPDATE jobs SET state='failed', lease_until=0, claimed_by=NULL, "
+            "detail=?, updated=? WHERE session_id=?",
+            (detail[:500], stamp, session_id),
+        )
+        return
+    self.db.execute(
+        "UPDATE jobs SET state='pending', lease_until=0, claimed_by=NULL, "
+        "not_before=?, detail=?, updated=? WHERE session_id=?",
+        (stamp + BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)), detail[:500], stamp, session_id),
+    )
+
+
+def forget_all(self) -> None:
+    """Part of `--forget-all`: a user deleting their memory means all of it.
+
+    Leaving the job table behind would mean the sessions that produced the
+    deleted memory are marked `done`, so regenerating it would produce
+    nothing and the user would conclude the feature is broken.
+    """
+    self.db.execute("DELETE FROM jobs")
+```
+
+> - **`enrol`**：把新发现的会话登记成 `pending`。**`INSERT OR IGNORE`**——主键已经存在就什么都不做。这比"先查有没有、没有再插"可靠：先查再插是两步，两个进程会在中间撞上；让数据库用主键决定谁先到，是一步。`cursor.rowcount` 是这条语句插进去几行（0 或 1），累加起来就是"这次新登记了几条"。
+> - **`claim`**：§4.3 的全部。注意它还会**收回过期的认领**：`(state = 'claimed' AND lease_until <= ?)`——那是被杀掉的进程留下的。`ORDER BY updated LIMIT ?`：最久没动过的先来，最多 `limit` 条。认领时 `attempts=attempts+1`（§4.4 第二条）。
+> - **`try: ... COMMIT / except BaseException: ROLLBACK; raise`**：中间出任何事（包括 Ctrl-C），都把事务撤销，不留半截的认领。这里用 `BaseException` 是对的——不管为什么停下，事务都得撤。
+> - **`finish`**：标成 `done`，清掉租约。
+> - **`fail`**：次数没用完就退回 `pending`，并设 `not_before = 现在 + 60 × 2^(次数-1)`；用完了标成 `failed`。`detail[:500]`：原因最多存 500 字，一个异常消息可能很长。
+> - **`forget_all`**：§12.3。
+
+"读"的那几个方法，和 `with` 语句要的两个方法：
+
+```python
+def rows(self) -> list[dict[str, Any]]:
+    return [dict(r) for r in self.db.execute("SELECT * FROM jobs ORDER BY updated DESC")]
+
+
+def counts(self) -> dict[str, int]:
+    return {
+        row["state"]: row["n"]
+        for row in self.db.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
+    }
+
+
+def state_of(self, session_id: str) -> str | None:
+    row = self.db.execute("SELECT state FROM jobs WHERE session_id=?", (session_id,)).fetchone()
+    return row["state"] if row else None
+
+
+def close(self) -> None:
+    self.db.close()
+
+
+def __enter__(self) -> JobStore:
+    return self
+
+
+def __exit__(self, *exc: object) -> None:
+    self.close()
+```
+
+> - `dict(r)`：`sqlite3.Row` 可以直接变成字典。
+> - `GROUP BY state` 加 `COUNT(*)`：每种状态各几行。
+> - **`__enter__` 返回 `self`，`__exit__` 关掉连接**——于是 `with JobStore(path) as store:` 用完自动关。`*exc: object` 是"收下任意多个参数，我不用它们"（`with` 会传进来异常的类型、值和回溯）。
+
+最后是"哪些会话算数"：
+
+```python
+def pending_sessions(
+    directory: Path,
+    *,
+    exclude: Sequence[str] = (),
+) -> list[tuple[str, Path]]:
+    """Session files that are finished, are a user's, and are not this run's own.
+
+    Two exclusions to start with, each of which is a fault somewhere else in
+    the book:
+
+    * **Still open.**  Chapter 7 puts an `O_EXCL` lock file next to a rollout
+      that is being written.  Its presence is reused here as the answer to
+      "has this session finished", because the alternative -- a footer record
+      written at the end -- is a footer that a crashed run never writes, and
+      the crashed runs are the ones with the interesting failures in them.
+
+    * **This process's own session**, passed in by the caller.  It has not
+      finished; it does not even have its question answered yet.
+
+    ...and a third, which was not planned and was found by running the thing:
+    **a sub-agent's session**.  Four questions asked through the CLI left seven
+    files, because one of them spawned two children, and each child is a
+    complete rollout with a `parent` field.  Extracted, they produce a third
+    and fourth copy of what the parent's session already says -- measured, the
+    two children of one task both yielded "the `pad_string(s, width, fillchar)`
+    function is in util/text.py", as did the parent.  They also have no user in
+    them: the whole "stable preference the user stated" half of stage 1 is
+    inapplicable to a conversation whose only participant is another agent.
+
+    Chapter 7 made exactly this exclusion, for exactly this reason, in
+    `resolve("last")`: "a run that spawns two sub-agents leaves three files, and
+    the two newest are the children".  The lesson is not about sub-agents.  It
+    is that **a session directory stopped being a list of conversations a user
+    had two chapters ago**, and every new reader of that directory has to be
+    told again.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+    out: list[tuple[str, Path]] = []
+    for path in sorted(directory.glob("*.jsonl")):
+        if path.with_suffix(path.suffix + ".lock").exists():
+            continue
+        try:
+            rollout = read_rollout(path)
+        except RolloutError:
+            continue
+        if rollout.meta.parent or rollout.meta.session_id in exclude:
+            continue
+        if not rollout.items:
+            continue
+        out.append((rollout.meta.session_id, path))
+    return out
+```
+
+> - 三种不算：**还开着的**（旁边有第 7 章的 `.lock` 文件）、**这次运行自己的**（`exclude`）、**子 Agent 的**（`rollout.meta.parent` 有值）。说明里第三种的故事在 §11.2。
+> - `path.with_suffix(path.suffix + ".lock")`：`a.jsonl` → `a.jsonl.lock`。
+> - 读不了的会话文件（`RolloutError`）跳过，不让一个坏文件挡住别的。
+
+```python
+def test_F17_01_the_pipeline_consumes_earlier_sessions_and_never_this_one(tmp_path: Path) -> None:
+    """The whole shape of the fix in one assertion.
+
+    Generating memory at the end of a run means the user waits for it -- 15.4
+    measured seconds for four sessions.  Generating it at the *start* of the
+    next run costs nobody anything, and the price is that the material is
+    always one session out of date.  The current session is excluded by name
+    rather than by "it has no lock yet", because it does have a lock: it is
+    open.
+    """
+    from minicodex.history import UserMessage
+
+    sessions = tmp_path / "sessions"
+    finished = _write_session(sessions, "old", ["remember: use uv"])
+    current = SessionMeta(session_id="current")
+    with RolloutWriter(sessions / "current.jsonl", current) as writer:
+        writer.append(UserMessage("what am I doing"))
+        # Open, locked, and therefore invisible even without `exclude`.
+        assert [s for s, _ in pending_sessions(sessions)] == ["old"]
+    assert sorted(s for s, _ in pending_sessions(sessions)) == ["current", "old"]
+    assert [s for s, _ in pending_sessions(sessions, exclude=["current"])] == ["old"]
+    assert finished.exists()
+
+
+def test_F17_01_at_most_two_sessions_are_consumed_per_startup(tmp_path: Path) -> None:
+    """A user who switches this on after a month has ninety sessions waiting."""
+    store = JobStore(tmp_path / "jobs.db")
+    store.enrol([(f"s{i}", Path(f"s{i}.jsonl")) for i in range(10)])
+    assert len(store.claim()) == MAX_PER_STARTUP
+    store.close()
+
+
+def test_F17_01_a_session_that_is_still_open_is_not_eligible(tmp_path: Path) -> None:
+    """Chapter 7's lock file, reused as "has this finished".
+
+    A footer record would be the other way to answer it, and a crashed run
+    never writes a footer -- so the sessions with the most interesting
+    failures in them would be the ones never extracted.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "done", ["hello"])
+    writer = RolloutWriter(sessions / "live.jsonl", SessionMeta(session_id="live"))
+    try:
+        assert [s for s, _ in pending_sessions(sessions)] == ["done"]
+    finally:
+        writer.release()
+
+
+def test_F17_01_a_sub_agents_session_is_not_a_users_session(tmp_path: Path) -> None:
+    """Not on the list, and found by running four questions through the CLI.
+
+    They left *seven* session files, because one task spawned two children.
+    Extracted, the children restate what the parent already said, and the half
+    of stage 1 that is about what the user prefers has no user in it at all.
+    Chapter 7's `resolve("last")` makes the same exclusion for the same reason.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "parent", ["do the thing"])
+    _write_session(sessions, "child", ["sub-task"], parent="parent")
+    assert [s for s, _ in pending_sessions(sessions)] == ["parent"]
+```
+
+> 这几个测试用的 `_write_session(...)` 是测试文件底部的辅助函数（§14.1）：用第 7 章真正的 `RolloutWriter` 写一个会话文件，而不是手写 JSON——第 14 章说过，一个重新实现了被测格式的测试，测的是那份抄本。
+
+```python
+def test_F17_03_a_claimed_job_is_not_claimed_twice(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.db")
+    store.enrol([("a", Path("a.jsonl")), ("b", Path("b.jsonl"))])
+    first = store.claim(limit=1, now=100.0)
+    second = store.claim(limit=1, now=100.0)
+    assert [j.session_id for j in first] == ["a"]
+    assert [j.session_id for j in second] == ["b"]
+    assert store.claim(limit=5, now=100.0) == ()
+    store.close()
+
+
+def test_F17_03_an_expired_lease_is_taken_back(tmp_path: Path) -> None:
+    """The only reason a lease exists rather than a flag.
+
+    The process that claimed the job may have been killed -- or, in this
+    program, simply cancelled when the foreground run finished first -- and a
+    killed process releases nothing.
+    """
+    store = JobStore(tmp_path / "jobs.db")
+    store.enrol([("a", Path("a.jsonl"))])
+    store.claim(now=100.0, lease=60.0)
+    assert store.claim(now=150.0, lease=60.0) == ()
+    retaken = store.claim(now=200.0, lease=60.0)
+    assert [j.session_id for j in retaken] == ["a"]
+    assert retaken[0].attempts == 2
+    store.close()
+
+
+def test_F17_03_failure_backs_off_and_then_gives_up(tmp_path: Path) -> None:
+    """Three attempts, doubling, and then the job stops coming back.
+
+    A rollout that fails extraction three times is not going to start working:
+    the causes are properties of the file, not of the moment.  Coming back
+    forever is how a background job becomes a background cost.
+    """
+    store = JobStore(tmp_path / "jobs.db")
+    store.enrol([("a", Path("a.jsonl"))])
+    now = 100.0
+    for attempt in range(1, MAX_ATTEMPTS):
+        assert store.claim(now=now) != (), attempt
+        store.fail("a", "boom", now=now)
+        assert store.state_of("a") == "pending"
+        # Not available until the backoff has passed...
+        assert store.claim(now=now + 1) == ()
+        now += BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + 1
+    assert store.claim(now=now) != ()
+    store.fail("a", "boom", now=now)
+    assert store.state_of("a") == "failed"
+    assert store.claim(now=now + 10 * DAY) == ()
+    store.close()
+
+
+def test_F17_03_the_attempt_is_counted_when_it_is_claimed(tmp_path: Path) -> None:
+    """Counted on claim rather than on failure, and that is the load-bearing bit.
+
+    A process that dies between claiming and failing never calls `fail`.  If
+    the count lived there, a rollout that crashes the extractor would be
+    claimed forever by whoever starts next.
+    """
+    store = JobStore(tmp_path / "jobs.db")
+    store.enrol([("a", Path("a.jsonl"))])
+    job = store.claim(now=100.0)[0]
+    assert job.attempts == 1
+    assert store.rows()[0]["attempts"] == 1
+    store.close()
+```
+
+> - 这些测试都传 `now=...`：时间由测试决定，"租约过期"不需要真等 5 分钟。第 12 章的重试测试用过同一招。
+
+### 4.6 改写时重量：这个竞态在 Linux 上是时有时无的
+
+§4.2 写的是"跑四次，四次一模一样"。这次改写在 Linux 上重跑了六次：
+
+```
+$ uv run python probe_memory_write.py race      # 六次里的三次
+  naive select-then-update   3 workers claimed 6 job(s), 4 distinct, 2 duplicate(s)
+  naive select-then-update   3 workers claimed 6 job(s), 6 distinct, 0 duplicate(s)
+  naive select-then-update   3 workers claimed 6 job(s), 4 distinct, 2 duplicate(s)
+```
+
+**六次里三次有重复，每次两个；另外三次一个都没有。** `BEGIN IMMEDIATE` 那一行六次都是 0 重复。
+
+所以"确定性的"这个说法只在当时那台 Windows 机器上成立。三个进程什么时候开始、操作系统怎么调度它们，决定了两个 `SELECT` 会不会落在同一个窗口里。这反而让这个 bug 更危险：**它在一台机器上每次都出现，在另一台上一半时间不出现**——一个只在"没出现"的那台上测过的人，会以为朴素写法没问题。
+
+修法不变：先拿写锁，再查。也正因为它时有时无，测试里没有拿"三个进程赛跑"去测它（那会是一个第 14 章 §15 所说的不稳定的测试），而是直接检查结果：`test_F17_03_a_claimed_job_is_not_claimed_twice` 在同一个数据库上连续认领两次，第二次必须一条都拿不到。
+
+### 4.7 改写时发现：被杀掉的会话，永远不会变成记忆，而且没人知道
+
+`pending_sessions` 把"旁边有 `.lock` 文件"当成"这次会话还开着"。说明里写得很清楚，理由也对：用一个"结尾标记"来判断会话结束，那个标记在崩溃的运行里永远不会写，而崩溃的运行恰恰是最值得记的。
+
+可是第 7 章的锁是在 `finally` 里删的。**一个被直接杀掉的进程不执行 `finally`**——关掉终端窗口、`kill -9`。那样会话旁边的 `.lock` 就永远留着，`pending_sessions` 永远跳过它。这次会话永远不会变成记忆，而 `minicodex memory --jobs` 也看不到它，因为它从来没被登记进表。
+
+为什么不自动判断"那个进程还活着吗"？在 POSIX 上可以用 `os.kill(pid, 0)` 问；但在 Windows 上，`os.kill` 用这个参数会**直接结束那个进程**。第 7 章对同一个问题的回答是：把 pid 说出来，让人决定。这里照做——加一个函数，把这些会话列出来：
+
+```python
+def locked_sessions(directory: Path) -> list[tuple[Path, str]]:
+    """Session files skipped because a lock file sits beside them, and whose pid.
+
+    `pending_sessions` reads a lock as "still open", which is right while the
+    process is alive and wrong forever after it is not: chapter 7's lock is
+    removed in a `finally`, and a process that is killed outright -- the
+    terminal window closed, `kill -9` -- runs no `finally`. Its session is then
+    never turned into memory, and nothing anywhere said so. Found when the
+    chapter was rewritten.
+
+    Listed rather than taken: whether pid 4127 is still a `minicodex` cannot be
+    answered portably (`os.kill(pid, 0)` on Windows *terminates* the process),
+    and chapter 7's answer to the same question was to name the pid and let
+    the person decide. `minicodex memory --jobs` prints these.
+    """
+    directory = Path(directory)
+    if not directory.is_dir():
+        return []
+    out: list[tuple[Path, str]] = []
+    for path in sorted(directory.glob("*.jsonl")):
+        lock = path.with_suffix(path.suffix + ".lock")
+        if not lock.exists():
+            continue
+        try:
+            holder = lock.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:  # pragma: no cover
+            holder = ""
+        out.append((path, holder or "?"))
+    return out
+```
+
+> `lock.read_text(...)` 读出第 7 章写进锁文件的那个 pid。读不了就是 `"?"`。
+
+`minicodex memory --jobs`（§12.2）在最后把它们打出来，**不管任务表存不存在**——一个刚开记忆功能的用户，第一天就可能遇到。
+
+```python
+def test_a_session_left_locked_by_a_dead_process_is_named(tmp_path: Path, capsys: Any) -> None:
+    """A lock beside a rollout means "still open" -- and also "killed before
+    its `finally` ran". Such a session was skipped forever, with nothing
+    anywhere saying so. It is still skipped (whether pid 4127 is alive cannot
+    be asked portably), but `minicodex memory --jobs` names it."""
+    from minicodex.__main__ import main
+
+    sessions = tmp_path / "sessions"
+    path = _write_session(sessions, "killed", ["use uv"])
+    path.with_suffix(".jsonl.lock").write_text("4127", encoding="utf-8")
+
+    assert pending_sessions(sessions) == []
+    assert locked_sessions(sessions) == [(path, "4127")]
+
+    jobs = tmp_path / "jobs.db"
+    assert main(["memory", "--jobs", "--jobs-db", str(jobs), "--session-dir", str(sessions)]) == 0
+    out = capsys.readouterr().out
+    assert "locked, skipped: killed.jsonl (pid 4127)" in out
+    assert "delete killed.jsonl.lock" in out
+```
+
+> `capsys.readouterr().out` 取出 `main()` 打印的东西（第 14 章 §9.2）。断言它说出了文件名、pid，以及"删掉锁文件它就会被处理"。
+
 ## §5 F17-04：一个有空位的格式，模型就会把它填满
 
 这一节是本章最长的，因为清单里那条药方**方向是对的，落地之后完全无效**。
@@ -579,6 +1587,8 @@ Answer with exactly this shape and nothing else:
   codex 真实的条件式问法（已发布）      引用块 0/9   解析成功 0   编造 0
   无条件问法（只用于对照，没发布）      引用块 9/9   解析成功 0   编造 9
 ```
+
+（改写第 16 章时又发现一件事：那时程序给每个小节算的**行号本身是错的**（第 16 章 §5.3），一条照真实行号写的引用也会被判成编造。所以"9 个都是编的"里，可能有几个其实是对的。这组数字没有重量过。）
 
 无条件问法**确实**几乎每次都给出引用块。但**九条里没有一条解析得到真实条目**：
 格式要的是真实行号（`MEMORY.md:12-14`），而这个程序从没让模型看见过任何行号，
@@ -734,6 +1744,549 @@ $ uv run python probe_memory_write.py signal --samples 3 --arms quota,shipped --
 
 ---
 
+### 5.9 代码：第一段的全部
+
+一次抽取的结果用一个类型装：
+
+```python
+@dataclass(frozen=True)
+class Stage1:
+    """What one session was worth remembering.
+
+    Three fields rather than a free-text blob, because the sections are what
+    the prompt is enforcing and a parsed shape is what makes "it produced
+    nothing" a fact this program can act on rather than a judgement it has to
+    make about prose.
+
+    The section names are chapter 6's structured-summary result (F06-04: six
+    mandatory headings kept 23/25 planted facts against 15/25 for "summarise
+    this") one subsystem later.  What changed is the *selection* rule: a
+    compaction summary must keep everything still in play, and this must keep
+    almost nothing.
+    """
+
+    session_id: str = ""
+    preferences: tuple[str, ...] = ()
+    knowledge: tuple[str, ...] = ()
+    failures: tuple[str, ...] = ()
+    secrets_removed: int = 0
+
+    def __bool__(self) -> bool:
+        return bool(self.preferences or self.knowledge or self.failures)
+
+    def bullets(self) -> tuple[str, ...]:
+        return self.preferences + self.knowledge + self.failures
+
+    def describe(self) -> str:
+        if not self:
+            return f"{self.session_id}: nothing worth keeping"
+        return (
+            f"{self.session_id}: {len(self.preferences)} preference(s), "
+            f"{len(self.knowledge)} fact(s), {len(self.failures)} failure(s)"
+        )
+
+
+_SECTIONS = (
+    ("preferences", "Preference signals"),
+    ("knowledge", "Reusable knowledge"),
+    ("failures", "Failures and how to do differently"),
+)
+```
+
+> - 三个字段对应三类"值得记"的东西（§5.1）：偏好、知识、失败的教训。说明里写了为什么要分成字段而不是一段自由文字：分开之后，"什么都没产出"是一个程序能判断的**事实**（`__bool__` 返回假），而不是要去读一段话来判断。
+> - `bullets()` 把三类合成一个元组；`describe()` 给报告用。
+> - `_SECTIONS`：字段名和小节标题的对照表。提示词、解析、渲染都从这一张表取，三处不会说岔。
+
+三份提示词都留在源码里，**连同输掉的那两份**（第 16 章的理由：只留赢家、删掉对照组的"A 比 B 好"，是一个没人能重跑的结论）：
+
+```python
+# The three wordings this chapter measured, weakest first.  All three are here
+# rather than only the winner, for chapter 16's reason: a claim that one
+# wording is better than another, with the other one deleted, is a claim
+# nobody can re-run.
+#
+# **STAGE1_NAIVE** -- one sentence, the version anybody writes first.
+STAGE1_NAIVE = (
+    "Summarise what was learned in this session that would be useful next time. "
+    "Use the same three headings:\n\n"
+    f"## {_SECTIONS[0][1]}\n## {_SECTIONS[1][1]}\n## {_SECTIONS[2][1]}\n"
+)
+
+_KINDS = """\
+Write only high-signal material, which means exactly three kinds of thing:
+
+1. A **stable preference** the user stated or clearly implied about how work is
+   done here -- a command they insist on, a style rule, a thing they do not want
+   touched. Something they would have to say again in the next session if it is
+   not written down.
+2. **Reusable knowledge** about this repository that was expensive to find and
+   will be needed again -- where something lives, how a thing is built or run,
+   what a non-obvious file is for.
+3. A **failure shield**: something that went wrong, and the one sentence that
+   would stop it happening again.
+
+Do not write:
+
+- What happened. "Ran the tests", "read three files", "added a function" are
+  facts about one afternoon, not about this repository.
+- Anything true only of the task in this session.
+- Anything already obvious from opening the repository.
+- Credentials, tokens, keys, or anything that looks like one, even partially.
+- Praise, narration, or a description of what you are about to do.
+"""
+
+_SHAPE = f"""\
+## {_SECTIONS[0][1]}
+- ...
+
+## {_SECTIONS[1][1]}
+- ...
+
+## {_SECTIONS[2][1]}
+- ...
+"""
+
+# **STAGE1_QUOTA** -- the careful version, and the one this chapter shipped
+# first.  It says everything correct: what to keep, what not to keep, and that
+# "producing nothing is a normal and preferred outcome" in bold, which is the
+# sentence codex's own stage-one prompt carries.
+#
+# It produced three bullets for **every session it was shown, including the one
+# that taught nothing**: 0/2 no-ops on a session whose whole content is "which
+# functions does calc.py define". The bullets it invented for it were
+# "The user prefers concise summaries of function definitions" and "The calc.py
+# file defines two functions". Both true. Both worthless. Both would have been
+# injected into every future request in this repository.
+#
+# The cause is the last paragraph, and it is not the one that says nothing is
+# preferred: **"write at most three bullets per section" is a quota, and a
+# format with slots in it is a format a model fills.**
+#
+# Chapter 16 met the same mechanism from the other side, and what it found
+# there is now a sharper version of this result than the one this comment used
+# to cite.  Its first draft claimed that asking for a citation block
+# unconditionally took compliance from 0/9 to 18/18 -- and that measurement did
+# not survive its rewrite.  Asking unconditionally does still produce a block
+# almost every time; what the stricter format showed is that **0 of 9 of those
+# blocks contained a line that resolved to anything real.**  The model filled
+# the slot with invented line numbers.
+#
+# So the two chapters agree, and they agree on something worse than "a required
+# shape is filled": a required shape is filled *with plausible material*
+# whether or not there is anything to put in it.  A quota produces a bullet
+# about `calc.py` defining two functions; a citation format produces
+# `MEMORY.md:12-14` for lines nobody read.  Neither failure announces itself,
+# and in both cases the fix is the same shape -- make the model commit to a
+# verdict before it is shown the slot (`DURABLE: yes/no` below), rather than
+# hoping it declines to fill one.
+STAGE1_QUOTA = f"""\
+You are reading the transcript of one finished coding session. Your job is to
+decide what, if anything, about it is worth remembering in three months, and to
+write that down. You are not summarising the session.
+
+{_KINDS}
+**Producing nothing is a normal and preferred outcome.** Most sessions teach
+nothing durable. If this one did not, return the three headings with no bullets
+under them. An empty answer costs nothing; a wrong one is injected into every
+future session in this repository.
+
+Each bullet must be one sentence, standing on its own, understandable by
+someone who has not read this transcript. Write at most three bullets per
+section, and fewer is better.
+
+Answer with exactly this shape and nothing else:
+
+{_SHAPE}"""
+```
+
+> - **`STAGE1_NAIVE`**：一句话版本，谁都会先写这个。
+> - **`_KINDS`**：三类该写、五类不该写。两份认真的提示词共用它。
+> - **`_SHAPE`**：要模型照着填的那个形状。
+> - **`STAGE1_QUOTA`**：§5.3 量出来"在什么都没有的地方产出三条"的那一份。它上面那段长注释就是 §5.4，还记着和第 16 章对照的结论。
+> - 上面这段代码到 `STAGE1_QUOTA` 结束为止。发布的那一份 `STAGE1_SYSTEM`（§5.5）紧接着它，单独列在下面：
+
+```python
+# **STAGE1_SYSTEM** -- what ships.  Two changes from the version above, and
+# both are structural rather than emphatic.
+#
+# The first is the verdict line. The model must decide, in one word, before it
+# is shown the shape it could fill -- and the decision is *enforced* by
+# `parse_stage1` rather than trusted, which is this book's standing rule about
+# anything that can be settled in code.
+#
+# The second is the test. "Would a competent engineer opening this repository
+# be unable to work this out in thirty seconds" is a question with an answer,
+# where "is this durable?" is a question with a vibe.
+STAGE1_SYSTEM = f"""\
+You are reading the transcript of one finished coding session. Your job is to
+decide what, if anything, about it is worth remembering in three months, and to
+write that down. You are not summarising the session.
+
+First decide whether this session taught anything durable at all. Most did not.
+Apply this test to each candidate line, and write it down only if it passes:
+
+  Would a competent engineer, opening this repository for the first time, be
+  unable to work this out for themselves in thirty seconds?
+
+If they could work it out -- what a file defines, what a function does, that
+tests should be written -- it is not memory. It is a sentence that will be sent
+with every future request in this repository, forever, and will teach nobody
+anything.
+
+{_KINDS}
+Begin your answer with one line, exactly `DURABLE: yes` or `DURABLE: no`.
+
+Answer `DURABLE: no` and leave every section empty unless there is something
+that passes the test above. That is the normal outcome, and an empty answer
+costs nothing: a wrong line costs every future session.
+
+If and only if you answered yes, fill in the sections below. One sentence per
+bullet, standing on its own, understandable by someone who has not read this
+transcript. There is no minimum; one bullet is a good answer.
+
+Answer with exactly this shape and nothing else:
+
+DURABLE: yes
+{_SHAPE}"""
+```
+
+> 这一段的 `f"""..."""` 里，`{_KINDS}` 和 `{_SHAPE}` 会被替换成上面那两段字。
+
+解析模型的回答：
+
+```python
+_VERDICT = re.compile(r"^\W*durable\W*:\W*(yes|no)\b", re.IGNORECASE | re.MULTILINE)
+
+
+_BULLET = re.compile(r"^\s*[-*]\s+(.*\S)\s*$")
+
+
+_H2 = re.compile(r"^##\s+(.+?)\s*$")
+
+
+def parse_stage1(text: str, *, session_id: str = "") -> Stage1:
+    """Read the extractor's answer, keeping only what is under a known heading.
+
+    Tolerant in one direction and strict in the other: unknown headings and
+    prose between sections are dropped, and nothing outside a section is ever
+    promoted into one.  A model that ignores the format produces an empty
+    `Stage1`, which is the same outcome as a model that had nothing to say --
+    and that is the right collapse, because both mean "there is nothing here to
+    merge".
+
+    `DURABLE: no` empties the answer, whatever else is in it.  The model is
+    asked to make one judgement before it is shown a shape it could fill, and
+    this line is what makes that judgement binding rather than advisory: it
+    said no, so the bullets under the headings are the shape talking.  Measured
+    disagreement -- said no and wrote bullets anyway -- is in the chapter.
+    """
+    verdict = _VERDICT.search(text)
+    if verdict is not None and verdict.group(1).lower() == "no":
+        return Stage1(session_id=session_id)
+    wanted = {title.lower(): key for key, title in _SECTIONS}
+    found: dict[str, list[str]] = {key: [] for key, _ in _SECTIONS}
+    current: str | None = None
+    for line in text.splitlines():
+        heading = _H2.match(line)
+        if heading:
+            current = wanted.get(heading.group(1).strip().lower())
+            continue
+        if current is None:
+            continue
+        bullet = _BULLET.match(line)
+        if bullet:
+            body = bullet.group(1).strip()
+            # A model told to leave a section empty sometimes writes "- none"
+            # rather than nothing at all.  Treating that as an entry is how a
+            # memory ends up with a section that says "none" in it forever.
+            #
+            # `...` is on this list because it happened: the shape at the
+            # bottom of the prompt is `- ...`, and one sample in three copied
+            # the placeholder through into its answer.  A memory entry whose
+            # entire text is an ellipsis is the kind of thing that survives
+            # for a year because nobody can tell what it was meant to say.
+            if body.lower().strip(" .") in {"none", "n/a", "nothing", "(none)", ""}:
+                continue
+            found[current].append(body)
+    return Stage1(
+        session_id=session_id,
+        preferences=tuple(found["preferences"]),
+        knowledge=tuple(found["knowledge"]),
+        failures=tuple(found["failures"]),
+    )
+```
+
+> - **`_VERDICT`**：认 `DURABLE: yes|no` 那一行。`^\W*durable\W*:\W*(yes|no)\b`——行首允许有任意符号（模型爱写成 `**DURABLE: no**`），大小写不论（`re.IGNORECASE`），任何一行都可以（`re.MULTILINE`）。
+> - **`DURABLE: no` 直接返回一个空的 `Stage1`**，不管下面写了什么。这就是"判决由代码执行"。
+> - 然后一行一行读：遇到 `## 标题`，看它是不是三个认识的标题之一（不区分大小写），是就记下"现在在哪一节"，不是就把"当前节"设成 `None`——后面的内容全部丢掉。遇到 `- 条目`，放进当前节。
+> - **`- none`、`- ...` 这类不算条目。** 注释里写了 `...` 为什么在名单上：提示词的形状里写的是 `- ...`，三次里有一次模型把这个占位符原样抄进了答案。一条正文是省略号的记忆，能在文件里活一年，因为没人看得出它本来想说什么。
+
+`raw/` 文件、会话变成文字、一次抽取、一次不流式的提问：
+
+```python
+def render_stage1(stage1: Stage1) -> str:
+    """The `raw/<session>.md` file, which says what it is in its first lines.
+
+    The warning is not decoration.  codex's equivalent carries the same one --
+    "Temporary file: … Input for Phase 2" -- and the fault it prevents is a
+    slow one: a file in a memory directory that looks like memory, and that
+    somebody eventually edits, or greps, or copies into a bug report.
+    """
+    lines = [
+        FORMAT_VERSION,
+        "",
+        f"<!-- Temporary file: stage-1 output for session {stage1.session_id or '?'}.",
+        "     Input for stage 2. Deleted once it has been merged.",
+        "     Nothing reads this as memory; edit MEMORY.md instead. -->",
+        "",
+    ]
+    for key, title in _SECTIONS:
+        lines.append(f"## {title}")
+        for item in getattr(stage1, key):
+            lines.append(f"- {item}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def transcript_of(rollout: Rollout, *, budget: int = TRANSCRIPT_TOKEN_BUDGET) -> tuple[str, int]:
+    """One session as text, redacted and clipped.  Returns text and secret count.
+
+    System and developer notes are **left out**, and that is a decision rather
+    than an omission.  They are this program's own words -- the permissions
+    block, chapter 0's "you have 2 turns left", chapter 13's `AGENTS.md`
+    injection, chapter 16's memory block itself -- and an extractor shown them
+    dutifully reports the program's instructions back as things worth
+    remembering.  The most direct form of that is the last one in the list: a
+    memory that was injected into the session is a memory the session then
+    re-learns, which is a loop with no fixed point and no error message.
+
+    One thing is lost with them and it is worth saying out loud, because it
+    looks like an oversight: chapter 13's `AGENTS.md` arrives as a developer
+    note, and it is the most convention-shaped material in a session.  It is
+    dropped **because it is already in the repository**, in a file a person
+    maintains and a team can read.  Extracting it would store the same sentence
+    in two places, and the two places drift -- which is the whole argument for
+    the three-layer table in chapter 16 §2.1.
+    """
+    parts: list[str] = []
+    for item in rollout.items:
+        if isinstance(item, UserMessage):
+            parts.append(f"user: {item.text}")
+        elif isinstance(item, AssistantMessage):
+            if item.text.strip():
+                parts.append(f"assistant: {item.text.strip()}")
+            for call in item.tool_calls:
+                if call.name == NOTE_NAME:
+                    continue
+                parts.append(f"assistant calls {call.name} {call.raw_arguments}")
+        elif isinstance(item, ToolResult):
+            if item.name == NOTE_NAME:
+                # The writer does not read its own output.  A `remember_this`
+                # call is *already* an input to stage 2 by another route
+                # (`notes/`), so leaving it in the transcript delivers the same
+                # sentence twice -- measured: 3/3 extractions of a session that
+                # proposed a note re-derived the note as a bullet.
+                #
+                # This is F17-10's shape, in the one place this program can
+                # reach it: the memory system reading a transcript of the
+                # memory system.  The listed version of that fault needs the
+                # writer to be an agent with a session of its own, which this
+                # one is not (see the chapter).
+                continue
+            parts.append(f"{item.name} returned: {clip(item.content, TOOL_RESULT_CHARS)}")
+    text = "\n".join(parts)
+    text, secrets = scrub(text)
+    # Head and tail, chapter 2's shape: the user's actual request is at the top
+    # of a session and the thing that finally worked is at the bottom, and a
+    # tail-only clip loses the first of those every time.
+    if estimate_messages([{"role": "user", "content": text}]) > budget:
+        text = clip(text, budget * 4)
+    return text, secrets
+
+
+async def extract(
+    model: Any,
+    rollout: Rollout,
+    *,
+    system: str = STAGE1_SYSTEM,
+) -> Stage1:
+    """Stage 1 for one session.  One model call, no tools, no loop.
+
+    Not an `Agent`.  There is nothing to iterate: the input is a transcript
+    that already exists and the output is text.  A tool loop here would add
+    every failure mode chapters 0 to 12 exist to handle, in exchange for
+    nothing -- and it would also give a model somewhere to write, which is the
+    one thing F17-09 says it must not have.
+    """
+    text, secrets = transcript_of(rollout)
+    answer = await _ask(
+        model,
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"<transcript>\n{text}\n</transcript>"},
+        ],
+    )
+    # The second scrub.  The first one was on the way in; this one is on the
+    # way to a file that gets injected into every future request.
+    answer, more = scrub(answer)
+    stage1 = parse_stage1(answer, session_id=rollout.meta.session_id)
+    return Stage1(
+        session_id=stage1.session_id,
+        preferences=stage1.preferences,
+        knowledge=stage1.knowledge,
+        failures=stage1.failures,
+        secrets_removed=secrets + more,
+    )
+
+
+async def _ask(model: Any, messages: list[dict[str, Any]]) -> str:
+    """Collect one non-streaming answer out of a streaming client.
+
+    The same shape `make_summariser` uses in chapter 6, including the deferred
+    import, and it is duplicated rather than shared: that one builds a
+    `History` and renders it, this one has two literal messages and wants no
+    history at all.  Two six-line functions that look alike is not the same
+    thing as two call sites of one function.
+
+    The `[DONE]` check is chapter 0's rule, third application.  A stream that
+    ended early is not a shorter answer -- here it is half a memory, and half a
+    memory is written to disk and read back forever.
+    """
+    from minicodex.model import Completed, TextDelta
+
+    out: list[str] = []
+    finished = False
+    async for event in model.stream(messages):
+        if isinstance(event, TextDelta):
+            out.append(event.text)
+        elif isinstance(event, Completed):
+            finished = True
+    if not finished:
+        raise MemoryWriteError("the model stream ended without a [DONE] sentinel")
+    return "".join(out)
+```
+
+> - **`render_stage1`**：§2.3。开头三行是 HTML 注释（`<!-- ... -->`），在 markdown 里看不见，打开文件看得见。
+> - **`transcript_of`**：把一次会话的历史变成纯文字给抽取器读。
+>   - 只要三种条目：用户说的、模型说的（和它要调的工具）、工具返回的。**系统和 developer 消息不要**——说明里讲了，那些是程序自己的话（权限说明、"还剩两轮"、`AGENTS.md`、**第 16 章的记忆块本身**）；抽取器读到它们，会把程序的指示当成"值得记住的事"报回来——尤其是记忆块：注入进会话的记忆，被会话重新学一遍，一代一代加强，没有终点也没有报错。
+>   - `remember_this` 的调用和返回也跳过（§11.2）。
+>   - 每条工具结果用第 2 章的 `clip` 截到 800 字（头和尾）。
+>   - 整段先脱敏（§6），太长就再截一次，头尾都留：用户的请求在开头，最后成功的那一步在结尾。
+> - **`extract`**：一次模型调用，没有工具、没有循环。两条消息：系统提示词、和用 `<transcript>` 包起来的会话。回来的答案**再脱敏一次**，然后解析。说明里讲了为什么不是一个 Agent：没有需要循环的东西，而一个 Agent 意味着要给模型一个能写东西的地方——那正是 §8 说它不能有的。
+> - **`_ask`**：从一个流式的客户端里收一个完整的答案。`from minicodex.model import ...` 写在函数里面（延迟导入），和第 6 章的 `make_summariser` 一样。**没收到 `[DONE]` 就报错**——第 0 章的规矩第三次：一个提前断掉的流不是一个短一点的答案，在这里它是半份记忆，而半份记忆会被写进文件、以后每次都被读出来。
+
+```python
+def test_F17_04_the_shipped_prompt_asks_for_a_verdict_before_it_shows_a_shape() -> None:
+    """A snapshot, chapter 3's F03-10 shape, and it is pinning a measurement.
+
+    The version without these two clauses -- `STAGE1_QUOTA`, still in the
+    module -- produced three bullets for *every* session it was shown,
+    including one whose entire content was "which functions does calc.py
+    define": 0/3 no-ops where the answer should have been nothing at all.  The
+    shipped wording answered `DURABLE: no` 3/3 on the same session.
+
+    Both clauses are load-bearing and both look like padding:
+    """
+    assert "DURABLE: yes" in STAGE1_SYSTEM
+    assert "DURABLE: no" in STAGE1_SYSTEM
+    assert "thirty seconds" in STAGE1_SYSTEM
+    assert "There is no minimum" in STAGE1_SYSTEM
+    # ...and the thing that had to go: a quota is filled.
+    assert "at most three bullets" in STAGE1_QUOTA
+    assert "at most three bullets" not in STAGE1_SYSTEM
+
+
+def test_F17_04_a_no_verdict_empties_the_answer() -> None:
+    """The judgement is enforced, not trusted.
+
+    A model that answers `DURABLE: no` and then fills the sections anyway is
+    the shape talking, and the shape does not get a vote.
+    """
+    answer = (
+        "DURABLE: no\n\n## Preference signals\n- The user likes tests.\n"
+        "## Reusable knowledge\n- calc.py has two functions.\n"
+    )
+    assert not parse_stage1(answer)
+    assert parse_stage1(answer.replace("no", "yes")).bullets()
+
+
+def test_F17_04_nothing_to_keep_is_a_success_not_a_failure(tmp_path: Path) -> None:
+    """An empty extraction finishes the job and writes no file.
+
+    Writing an empty raw file instead would make every merge read a page of
+    empty headings, and re-queueing the session would mean paying for the same
+    negative answer forever.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "s1", ["what does calc.py define?"])
+    jobs = tmp_path / "jobs.db"
+    report = asyncio.run(
+        run_pipeline(
+            _Scripted(["DURABLE: no"]),
+            directory=tmp_path / "mem",
+            sessions_dir=sessions,
+            jobs_path=jobs,
+            lock_path=tmp_path / "merge.lock",
+        )
+    )
+    assert report.sessions == ("s1",)
+    assert report.empty == ("s1",)
+    assert not report.merged
+    assert pending_raw(tmp_path / "mem") == ()
+    with JobStore(jobs) as store:
+        assert store.state_of("s1") == "done"
+
+
+def test_F17_04_a_placeholder_bullet_is_not_a_memory() -> None:
+    """`- ...` is in the prompt's example, and one sample in three copied it.
+
+    An entry whose whole text is an ellipsis survives for a year, because
+    nobody can tell what it was meant to say.
+    """
+    answer = "DURABLE: yes\n## Preference signals\n- ...\n- none\n- Use uv.\n"
+    assert parse_stage1(answer).preferences == ("Use uv.",)
+
+
+def test_F17_04_material_outside_a_known_heading_is_dropped() -> None:
+    answer = (
+        "Here is what I found.\n- a stray bullet\n"
+        "## Something else\n- not one of ours\n"
+        "## Reusable knowledge\n- Releases are cut with `make ship`.\n"
+    )
+    out = parse_stage1(answer)
+    assert out.knowledge == ("Releases are cut with `make ship`.",)
+    assert out.preferences == ()
+
+
+def test_F17_04_the_raw_file_says_it_is_temporary(tmp_path: Path) -> None:
+    """codex writes the same warning into the same file, and it is not tidiness.
+
+    An intermediate product that does not say it is intermediate is one
+    somebody starts maintaining.
+    """
+    path = write_raw(tmp_path, Stage1(session_id="s1", preferences=("Use uv.",)))
+    text = path.read_text(encoding="utf-8")
+    assert text.splitlines()[0] == FORMAT_VERSION
+    assert "Temporary file" in text
+    assert "Input for stage 2" in text
+    assert path.parent.name == RAW_DIR
+
+
+def test_a_stream_that_ends_early_is_not_half_a_memory(tmp_path: Path) -> None:
+    """Chapter 0's `[DONE]` rule, third application.
+
+    Half an answer here is written to a file and read back forever.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "s1", ["hello"])
+    with pytest.raises(MemoryWriteError, match=r"\[DONE\]"):
+        asyncio.run(
+            extract(_Scripted(["half an ans"], finish=False), read_rollout(sessions / "s1.jsonl"))
+        )
+```
+
+> - `_Scripted([...])` 是测试文件底部的假模型（§14.1）：每次被问，就按顺序说出列表里的下一句，并记下收到的消息。
+
 ## §6 F17-05：脱敏必须在两侧，而只有第二侧挡得住"请记住这个 key"
 
 ### 6.1 第一次测量：没复现
@@ -843,6 +2396,139 @@ def scrub(text: str) -> tuple[str, int]:
 
 ---
 
+### 6.5 代码：`scrub`
+
+```python
+# Redaction: on the way in, and again on the way out
+# ---------------------------------------------------------------------------
+
+# Shapes that are secret regardless of what they are called.  Chapter -1's
+# recorder redacts by *key name* (`api_key`, `authorization`), which is right
+# for a JSON request body and useless here: a transcript is prose, and the
+# thing that reaches this module is `OPENAI_API_KEY=sk-proj-…` sitting in the
+# output of `env`, or a token a user pasted into a question.
+_SECRET_SHAPES = (
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{12,}"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+)
+
+# `NAME=value` where the name says it is a credential.  The value is taken up
+# to whitespace or a quote, which is what an `env` dump and a `.env` file both
+# look like.
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*)"
+    r"\s*[=:]\s*[\"']?([^\s\"'\n]{6,})"
+)
+
+REDACTED = "<redacted>"
+
+
+def scrub(text: str) -> tuple[str, int]:
+    """Remove anything credential-shaped.  Returns the text and how many hits.
+
+    Applied **twice**, on purpose, and that is the whole of F17-05: once to the
+    transcript before it is sent to the extractor, and once to the extractor's
+    answer before it is written to a file that will be injected into every
+    future request.  Doing only the first is the version that feels sufficient
+    -- if the model never saw the key it cannot repeat it -- and it is wrong in
+    two directions: the merge step also reads hand-written notes and a
+    user-edited memory file, and a model asked to summarise a session can
+    reconstruct a partially-masked value from context.
+
+    A count is returned rather than a boolean because it goes in the report:
+    "3 secret(s) removed" is a line that makes somebody look, and a silent
+    redaction is a redaction nobody audits.
+    """
+    hits = 0
+    for pattern in _SECRET_SHAPES:
+        text, n = pattern.subn(REDACTED, text)
+        hits += n
+
+    def _assignment(match: re.Match[str]) -> str:
+        nonlocal hits
+        if match.group(2) == REDACTED:
+            # Already handled by a shape above.  Without this the count is of
+            # *substitutions* rather than of secrets, and the probe reported
+            # "2 removed" for one key -- a number about the regex list, not
+            # about the transcript.
+            return match.group(0)
+        hits += 1
+        return f"{match.group(1)}={REDACTED}"
+
+    text = _SECRET_ASSIGNMENT.sub(_assignment, text)
+    return text, hits
+```
+
+> - **`_SECRET_SHAPES`**：六种"长得就像密钥"的东西——OpenAI 的 `sk-...`、GitHub 的 `ghp_...` 一族、AWS 的 `AKIA...`、Slack 的 `xox?-...`、JWT（三段 base64，用 `.` 隔开，`eyJ` 开头）、PEM 私钥（`-----BEGIN ... PRIVATE KEY-----` 到 `END`，中间可以跨行，所以带 `re.S`）。`{16,}` 是"至少 16 个"——太短的串不当成密钥，免得误伤普通的词。
+> - **`_SECRET_ASSIGNMENT`**：`名字 = 值`，名字里含 `KEY`、`TOKEN`、`SECRET`、`PASSWORD` 之类。`(?i)` 让整个正则不区分大小写。值取到空白或引号为止，至少 6 个字符。
+> - **`scrub`**：先按形状替换，`pattern.subn(...)` 同时告诉你换了几处；再按名字替换。
+> - **里面那个 `_assignment` 函数**：`re.sub` 的第二个参数可以是一个函数，每找到一处就调用一次，返回值就是替换成的东西。它用 `nonlocal hits` 改外层的计数（第 16 章 §0.2）。如果值已经是 `<redacted>`（被形状那一步换过了），原样返回、不计数——§6.3 那个"一个 key 报两次"的修法。
+
+```python
+def test_F17_05_a_key_is_removed_from_the_transcript_before_it_is_sent(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "s1", ["the key is sk-live-9f4c2ab7d3e1f0aa88b2, do not lose it"])
+    rollout = read_rollout(sessions / "s1.jsonl")
+    text, removed = transcript_of(rollout)
+    assert "sk-live-9f4c2ab7d3e1f0aa88b2" not in text
+    assert REDACTED in text
+    assert removed == 1
+
+
+def test_F17_05_the_models_own_answer_is_scrubbed_too(tmp_path: Path) -> None:
+    """The half that is easy to leave out, and the half that was measured.
+
+    Given a transcript in which the user *asks* for a key to be remembered,
+    gpt-4o-mini reproduced it in its extraction output 3 times out of 3.  A
+    scrub on the way in cannot help with that: the model was asked to write
+    the key down and it did.  Only the outbound pass stops it reaching a file
+    that is injected into every future request.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "s1", ["hello"])
+    rollout = read_rollout(sessions / "s1.jsonl")
+    leak = "DURABLE: yes\n## Reusable knowledge\n- The deploy key is sk-live-aaaabbbbccccdddd.\n"
+    out = asyncio.run(extract(_Scripted([leak]), rollout))
+    assert "sk-live-aaaabbbbccccdddd" not in "".join(out.bullets())
+    assert REDACTED in "".join(out.bullets())
+    assert out.secrets_removed == 1
+
+
+def test_F17_05_an_assignment_is_caught_by_its_name_not_only_its_shape() -> None:
+    """`env` output and a `.env` file are the two ways this arrives."""
+    text, hits = scrub("DATABASE_PASSWORD=hunter2hunter2\nGITHUB_TOKEN: ghp_abcdefghijklmnopqrst")
+    assert "hunter2hunter2" not in text
+    assert "ghp_abcdefghijklmnopqrst" not in text
+    assert hits == 2
+
+
+def test_F17_05_the_count_is_of_secrets_not_of_regexes() -> None:
+    """One key matched by two patterns was reported as two.
+
+    A number about the pattern list rather than about the transcript -- the
+    same shape as every measurement-tool fault in this book, in the shipped
+    code this time.
+    """
+    _, hits = scrub("STRIPE_API_KEY=sk-live-9f4c2ab7d3e1f0aa88b2")
+    assert hits == 1
+
+
+def test_F17_05_the_merge_answer_is_scrubbed_before_it_is_parsed() -> None:
+    merged = parse_merged(
+        f"{SUMMARY_MARK}\n- Deploy with token ghp_zzzzyyyyxxxxwwwwvvvv.\n{BODY_MARK}\n## A\n\nb\n"
+    )
+    assert "ghp_zzzzyyyyxxxxwwwwvvvv" not in merged.summary
+    assert merged.secrets_removed == 1
+```
+
+> 第二个测试是 §6.2 那条臂的离线版：一个**模型自己的回答**里出现了密钥（假模型直接说出来），写进 `raw/` 的文件里必须没有它。
+
+名字匹配有一个代价，值得知道：`(?i)` 加上"名字里含 KEY"，会把 `keyfunc=lambda` 或者 `tokenizer: tiktoken` 这样的普通代码也换成 `<redacted>`，报告里的"N secret(s) removed"会偏多。这是往安全的方向错，没有改；章末练习 4 是它。
+
 ## §7 F17-02：后台工作给前台让路
 
 ### 7.1 provider 到底说了什么
@@ -918,6 +2604,192 @@ ollama 一个 rate-limit 头都不发。所以 `headroom()` 会返回 `None`，
 
 ---
 
+### 7.5 代码：`RateLimit`，和读它的那一行
+
+`src/minicodex/model.py`，在 `ModelHTTPError` 上面加一个类型：
+
+```python
+@dataclass(frozen=True)
+class RateLimit:
+    """How much of the provider's window is left, as the provider reports it.
+
+    Read off the response headers of a *successful* request, which is the only
+    moment it is free.  Chapter 12 already parses these headers, but only out
+    of a 429 -- by which time the information is a description of the wall the
+    program has just hit.  Chapter 17 needs the same numbers before anything
+    goes wrong, because the decision it makes is "should this optional work
+    happen at all" (F17-02).
+
+    Everything is optional because not every server speaking this API sends
+    any of it: a local ollama sends none, and `headroom()` returning `None`
+    means "unknown", which the caller must not read as "plenty".
+    """
+
+    remaining_requests: int | None = None
+    limit_requests: int | None = None
+    remaining_tokens: int | None = None
+    limit_tokens: int | None = None
+
+    @classmethod
+    def from_headers(cls, headers: Any) -> RateLimit | None:
+        table = {str(k).lower(): str(v) for k, v in dict(headers).items()}
+
+        def number(name: str) -> int | None:
+            raw = table.get(name)
+            try:
+                return int(raw) if raw is not None else None
+            except ValueError:  # pragma: no cover - a provider sending "1k"
+                return None
+
+        value = cls(
+            remaining_requests=number("x-ratelimit-remaining-requests"),
+            limit_requests=number("x-ratelimit-limit-requests"),
+            remaining_tokens=number("x-ratelimit-remaining-tokens"),
+            limit_tokens=number("x-ratelimit-limit-tokens"),
+        )
+        return value if value.headroom() is not None else None
+
+    def headroom(self) -> float | None:
+        """The tighter of the two windows, as a percentage.  `None` if unknown.
+
+        The *minimum* of requests and tokens, not an average: they are two
+        separate buckets and running out of either one stops the program.
+        """
+        pairs = [
+            (self.remaining_requests, self.limit_requests),
+            (self.remaining_tokens, self.limit_tokens),
+        ]
+        seen = [100.0 * left / total for left, total in pairs if left is not None and total]
+        return min(seen) if seen else None
+```
+
+> - 四个字段全是"可以没有"（`int | None`）：不是每个服务商都发这些头，本地的 Ollama 一个都不发。
+> - **`@classmethod from_headers(cls, headers)`**：一个"从响应头造出一个 `RateLimit`"的构造办法。`cls` 就是这个类本身。先把所有头名变成小写放进字典（HTTP 头名不区分大小写）；`number(name)` 取一个头、转成整数，取不到或转不了就是 `None`。四个都没有的话（`headroom()` 算不出来），返回 `None`。
+> - **`headroom()`**：剩余的百分比，**取两个桶里紧的那个**（§7.2）。`left is not None and total` 同时排除了"没这个头"和"总数是 0"（除以 0）。
+
+`ChatCompletionsModel.__init__` 里多一个属性：
+
+```python
+        self.rate_limit: RateLimit | None = None
+```
+
+`stream()` 里，收到 200 之后、读响应体之前：
+
+```python
+# Before the first byte of the body: the headers are already
+# here, and reading them costs nothing.  Assigned even when
+# they are absent -- `None` is the honest answer for a server
+# that does not report, and the caller is required to treat it
+# as unknown rather than as unlimited.
+self.rate_limit = RateLimit.from_headers(resp.headers)
+```
+
+```python
+def test_F17_02_no_quota_left_means_the_writer_does_not_run(tmp_path: Path) -> None:
+    report = asyncio.run(
+        run_pipeline(
+            _Scripted([]),
+            directory=tmp_path / "mem",
+            sessions_dir=tmp_path / "sessions",
+            jobs_path=tmp_path / "jobs.db",
+            headroom=5.0,
+        )
+    )
+    assert report.skipped
+    assert "5%" in report.describe()
+    assert not (tmp_path / "mem").exists()
+
+
+def test_F17_02_an_unknown_headroom_is_not_read_as_empty(tmp_path: Path) -> None:
+    """`None` means the provider does not report, which ollama does not.
+
+    Treating unknown as zero switches the feature off against every server
+    that sends no rate-limit headers; treating it as full is the honest
+    default and is written down as a choice rather than left to be inferred.
+    """
+    report = asyncio.run(
+        run_pipeline(
+            _Scripted([]),
+            directory=tmp_path / "mem",
+            sessions_dir=tmp_path / "sessions",
+            jobs_path=tmp_path / "jobs.db",
+            headroom=None,
+        )
+    )
+    assert not report.skipped
+
+
+def test_F17_02_the_headers_are_read_off_a_real_response() -> None:
+    """Driven through the real `stream()`, not through `from_headers` alone.
+
+    Chapter 6 paid for this distinction: a test that reimplements the parsing
+    it is checking stays green when the parsing is deleted.  Mutation testing
+    found the same hole here -- `self.rate_limit = None` left every other
+    assertion in this file passing, because nothing else in the suite makes
+    the client read a response.
+    """
+    import httpx
+
+    from minicodex.model import ChatCompletionsModel
+
+    body = (
+        'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=body,
+            headers={
+                "content-type": "text/event-stream",
+                "x-ratelimit-limit-requests": "10000",
+                "x-ratelimit-remaining-requests": "2000",
+                "x-ratelimit-limit-tokens": "200000",
+                "x-ratelimit-remaining-tokens": "40000",
+            },
+        )
+
+    model = ChatCompletionsModel(transport=httpx.MockTransport(handler))
+    assert model.rate_limit is None
+
+    async def drain() -> None:
+        async for _ in model.stream([{"role": "user", "content": "hi"}]):
+            pass
+
+    asyncio.run(drain())
+    assert model.rate_limit is not None
+    assert model.rate_limit.headroom() == pytest.approx(20.0)
+
+
+def test_F17_02_the_threshold_is_the_tighter_of_the_two_windows() -> None:
+    """Requests and tokens are separate buckets; running out of either stops you."""
+    limit = RateLimit(
+        remaining_requests=9987,
+        limit_requests=10000,
+        remaining_tokens=20000,
+        limit_tokens=200000,
+    )
+    assert limit.headroom() == pytest.approx(10.0)
+    assert limit.headroom() < MIN_RATE_LIMIT_REMAINING_PERCENT
+
+    # A real header set, copied from `probe_memory_write.py quota`.
+    healthy = RateLimit.from_headers(
+        {
+            "x-ratelimit-limit-requests": "10000",
+            "x-ratelimit-limit-tokens": "200000",
+            "x-ratelimit-remaining-requests": "9987",
+            "x-ratelimit-remaining-tokens": "199996",
+        }
+    )
+    assert healthy is not None
+    assert healthy.headroom() == pytest.approx(99.87, abs=0.01)
+
+    assert RateLimit.from_headers({"content-type": "application/json"}) is None
+```
+
+> - 第三个测试的说明里记着一次失败：第一版测的是"我自己去调 `from_headers`"，于是把 `stream()` 里那一行删掉，测试照样全绿——第 6 章那条"测试重新实现了被测代码"第三次。现在它用 `httpx.MockTransport` 造一个带这些头的假响应，**走真正的 `stream()`**，然后看 `rate_limit` 有没有被设上。
+
 ## §8 F17-09：模型只能提案，落盘只有一个人
 
 ### 8.1 那个显然的设计，和它为什么不能要
@@ -986,8 +2858,8 @@ def test_F17_09_the_version_line_is_the_programs_claim_not_the_models() -> None:
 
 ### 8.4 这个工具到底有没有人用
 
-第 16 章的 F16-09 有一条很硬的结论：**需要模型主动选择进入的阶段，模型就是不进**
-（36 次运行，`memory_search` 被调 3 次）。那这个 `remember_this` 呢？
+第 16 章有一条很硬的结论：**需要模型主动选择进入的阶段，模型就是不进**
+（`memory_search` 在 12 次有机会用的运行里只被调了 1 次，第 16 章 §11.4）。那这个 `remember_this` 呢？
 
 同一条约定，两种说法，各三次：
 
@@ -1003,10 +2875,755 @@ def test_F17_09_the_version_line_is_the_programs_claim_not_the_models() -> None:
 而"顺口说的约定"由抽取管线负责——`docstrings` / `runner` / `layout` 三条会话
 证明它确实抓得到。两条路互补，谁也不能替代谁。
 
-这也解释了为什么这个工具留下来了，而第 16 章的 `memory_search` 被收进了
-"只在装不下时才挂"：**这个工具有 3/3 的调用记录，那个有 3/36。**
+这也解释了为什么这个工具默认就在（只要开了 `--remember`），而第 16 章的 `memory_search` 默认关着、要 `--dedicated-tools` 才有：**这个工具在"用户说了请记住"时 3/3 被调用，那个 12 次里 1 次。**
 
 ---
+
+### 8.5 代码：模型的出口箱
+
+```python
+# Notes: the only thing a model may add, and it may only add
+# ---------------------------------------------------------------------------
+
+NOTE_NAME = "remember_this"
+
+NOTE_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": NOTE_NAME,
+        "description": (
+            "Propose one durable fact about this repository for the memory used by "
+            "future sessions. Use it when the user states a convention, or when you "
+            "find something expensive to discover that will be needed again. Do not "
+            "use it for what you did in this session, for anything true only of this "
+            "task, or for anything you have not confirmed. The note is a proposal: "
+            "it is reviewed and merged later, not written into memory now."
+        ),
+        "parameters": {
+            "type": "object",
+            "required": ["note"],
+            "properties": {
+                "note": {
+                    "type": "string",
+                    "description": (
+                        "One sentence, standing on its own, understandable by someone "
+                        "who has not read this conversation. Example: this project is "
+                        "run with `uv run`, never with a bare `python`."
+                    ),
+                }
+            },
+        },
+    },
+}
+
+# A note is a sentence.  Anything longer is a session transcript arriving by
+# another door, and the merge step reads all of these on every run.
+MAX_NOTE_CHARS = 400
+
+# What the system prompt says when the tool is present, and only then --
+# chapter 5's F05-10, which measured a model calling a tool the prompt named
+# and the policy did not have, 2/3.
+#
+# The last sentence is the one worth arguing about.  Everything the session
+# does is extracted afterwards anyway, so this tool is not the only route into
+# memory; it is the route for the things a transcript does not show, which is
+# mostly the user saying "always do X".  Saying that plainly is cheaper than
+# hoping the model infers the division of labour.
+REMEMBER_INSTRUCTIONS = (
+    f"You can propose something for this repository's long-term memory with "
+    f"`{NOTE_NAME}`. Use it when the user tells you how things are done here, or "
+    "when you find something that cost you several steps to discover and will be "
+    "needed again. One sentence, written for a session that cannot see this "
+    "conversation. Do not use it to record what you did. Everything else in this "
+    "session is reviewed for memory automatically afterwards, so a note is only "
+    "worth writing for something a reader of the transcript would miss."
+)
+
+
+def remember_instructions() -> str:
+    return REMEMBER_INSTRUCTIONS
+
+
+def note_toolset(directory: Path, *, limit: int = 5) -> ToolSet:
+    """`remember_this`: append a proposal, and nothing else.
+
+    This is the whole of F17-09.  The obvious design -- let the model edit
+    `MEMORY.md`, it is only markdown -- gives a model that has been told to add
+    one line the ability to rewrite the file it is adding it to, and the
+    failure is not that it refuses: it is that it re-emits the parts it
+    remembers and drops the rest, silently, in a file nobody diffs.  Chapter
+    4's F04-02 with no reviewer.
+
+    So the model gets an append-only outbox.  One file per note; the name
+    carries time and pid so two processes never choose the same one; nothing is
+    ever opened for writing twice.  The merge step reads the directory and is
+    the only thing that touches memory itself.
+
+    `limit` is per tool set, which is per run: a model that finds the tool
+    rewarding can otherwise turn one session into fifty proposals, and the
+    merge step pays for every one of them.
+    """
+    written = 0
+
+    async def do_note(args: dict[str, Any]) -> str:
+        nonlocal written
+        note = args.get("note")
+        if not isinstance(note, str) or not note.strip():
+            return tool_error(
+                f'{NOTE_NAME} needs a "note" argument, a non-empty string',
+                you_sent=repr(args.get("note")),
+                do_this='Example: {"note": "Tests are run with `python -m pytest`."}',
+            )
+        if written >= limit:
+            return tool_error(
+                f"{limit} note(s) is the limit for one session",
+                do_this="Continue with the task; what you have proposed is enough.",
+            )
+        body, _ = scrub(note.strip()[:MAX_NOTE_CHARS])
+        written += 1
+        path = propose(Path(directory), body)
+        return (
+            f"Proposed. It is not memory yet: it goes to {path.parent.name}/ and is "
+            "reviewed when memory is next merged."
+        )
+
+    return ToolSet(handlers={NOTE_NAME: do_note}, schemas=[NOTE_SCHEMA])
+
+
+def propose(directory: Path, note: str, *, now: float | None = None) -> Path:
+    """Write one proposal file.  Never overwrites, never edits, never merges."""
+    stamp = now if now is not None else time.time()
+    notes = Path(directory) / NOTES_DIR
+    notes.mkdir(parents=True, exist_ok=True)
+    for suffix in range(100):
+        name = f"{int(stamp)}-{os.getpid()}-{suffix}.md"
+        path = notes / name
+        if not path.exists():
+            path.write_text(note.strip() + "\n", encoding="utf-8")
+            return path
+    raise MemoryWriteError(f"cannot find an unused note name in {notes}")  # pragma: no cover
+
+
+def pending_notes(directory: Path) -> tuple[tuple[Path, str], ...]:
+    notes = Path(directory) / NOTES_DIR
+    if not notes.is_dir():
+        return ()
+    out = []
+    for path in sorted(notes.glob("*.md")):
+        try:
+            out.append((path, path.read_text(encoding="utf-8").strip()))
+        except OSError:  # pragma: no cover - unreadable proposal is not fatal
+            continue
+    return tuple(out)
+
+
+def pending_raw(directory: Path) -> tuple[tuple[Path, str], ...]:
+    raw = Path(directory) / RAW_DIR
+    if not raw.is_dir():
+        return ()
+    out = []
+    for path in sorted(raw.glob("*.md")):
+        try:
+            out.append((path, path.read_text(encoding="utf-8")))
+        except OSError:  # pragma: no cover
+            continue
+    return tuple(out)
+
+
+def write_raw(directory: Path, stage1: Stage1) -> Path:
+    raw = Path(directory) / RAW_DIR
+    raw.mkdir(parents=True, exist_ok=True)
+    path = raw / f"{stage1.session_id or 'unknown'}.md"
+    path.write_text(render_stage1(stage1), encoding="utf-8")
+    return path
+```
+
+> - **`NOTE_SCHEMA`**：工具说明的写法是第 3 章的规矩——什么时候用、什么时候**别**用、参数长什么样、给一个例子。最后一句"这只是一个提议，以后审核、合并，现在不会写进记忆"是说给模型听的：它不该以为写了就生效。
+> - **`MAX_NOTE_CHARS = 400`**：一条笔记是一句话。更长的就是"会话记录从另一扇门进来了"。
+> - **`REMEMBER_INSTRUCTIONS`**：只在这个工具存在时才加进系统提示词（第 5 章 F05-10）。最后一句讲了分工：会话里的一切事后都会被自动审一遍，所以这个工具只值得用在"读会话记录的人会漏掉的东西"上——主要是用户说"以后都这样"。
+> - **`note_toolset`**：和第 16 章的 `memory_toolset` 一样，用一个闭包里的计数器（`nonlocal written`）限制次数：一次会话最多 5 条。参数不对返回第 3 章格式的错误，**不扣次数**。笔记先截到 400 字、再脱敏，然后交给 `propose`。
+> - **`propose`**：写一个文件，**永远不覆盖**。文件名是"时间戳-pid-序号"；`for suffix in range(100)` 找第一个不存在的名字。同一秒、同一个进程写两条，就是 `-0`、`-1`。
+> - **`pending_notes`**、**`pending_raw`**：读出 `notes/`、`raw/` 里所有的文件，按文件名排序（于是按时间排序）。
+> - **`write_raw`**：第一段的结果写成 `raw/<会话 id>.md`。
+
+`composition.py` 的导入区加 `from minicodex.memory_write import note_toolset`，`top_level_tools` 多一个参数 `remember: Path | None = None`，函数末尾：
+
+```python
+# Chapter 17's one model-facing tool, and the only write access a model has
+# to memory anywhere in this program: it appends a proposal to `notes/` and
+# cannot touch `MEMORY.md` (F17-09).  A separate switch from `memory=`
+# because reading and writing are separate consents -- a user may well want
+# the agent to use what it knows without it recording anything new.
+if remember is not None:
+    tools = tools.plus(note_toolset(remember))
+```
+
+`__main__.py` 的 `_instructions` 多一段，和计划、记忆那两段一样"工具在才说"：
+
+```python
+# Chapter 17's note tool, on the same condition and for the same reason,
+# and read off the tool table rather than off a flag of its own: writing is
+# a separate consent from reading, so `--remember` without `--memory` is a
+# real configuration and the prompt has to describe that one too.
+if tools is not None and NOTE_NAME in tools.handlers:
+    parts.append(remember_instructions())
+```
+
+### 8.6 代码：第二段，和唯一写记忆的那个函数
+
+第二段的提示词：
+
+```python
+SUMMARY_MARK = "=== memory_summary.md ==="
+BODY_MARK = "=== MEMORY.md ==="
+
+STAGE2_SYSTEM = f"""\
+You maintain one repository's memory: a short resident summary that is sent
+with every request, and a longer body of sections that is consulted when
+needed. You are given what is there now, new material extracted from recent
+sessions, notes proposed during those sessions, and any edits a human made to
+the files by hand.
+
+Produce the new contents of both files.
+
+Rules:
+
+- **Human edits win and are preserved.** If the diff of hand edits shows a line
+  a person wrote, changed or removed, honour it. Do not restore something a
+  person deleted. Do not reword something a person wrote.
+- Merge duplicates. If new material says the same thing as an existing entry,
+  keep one, worded as precisely as the better of the two.
+- If new material contradicts an existing entry, the new material is more
+  recent and wins -- but say so in one clause, so the change is visible.
+- Never invent. Every line must come from something you were given.
+- No credentials, tokens or keys, ever, in either file.
+- The summary holds only what is worth sending on every single request: at most
+  eight short bullets. Everything else belongs in a section of the body.
+- The body is `## Heading` sections, each a few lines, each about one thing.
+  **Name each section after its subject** -- `## Running tests`,
+  `## Where new code goes` -- because the heading is what a future session
+  searches for and cites.
+- The headings in the material you were given (`Preference signals`,
+  `Reusable knowledge`, `Failures and how to do differently`) are the
+  extractor's filing categories. They are not subjects and must not appear in
+  what you write.
+- Say each thing once. If a preference and a failure are the same rule from two
+  angles, they are one section.
+- Keep it small. Drop any line a competent engineer opening this repository
+  could work out for themselves in thirty seconds -- what a file contains, what
+  a function does, that code should have tests.
+
+Answer with exactly this shape and nothing else -- no code fences, no
+commentary:
+
+{SUMMARY_MARK}
+- ...
+{BODY_MARK}
+## ...
+
+...
+"""
+```
+
+> - 两个**分隔标记**：模型的回答必须是"摘要标记、摘要、正文标记、正文"这个形状，程序按标记切开。
+> - 规则里最重的一条是第一条：**人手改的东西优先，并且保留**——不要恢复人删掉的，不要改写人写的。§9 量过它靠什么才做得到。
+> - "标题要按主题起名"那两条，是因为第一段的三个小节名（偏好/知识/失败）是**抽取器的归档分类**，不是主题；合并时要把它们换成 `## Running tests` 这样的、以后会被搜索和引用的名字。
+
+```python
+@dataclass(frozen=True)
+class Merged:
+    """The proposed new contents of the two files, before anything is written."""
+
+    summary: str
+    body: str
+    secrets_removed: int = 0
+
+    def entries(self) -> tuple[Entry, ...]:
+        return parse_entries(self.body)
+
+
+def parse_merged(text: str) -> Merged:
+    """Split the merge answer into the two files.
+
+    Refuses rather than guesses.  A merge answer that does not carry both
+    markers is one this program cannot place, and the tempting fallback --
+    treat the whole thing as the body -- writes the model's commentary into a
+    file that is injected into every future request.
+    """
+    if SUMMARY_MARK not in text or BODY_MARK not in text:
+        raise MemoryWriteError(
+            f"merge answer is missing its markers ({SUMMARY_MARK} / {BODY_MARK}); "
+            f"nothing was written. First 200 characters: {text[:200]!r}"
+        )
+    _, rest = text.split(SUMMARY_MARK, 1)
+    summary, body = rest.split(BODY_MARK, 1)
+    summary, hits_a = scrub(summary.strip())
+    body, hits_b = scrub(body.strip())
+    return Merged(summary=summary, body=body, secrets_removed=hits_a + hits_b)
+
+
+def merge_request(
+    *,
+    memory: Memory,
+    raw: Sequence[tuple[Path, str]],
+    notes: Sequence[tuple[Path, str]],
+    hand_edits: str,
+) -> str:
+    """Everything stage 2 is shown, as one message.
+
+    The hand-edit diff is last and labelled, because it is the input with the
+    highest authority and the one most easily read as more of the same.
+    """
+    parts = [
+        "# Memory as it stands\n",
+        f"## {SUMMARY_FILE}\n{memory.summary or '(empty)'}",
+        f"## {BODY_FILE}\n" + ("\n\n".join(e.render() for e in memory.entries) or "(empty)"),
+        "\n# New material extracted from recent sessions\n",
+    ]
+    parts.extend(text for _, text in raw)
+    if notes:
+        parts.append("\n# Notes proposed during those sessions\n")
+        parts.extend(f"- {text}" for _, text in notes)
+    if hand_edits.strip():
+        parts.append(
+            "\n# Edits a human made by hand since the last merge (git diff)\n"
+            "These are the user's own words. Preserve them.\n\n" + hand_edits
+        )
+    return "\n\n".join(parts)
+
+
+async def consolidate(
+    model: Any,
+    *,
+    memory: Memory,
+    raw: Sequence[tuple[Path, str]],
+    notes: Sequence[tuple[Path, str]] = (),
+    hand_edits: str = "",
+    system: str = STAGE2_SYSTEM,
+) -> Merged:
+    """Stage 2: one model call, and the answer is a proposal, not a write."""
+    answer = await _ask(
+        model,
+        [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": merge_request(
+                    memory=memory, raw=raw, notes=notes, hand_edits=hand_edits
+                ),
+            },
+        ],
+    )
+    return parse_merged(answer)
+```
+
+> - **`Merged`**：合并的结果，还没写盘。`entries()` 用第 16 章的 `parse_entries` 把正文切成小节。
+> - **`parse_merged`**：两个标记缺一个就**拒绝**，什么都不写。说明里写了那个诱人的退路——"没标记就把整段当正文"——会把模型的客套话写进每次都要发出去的文件里。`text.split(SUMMARY_MARK, 1)`：只在第一个标记处切一刀。切出来的两段各脱敏一次。
+> - **`merge_request`**：给第二段看的那一整条消息。顺序是：现在的记忆、新抽取的材料、模型提的笔记、**最后是用户手改的 diff**，带一句"这是用户自己的话，保留它们"。放最后、带标签，是因为它权威最高，又最容易被当成"更多的同类材料"读过去。
+> - **`consolidate`**：一次模型调用，返回的是**提议**，不是写盘。
+
+写盘：
+
+```python
+def _lock(path: Path = MERGE_LOCK) -> int:
+    """chapter 7's `O_EXCL` lock, copied deliberately.  See `MERGE_LOCK`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        holder = ""
+        try:
+            holder = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:  # pragma: no cover
+            pass
+        raise MemoryWriteError(
+            f"memory is being merged by another minicodex (pid {holder or '?'}). "
+            f"Nothing was written. Delete {path} if that process is gone."
+        ) from None
+    os.write(fd, str(os.getpid()).encode())
+    return fd
+
+
+def _unlock(fd: int, path: Path = MERGE_LOCK) -> None:
+    os.close(fd)
+    try:
+        path.unlink()
+    except OSError:  # pragma: no cover
+        pass
+
+
+def write_memory(
+    directory: Path,
+    *,
+    summary: str,
+    body: str,
+    now: float | None = None,
+    lock_path: Path | None = MERGE_LOCK,
+) -> Prune:
+    """The one function in this program that writes `MEMORY.md`.
+
+    Everything else -- the extractor, the merger, the note tool -- produces a
+    proposal.  This validates it, prunes it, writes both files under a lock,
+    updates the usage records and commits.  The ordering matters in one place:
+    **validation happens before anything is opened for writing**, which is
+    chapter 4's two-phase apply (F04-11) at a different scale.  A merge answer
+    that parses into no entries at all is refused rather than written, for
+    chapter 6's reason about an empty summary (F06-08): that is not a smaller
+    memory, it is a destroyed one.
+
+    `lock_path=None` means the caller already holds the lock, which is what
+    `run_pipeline` does: it has to hold it across the whole of stage 2, not
+    only across this write (see the comment there).
+    """
+    stamp = now if now is not None else time.time()
+    directory = Path(directory)
+    entries = parse_entries(body)
+    if not entries and not summary.strip():
+        raise MemoryWriteError(
+            "the merge produced neither a summary nor a section; refusing to "
+            "replace the existing memory with nothing"
+        )
+
+    counts = _usage(directory)
+    kept = prune(entries, counts, now=stamp)
+    summary = trim_summary(summary.strip(), kept.kept)
+
+    fd = _lock(lock_path) if lock_path is not None else None
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / SUMMARY_FILE).write_text(f"{FORMAT_VERSION}\n\n{summary}\n", encoding="utf-8")
+        body_text = "\n\n".join(entry.render() for entry in kept.kept)
+        (directory / BODY_FILE).write_text(
+            f"{FORMAT_VERSION}\n\n{body_text}\n" if body_text else f"{FORMAT_VERSION}\n",
+            encoding="utf-8",
+        )
+        _record_first_seen(directory, kept, counts, now=stamp)
+    finally:
+        if fd is not None and lock_path is not None:
+            _unlock(fd, lock_path)
+    return kept
+```
+
+> - **`_lock`**：第 7 章的锁，第二份（§2.4）。`O_CREAT | O_EXCL`：文件已经存在就失败。失败时读出里面的 pid，报错说"另一个 minicodex 正在合并（pid ...），如果那个进程已经没了，删掉这个文件"。成功就把自己的 pid 写进去。
+> - **`_unlock`**：关掉、删掉。
+> - **`write_memory`**：
+>   1. **先校验**：正文切不出任何小节、摘要也是空的——拒绝。那不是一份小一点的记忆，是一份被销毁的记忆（第 6 章 F06-08）。
+>   2. 读引用计数，**遗忘**（§10 的 `prune`），把摘要**裁到第 16 章的上限**（§10 的 `trim_summary`）。
+>   3. 拿锁（`lock_path=None` 表示调用者已经拿着了，§8.7），写两个文件，第一行由**程序**写上 `v1`（§8.3），更新 `usage.json`，放锁。
+
+```python
+def test_F17_09_the_note_tool_cannot_touch_the_memory_files(tmp_path: Path) -> None:
+    """The whole of F17-09 in one assertion.
+
+    `remember_this` is the only write access a model has anywhere in this
+    program, and what it writes is a file in `notes/` that nothing reads as
+    memory.  Letting it edit `MEMORY.md` instead is chapter 4's F04-02 with no
+    reviewer: a model asked to add one line rewrites the file and silently
+    drops the parts it did not re-emit.
+    """
+    write_memory(tmp_path, summary="- a", body="## A\n\nb\n", lock_path=tmp_path / "merge.lock")
+    before = (tmp_path / BODY_FILE).read_text(encoding="utf-8")
+    tools = note_toolset(tmp_path)
+    answer = asyncio.run(tools.handlers[NOTE_NAME]({"note": "The linter is `ruff check --fix`."}))
+
+    assert "Proposed" in answer
+    assert (tmp_path / BODY_FILE).read_text(encoding="utf-8") == before
+    assert (tmp_path / SUMMARY_FILE).exists()
+    notes = pending_notes(tmp_path)
+    assert len(notes) == 1
+    assert notes[0][1] == "The linter is `ruff check --fix`."
+    assert notes[0][0].parent.name == NOTES_DIR
+
+
+def test_F17_09_a_note_never_overwrites_another_note(tmp_path: Path) -> None:
+    """Append-only, applied to a directory instead of to a file (chapter 7)."""
+    first = propose(tmp_path, "one", now=1000.0)
+    second = propose(tmp_path, "two", now=1000.0)
+    assert first != second
+    assert {p.read_text(encoding="utf-8").strip() for p, _ in pending_notes(tmp_path)} == {
+        "one",
+        "two",
+    }
+
+
+def test_F17_09_a_note_is_scrubbed_and_bounded(tmp_path: Path) -> None:
+    tools = note_toolset(tmp_path)
+    asyncio.run(tools.handlers[NOTE_NAME]({"note": "token ghp_abcdefghijklmnopqrst " + "x" * 900}))
+    text = pending_notes(tmp_path)[0][1]
+    assert "ghp_abcdefghijklmnopqrst" not in text
+    assert len(text) <= 400
+
+
+def test_F17_09_one_session_may_not_propose_fifty_notes(tmp_path: Path) -> None:
+    tools = note_toolset(tmp_path, limit=2)
+    for _ in range(2):
+        asyncio.run(tools.handlers[NOTE_NAME]({"note": "a rule"}))
+    refusal = asyncio.run(tools.handlers[NOTE_NAME]({"note": "a rule"}))
+    assert "limit" in refusal
+    assert len(pending_notes(tmp_path)) == 2
+
+
+def test_F17_09_a_bad_argument_is_chapter_threes_three_part_error(tmp_path: Path) -> None:
+    tools = note_toolset(tmp_path)
+    answer = asyncio.run(tools.handlers[NOTE_NAME]({"note": ""}))
+    assert "you sent" in answer.lower()
+    assert "Example:" in answer
+    assert pending_notes(tmp_path) == ()
+
+
+def test_F17_09_the_writer_refuses_to_replace_a_memory_with_nothing(tmp_path: Path) -> None:
+    """Chapter 6's empty-summary rule (F06-08) on a file that outlives the run.
+
+    An empty merge answer is not a smaller memory, it is a destroyed one, and
+    validation happens before anything is opened for writing -- chapter 4's
+    two-phase apply at a different scale.
+    """
+    write_memory(tmp_path, summary="- a", body="## A\n\nb\n", lock_path=tmp_path / "merge.lock")
+    with pytest.raises(MemoryWriteError):
+        write_memory(tmp_path, summary="  ", body="", lock_path=tmp_path / "merge.lock")
+    assert "## A" in (tmp_path / BODY_FILE).read_text(encoding="utf-8")
+
+
+def test_F17_09_a_merge_answer_without_its_markers_is_refused() -> None:
+    """The tempting fallback -- treat the whole thing as the body -- writes the
+    model's commentary into a file injected into every future request."""
+    with pytest.raises(MemoryWriteError) as caught:
+        parse_merged("Sure! Here is your updated memory:\n\n## Tests\n\nRun pytest.\n")
+    assert "markers" in str(caught.value)
+
+
+def test_F17_09_what_is_written_is_readable_by_chapter_sixteen(tmp_path: Path) -> None:
+    """The two halves of the subsystem meet at one file format, so the write
+    path's output is checked with the read path's parser."""
+    write_memory(
+        tmp_path,
+        summary="- Run tests with `python -m pytest`.",
+        body="## Running tests\n\nUse `python -m pytest`.\n\n## Layout\n\nHelpers live in util/.\n",
+        lock_path=tmp_path / "merge.lock",
+    )
+    memory = load(tmp_path)
+    assert memory.summary == "- Run tests with `python -m pytest`."
+    assert [e.title for e in memory.entries] == ["Running tests", "Layout"]
+    assert (tmp_path / SUMMARY_FILE).read_text(encoding="utf-8").startswith(FORMAT_VERSION)
+    assert (tmp_path / BODY_FILE).read_text(encoding="utf-8").startswith(FORMAT_VERSION)
+
+
+def test_F17_09_the_version_line_is_the_programs_claim_not_the_models() -> None:
+    """The model is never asked to emit `v1`, so it can never get it wrong."""
+    assert FORMAT_VERSION not in STAGE2_SYSTEM
+    assert SUMMARY_MARK in STAGE2_SYSTEM
+    assert BODY_MARK in STAGE2_SYSTEM
+
+
+def test_F17_03_the_merge_lock_names_the_process_holding_it(tmp_path: Path) -> None:
+    """Chapter 7's lock, second implementation, same refusal.
+
+    The message has to name the pid: a stale lock is otherwise a program that
+    stopped working with no way to find out why.
+    """
+    lock = tmp_path / "merge.lock"
+    write_memory(tmp_path / "mem", summary="- a", body="## A\n\nb\n", lock_path=lock)
+    assert not lock.exists(), "the lock is released when the write finishes"
+
+    lock.write_text("4242", encoding="utf-8")
+    with pytest.raises(MemoryWriteError) as caught:
+        write_memory(tmp_path / "mem", summary="- a", body="## A\n\nb\n", lock_path=lock)
+    assert "4242" in str(caught.value)
+    assert "Nothing was written" in str(caught.value)
+```
+
+### 8.7 改写时发现：锁只锁住了"写"，没锁住"读了再写"
+
+`write_memory` 在写的时候拿锁。听起来够了。改写时我把这件事换了个问法：**两个 `minicodex` 同时启动，各自带着 `--remember`，会发生什么？**
+
+第一段没问题：任务表保证它们认领到不同的会话（§4）。第二段是这样的：
+
+1. 进程 A 读出现在的记忆、读出 `raw/` 里的材料，然后**花一次模型调用**去合并——几秒钟。
+2. 这几秒里，进程 B 抽取完它的会话，也读出记忆（**还是旧的**）和 `raw/`，合并，拿锁，写盘，放锁，删掉它用过的 `raw/` 文件。
+3. A 的模型调用回来了。A 拿锁，写盘——**它的结果是在旧记忆上合出来的**，B 刚写进去的东西不在里面。
+
+用两个假模型把这个顺序摆出来（A 的合并卡住，等 B 做完再放行）：
+
+```
+A memory writer: 1 session(s) read, 1 entr(ies), nothing forgotten in 0.4s
+B memory writer: 1 session(s) read, 1 entr(ies), nothing forgotten in 0.0s
+sections on disk: ['Tooling A']
+raw left: []
+```
+
+**两个都报告成功。B 那次会话学到的东西，两个文件里都没有，它的 `raw/` 文件也被 B 自己删了。** 什么都没剩下。
+
+这是数据库里叫"丢失更新"的那种错：两个人各自"读—改—写"，后写的那个覆盖了先写的。锁只包住了"写"，没包住"读了再写"。
+
+修法：**第二段从第一次读到最后一次删，全程拿着锁**。拿不到锁的那个进程**不等、也不报错**——它的抽取结果已经在 `raw/` 里了，正是拿着锁的那个进程（或者下一次运行）会去找的地方。
+
+`run_pipeline` 的后半段（完整的函数在 §13.4）：
+
+```python
+def report(**extra: Any) -> WriteReport:
+    return WriteReport(
+        sessions=tuple(read),
+        empty=tuple(empty),
+        secrets_removed=secrets,
+        seconds=time.monotonic() - began,
+        failed=tuple(failed),
+        **extra,
+    )
+
+# Stage 2 runs under the merge lock from the first read to the last
+# delete, not only around the write. The first version took the lock
+# inside `write_memory`, so two processes could each read the memory, each
+# spend a model call merging, and then write one after the other: the
+# second write was built on a memory from before the first, and silently
+# replaced it. Measured with two overlapping runs over two sessions: both
+# reported success, one session's material was in neither file, and its
+# `raw/` file had been deleted by the run whose write was then overwritten.
+#
+# A run that finds the lock taken does not wait for it and does not fail.
+# Its extraction is already in `raw/`, which is exactly where the run
+# holding the lock -- or the next one -- will look.
+try:
+    fd = _lock(lock_path)
+except MemoryWriteError:
+    return report(deferred="another minicodex")
+try:
+    raw = pending_raw(directory)
+    notes = pending_notes(directory)
+    if not raw and not notes:
+        return report()
+
+    ensure_repo(directory)
+    write_gitignore(directory)
+    from minicodex.memory import load as load_memory
+
+    # Read here, under the lock, and never taken from the caller. A
+    # memory loaded when the session started is one some other process
+    # may have rewritten since, which is the lost update above by a
+    # second route.
+    current = load_memory(directory)
+    merged = await consolidate(
+        model, memory=current, raw=raw, notes=notes, hand_edits=hand_edits(directory)
+    )
+    pruned = write_memory(
+        directory, summary=merged.summary, body=merged.body, now=stamp, lock_path=None
+    )
+    commit(directory, f"memory: {len(raw)} session(s), {len(notes)} note(s)")
+    # Consumed only once the write succeeded.  The other order loses the
+    # extraction work on any failure in the merge, and the extraction is the
+    # expensive half.
+    for path, _ in (*raw, *notes):
+        try:
+            path.unlink()
+        except OSError:  # pragma: no cover
+            pass
+finally:
+    _unlock(fd, lock_path)
+```
+
+> - **`report(**extra)`**：一个局部的小函数，造一份报告；四个返回点都用它，只是各自多带一两个字段。`**extra` 把关键字参数原样传进 `WriteReport(...)`。
+> - **`fd = _lock(lock_path)` 在读任何东西之前。** 拿不到（`MemoryWriteError`）就返回一份 `deferred="another minicodex"` 的报告。
+> - **`current = load_memory(directory)`**：在锁里面重新从磁盘读。以前这里会优先用调用者传进来的 `memory`——那是**这次会话启动时**读的，等走到这一步，别的进程可能已经改过了。同一个丢失更新，换了一条路。于是 `run_pipeline` 的 `memory` 参数删掉了，`__main__` 和 Web 控制台里传它的地方也删了。
+> - `write_memory(..., lock_path=None)`：锁已经在手里，别再拿一次（同一个进程再 `O_EXCL` 一次会失败）。
+> - **`finally: _unlock(...)`**：不管怎么结束——正常写完、没东西可合、合并时出错——都放锁。
+
+`WriteReport` 多一个字段 `deferred`，`describe()` 里多一种说法：
+
+```python
+        elif self.deferred:
+            parts.append(f"merge left to {self.deferred}")
+```
+
+同样的两个进程，修完之后：
+
+```
+A memory writer: 1 session(s) read, 1 entr(ies), nothing forgotten in 0.4s
+B memory writer: 1 session(s) read, merge left to another minicodex in 0.0s
+sections on disk: ['Tooling A']
+raw left: ['b.md']
+```
+
+B 的材料在 `raw/` 里等着，下一次运行把它合进去。
+
+```python
+class _GatedMerge:
+    """Stage 1 answers at once with `fact`; stage 2 waits for `gate`, then
+    keeps every section it was shown and adds `title`."""
+
+    tools: ClassVar[list[dict[str, Any]]] = []
+
+    def __init__(self, fact: str, title: str, gate: asyncio.Event | None = None) -> None:
+        self.fact, self.title, self.gate = fact, title, gate
+
+    async def _stream(self, messages: Any) -> Any:
+        from minicodex.model import Completed, TextDelta
+
+        if "maintain one repository's memory" in messages[0]["content"]:
+            if self.gate is not None:
+                await self.gate.wait()
+            current = [e.title for e in load(self.directory).entries]
+            sections = "\n\n".join(f"## {t}\n\nkept." for t in [*current, self.title])
+            yield TextDelta(f"{SUMMARY_MARK}\n- s\n{BODY_MARK}\n{sections}\n")
+        else:
+            yield TextDelta(f"DURABLE: yes\n## Preference signals\n- {self.fact}\n")
+        yield Completed("stop")
+
+    def stream(self, messages: Any) -> Any:
+        return self._stream(messages)
+
+
+def test_two_overlapping_writers_do_not_lose_a_merge(tmp_path: Path) -> None:
+    """The lock used to be taken inside `write_memory` only.
+
+    Two runs each read the memory, each spent a model call merging, and then
+    wrote one after the other: the later write was built on a memory from
+    before the earlier one. Both reported success, one session's material
+    was in neither file, and its `raw/` file had been deleted. Now the lock
+    covers all of stage 2, and a run that finds it taken leaves its `raw/`
+    file for whoever holds it.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "a", ["use uv"])
+    _write_session(sessions, "b", ["use ruff"])
+    directory = tmp_path / "mem"
+    kw: dict[str, Any] = {
+        "directory": directory,
+        "sessions_dir": sessions,
+        "jobs_path": tmp_path / "jobs.db",
+        "lock_path": tmp_path / "merge.lock",
+        "limit": 1,
+    }
+
+    async def scenario() -> tuple[Any, Any]:
+        gate = asyncio.Event()
+        slow, fast = (
+            _GatedMerge("Use uv.", "Tooling A", gate),
+            _GatedMerge("Use ruff.", "Tooling B"),
+        )
+        slow.directory = fast.directory = directory  # type: ignore[attr-defined]
+        first = asyncio.create_task(run_pipeline(slow, **kw))
+        await asyncio.sleep(0.2)  # the first run is inside its merge, lock held
+        second = await run_pipeline(fast, **kw)
+        gate.set()
+        return await first, second
+
+    first, second = asyncio.run(scenario())
+    assert first.merged
+    assert second.deferred and not second.merged
+    assert "merge left to" in second.describe()
+    # The second run's extraction is waiting, not lost...
+    assert [p.name for p, _ in pending_raw(directory)] == ["b.md"]
+    # ...and the next run merges it on top of the first run's result.
+    final = _GatedMerge("", "Tooling B")
+    final.directory = directory  # type: ignore[attr-defined]
+    asyncio.run(run_pipeline(final, **kw))
+    assert [e.title for e in load(directory).entries] == ["Tooling A", "Tooling B"]
+```
+
+> - **`_GatedMerge`**：一个假模型。被问到第一段（抽取）时马上回答；被问到第二段（看系统提示词里有没有 "maintain one repository's memory"）时，先 `await self.gate.wait()`——等测试放行——然后把**当前磁盘上**已有的小节和自己的那一节一起交回去，像一个称职的合并那样。
+> - 测试的顺序：A 启动；等 0.2 秒，让 A 走进合并、拿着锁、卡在 `gate` 上；B 跑完（拿不到锁，延后）；放行 A。断言 A 合并了、B 延后了、`b.md` 还在。最后再跑一次，`b.md` 被合进去，两节都在。
+> - `asyncio.create_task(...)` 和 `asyncio.Event()`：两个"进程"在这里是同一个事件循环里的两个任务。锁是文件锁，同一个进程里也一样生效。
+
+这一条为什么第一次写这一章时没撞上？因为这一章所有的测量都是**一个进程**跑的。§4 为"两个进程同时启动"专门造了一张表，然后整条管线只在第一段用到了它。
 
 ## §9 F17-08：把合并冲突交给一个已经解决它的工具
 
@@ -1107,6 +3724,202 @@ def _force(func: Any, path: str, _exc: BaseException) -> None:
 
 ---
 
+### 9.5 代码：五个小函数包住 `git`
+
+```python
+# git: the merge conflict problem, handed to something that has solved it
+# ---------------------------------------------------------------------------
+
+
+def _git(directory: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(directory), *args],
+        capture_output=True,
+        text=True,
+        check=check,
+        timeout=30,
+    )
+
+
+def git_available() -> bool:
+    try:
+        return _git(Path("."), "--version").returncode == 0
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - git missing
+        return False
+
+
+def ensure_repo(directory: Path) -> bool:
+    """Make the memory directory a git repository, if it is not one already.
+
+    codex does the same thing to `~/.codex/memories/`, initialising a git
+    baseline under the memory root and diffing the worktree against it to
+    build the input its consolidation agent reads.  The reason is F17-08
+    rather than version control for its own sake: **the merge step needs to
+    know what a human changed**, and "what changed since the last time this
+    program wrote the file" is exactly what `git diff` answers.  Writing that
+    from scratch means storing a shadow copy and diffing it, which is storing a
+    shadow copy and diffing it.
+
+    Returns False when git is not available, and everything downstream then
+    degrades to "no hand edits detected" -- which is the safe direction: the
+    merge prompt's instruction to preserve what a person wrote still applies to
+    the memory it is shown, it simply has no diff to point at.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if (directory / ".git").exists():
+        return True
+    if not git_available():
+        return False
+    if _git(directory, "init", "--quiet").returncode != 0:  # pragma: no cover
+        return False
+    # A repository nobody configured cannot commit: `user.email` and
+    # `user.name` are not set in CI images, and the failure appears at the
+    # first commit rather than here.  Set locally, never globally.
+    _git(directory, "config", "user.email", "minicodex@localhost")
+    _git(directory, "config", "user.name", "minicodex")
+    _git(directory, "config", "commit.gpgsign", "false")
+    return True
+
+
+def hand_edits(directory: Path) -> str:
+    """What changed in the memory files since this program last committed.
+
+    Everything in the working tree that is not committed is, by definition,
+    not this program's work: it writes and commits in one operation.  So the
+    diff is the user's -- or another tool's, or a merge conflict someone left
+    behind -- and the merge prompt is told to treat it as authority.
+
+    Empty string when git is unavailable or the repository has no commits yet.
+    """
+    directory = Path(directory)
+    if not (directory / ".git").exists():
+        return ""
+    result = _git(directory, "diff", "--", SUMMARY_FILE, BODY_FILE)
+    if result.returncode != 0:  # pragma: no cover - a broken repository is not fatal
+        return ""
+    return result.stdout.strip()
+
+
+def commit(directory: Path, message: str) -> bool:
+    """Commit the two memory files.  Never raises; failure means no history."""
+    directory = Path(directory)
+    if not (directory / ".git").exists():
+        return False
+    # Only the two files.  `raw/` and `notes/` are temporary by construction
+    # and a repository full of them is a repository whose log is unreadable.
+    _git(directory, "add", "--", SUMMARY_FILE, BODY_FILE)
+    result = _git(directory, "commit", "--quiet", "-m", message)
+    return result.returncode == 0
+
+
+def write_gitignore(directory: Path) -> None:
+    """Keep the temporary directories out of the repository the merge diffs."""
+    path = Path(directory) / ".gitignore"
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{RAW_DIR}/\n{NOTES_DIR}/\n{USAGE_FILE}\n", encoding="utf-8")
+```
+
+> - **`_git(directory, *args)`**：`subprocess.run(["git", "-C", 目录, ...])`。`-C 目录` 让 git 在那个目录里执行，不用 `cd`。`timeout=30`：一个卡住的 git 不能卡住整个程序。
+> - **`git_available`**：`git --version` 能跑就算有。没装 git 时 `subprocess.run` 抛 `OSError`。
+> - **`ensure_repo`**：目录还不是仓库就 `git init`。然后在**这个仓库里**设置提交人名字和邮箱（不碰全局配置）——不设的话，在没配置过 git 的机器上（比如 CI），第一次提交才会失败，离原因很远。没有 git 就返回 `False`，后面的一切退化成"没检测到手改"，这是安全的方向。
+> - **`hand_edits`**：`git diff -- 两个文件`。说明里那句是整个机制的关键：这个程序**写和提交是同一个动作**，所以工作区里任何没提交的改动，按定义都不是它写的。
+> - **`commit`**：只 `add` 两个记忆文件。`raw/`、`notes/` 是临时的，不进历史。失败（比如什么都没变）不报错，只返回 `False`。
+> - **`write_gitignore`**：把临时目录和 `usage.json` 写进 `.gitignore`。已经有了就不动——用户可能改过它。
+
+```python
+@needs_git
+def test_F17_08_a_hand_edit_shows_up_as_a_diff(tmp_path: Path) -> None:
+    """What the merge is shown about what a person did.
+
+    Everything uncommitted is by definition not this program's work: it writes
+    and commits in one operation.
+    """
+    directory = tmp_path / "mem"
+    assert ensure_repo(directory)
+    write_memory(
+        directory, summary="- a", body="## A\n\noriginal\n", lock_path=tmp_path / "merge.lock"
+    )
+    assert commit(directory, "baseline")
+    assert hand_edits(directory) == ""
+
+    (directory / BODY_FILE).write_text(
+        f"{FORMAT_VERSION}\n\n## A\n\noriginal\nand a line a person added\n", encoding="utf-8"
+    )
+    diff = hand_edits(directory)
+    assert "+and a line a person added" in diff
+
+
+@needs_git
+def test_F17_08_a_deletion_is_only_visible_in_the_diff(tmp_path: Path) -> None:
+    """The measured reason the git repository is not ceremony.
+
+    An *addition* survives a merge whether or not there is a diff, because the
+    edited file is what the merge is shown.  A **deletion** is not in the file
+    -- that is what deleting means -- so the diff is the only evidence it ever
+    happened.  Measured against gpt-4o-mini: with the diff, the deleted
+    section stayed deleted 3/3; without it, the merge put it back 3/3.
+    """
+    directory = tmp_path / "mem"
+    ensure_repo(directory)
+    write_memory(
+        directory,
+        summary="- a",
+        body="## Keep\n\nkept\n\n## Drop\n\nthe user does not want this\n",
+        lock_path=tmp_path / "merge.lock",
+    )
+    commit(directory, "baseline")
+    (directory / BODY_FILE).write_text(f"{FORMAT_VERSION}\n\n## Keep\n\nkept\n", encoding="utf-8")
+
+    diff = hand_edits(directory)
+    assert "-the user does not want this" in diff
+    request = merge_request(memory=load(directory), raw=(), notes=(), hand_edits=diff)
+    assert "the user does not want this" in request
+    assert "These are the user's own words" in request
+    # ...and with no diff, nothing anywhere in the request mentions it.
+    assert "the user does not want this" not in merge_request(
+        memory=load(directory), raw=(), notes=(), hand_edits=""
+    )
+
+
+@needs_git
+def test_F17_08_the_writer_commits_what_it_wrote(tmp_path: Path) -> None:
+    directory = tmp_path / "mem"
+    ensure_repo(directory)
+    write_memory(directory, summary="- a", body="## A\n\nb\n", lock_path=tmp_path / "merge.lock")
+    assert commit(directory, "first")
+    log = subprocess.run(
+        ["git", "-C", str(directory), "log", "--oneline"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "first" in log.stdout
+
+
+def test_F17_08_no_git_is_a_degradation_not_a_failure(tmp_path: Path) -> None:
+    """A memory directory that is not a repository still merges."""
+    directory = tmp_path / "mem"
+    directory.mkdir()
+    assert hand_edits(directory) == ""
+    assert not commit(directory, "nothing to commit")
+
+
+def test_F17_08_the_jobs_database_is_not_in_the_repository() -> None:
+    """A binary rewritten on every operation, in the one directory whose whole
+    point is that its diffs are readable."""
+    from minicodex.memory import DEFAULT_MEMORY_DIR, MINICODEX_HOME
+    from minicodex.memory_jobs import DEFAULT_JOBS_PATH
+
+    assert DEFAULT_MEMORY_DIR not in DEFAULT_JOBS_PATH.parents
+    assert DEFAULT_JOBS_PATH.parent == MINICODEX_HOME
+```
+
+> - 用到 git 的测试上面都有一个 `@needs_git` 标记。它在测试文件开头定义：`needs_git = pytest.mark.skipif(not git_available(), reason="git is not on PATH")`——没装 git 的机器上，这些测试会说明为什么跳过，而不是报一个莫名其妙的错。
+> - 第四个测试：一个不是 git 仓库的目录，`hand_edits` 返回空、`commit` 返回 `False`，都不抛异常。
+
 ## §10 F17-06 / F17-07：遗忘
 
 ### 10.1 按时间遗忘会先删掉最有用的那条
@@ -1163,6 +3976,8 @@ $ uv run python probe_memory_write.py forget
   codex 真实的条件式问法（已发布）      引用块 0/9   解析成功 0
   无条件问法（只用于对照）              引用块 9/9   解析成功 0   编造 9
 ```
+
+（改写第 16 章时又发现一件事：那时程序给每个小节算的**行号本身是错的**（第 16 章 §5.3），一条照真实行号写的引用也会被判成编造。所以"9 个都是编的"里，可能有几个其实是对的。这组数字没有重量过。）
 
 **不是少报，是根本解析不到。** 格式要 `path:line_start-line_end`，
 而这个程序从没让模型看见过任何行号，于是它编了九个合理的行号。
@@ -1263,6 +4078,478 @@ codex 把两个信号**严格分开**：
 **"减掉被删的"和"只留下活着的"，在有第三条离开路径的时候不是一回事。**
 
 ---
+
+### 10.5 代码：`prune`、`trim_summary` 和 `usage.json`
+
+```python
+@dataclass(frozen=True)
+class Prune:
+    kept: tuple[Entry, ...]
+    dropped: tuple[tuple[Entry, str], ...]
+
+    def describe(self) -> str:
+        if not self.dropped:
+            return f"{len(self.kept)} entr(ies), nothing forgotten"
+        reasons = ", ".join(f"{e.title} ({why})" for e, why in self.dropped)
+        return f"{len(self.kept)} entr(ies), forgot {len(self.dropped)}: {reasons}"
+
+
+def prune(
+    entries: Sequence[Entry],
+    counts: dict[str, dict[str, Any]],
+    *,
+    now: float,
+    max_entries: int = MAX_ENTRIES,
+    unused_days: float = UNUSED_DAYS,
+) -> Prune:
+    """Decide what leaves.  Citations first, recency second, age last.
+
+    The listed fix for F17-06 is "a window of unused days, a total cap, and a
+    periodic prune", and taken literally that is F17-07: the entry that is nine
+    months old and consulted every week is exactly the one an age rule deletes
+    first.  So age is only ever a tie-breaker here, and the primary key is
+    chapter 16's citation counter.
+
+    **That primary key is a signal chapter 16 has now measured as unreliable,
+    and this is the fault it lands on (F17-13).**  Two separate things went
+    wrong with it, and only the first was known when this function was written:
+
+    * The *bias*, measured in chapter 16's first draft and inherited whole: a
+      model reports the memory that shaped its **answer** and not the memory
+      that shaped its **actions**.  On the `runner` task it ran `python -m
+      pytest` -- a string only memory knew -- and then cited nothing, 3/3.
+    * The *resolution rate*, measured after chapter 16 adopted codex's real
+      citation format: asked for `path:line_start-line_end`, the model supplies
+      plausible line numbers it did not look up, and **0 of 9 citations
+      resolved to a real entry**.  A citation that does not resolve never
+      reaches `record_uses`, so it never becomes a count here.
+
+    The tempting repair is to rank on chapter 16's other signal instead --
+    `usage_kind_for_call`, which sees the model actually open `MEMORY.md` and
+    cannot be lied to.  **codex does not do that, and neither does this.**  It
+    keeps the two strictly apart: the behavioural signal feeds a telemetry
+    counter and stops there (`core/src/memory_usage.rs:9-27`), while retention
+    ranking and retention pruning read only the citation-fed columns
+    (`core/src/stream_events_utils.rs:184` ->
+    `state/src/runtime/memories.rs:55-73`, consumed at
+    `state/src/runtime/memories.rs:389-413`).  The reason is not ceremony: a
+    counter that says "the model opened MEMORY.md" cannot say *which section
+    mattered*, and every decision made here is per-entry.  Substituting a
+    file-granularity signal for an entry-granularity one would keep every entry
+    alive whenever any entry was read, which is not a forgetting policy.
+
+    So the signal stays, and what changes is how much weight it is allowed to
+    carry.  **Zero citations alone never drops anything** -- it takes zero
+    citations *and* a month of not being consulted *and* the cap being over.
+    That was written as belt-and-braces when the bias was the only known
+    problem; with the resolution rate at 0/9 it is the only thing standing
+    between an unreliable signal and deleting a good entry, and it is now
+    load-bearing.  `test_F17_13_*` pins it.
+
+    An entry with no record at all is treated as new rather than as ancient.
+    The other way round deletes every entry the first time this runs on a
+    memory written before the counter existed -- and, since the merge step
+    rewrites headings and a reworded heading is a new `entry_id`, it would also
+    delete every entry the merge improved.
+    """
+    scored: list[tuple[float, float, float, int, Entry]] = []
+    for index, entry in enumerate(entries):
+        row = counts.get(entry.entry_id, {})
+        cited = float(row.get("count", 0) or 0)
+        last_used = float(row.get("last_used", 0) or 0)
+        first_seen = float(row.get("first_seen", 0) or 0) or now
+        scored.append((-cited, -last_used, -first_seen, index, entry))
+    scored.sort()
+
+    kept: list[Entry] = []
+    dropped: list[tuple[Entry, str]] = []
+    for cited, _, _, _, entry in scored:
+        row = counts.get(entry.entry_id, {})
+        first_seen = float(row.get("first_seen", 0) or 0) or now
+        age_days = max(0.0, (now - first_seen) / 86400.0)
+        if len(kept) >= max_entries:
+            dropped.append((entry, f"over the {max_entries}-entry cap"))
+        elif cited == 0 and age_days > unused_days:
+            dropped.append((entry, f"never cited in {age_days:.0f} days"))
+        else:
+            kept.append(entry)
+    # Sorted back into file order: the ranking decides *what* survives, and
+    # letting it decide the order as well would reshuffle the whole file on
+    # every merge, which makes the git diff -- the mechanism F17-08 depends on
+    # -- useless.
+    order = {entry.entry_id: i for i, entry in enumerate(entries)}
+    kept.sort(key=lambda e: order[e.entry_id])
+    return Prune(kept=tuple(kept), dropped=tuple(dropped))
+```
+
+> - **`Prune`**：留下的和删掉的（删掉的每条带一个理由）。`describe()` 给报告用。
+> - **排序**：每条记忆算一个元组 `(-引用数, -最近使用时间, -首次出现时间, 原来的位置, 条目)`，然后 `sort()`。元组从第一项比起：引用越多越靠前（取负号），一样就比最近用过的，再一样比新旧。
+> - `float(row.get("count", 0) or 0)`：取不到、或者存的是 `None`，都当 0。`or now`：没有"首次出现"的记录，就当成**现在**（"没记录的算新的"，§10.3）。
+> - **走一遍排好的顺序，三种去向**：已经留够 `max_entries` 条了 → 删（"超过上限"）；**零引用并且**超过 `unused_days` 天 → 删；否则留。注意第二条要两个条件同时成立——这就是 §10.2.1 说的"承重件"。
+> - **最后按原文件顺序排回去**：排名决定**谁活**，不决定顺序（§10.3）。`order = {entry.entry_id: i ...}` 记下每条原来的位置，`kept.sort(key=lambda e: order[e.entry_id])`。
+
+```python
+def trim_summary(
+    summary: str,
+    entries: Sequence[Entry] = (),
+    *,
+    budget: int = SUMMARY_TOKEN_BUDGET,
+) -> str:
+    """Keep the resident half inside chapter 16's cap, deterministically.
+
+    The prompt asks for at most eight bullets and the prompt is a request.  A
+    resident block is sent with every request forever, so the bound is here as
+    well, in code, and it cuts at a line.
+
+    `entries` is the part that had to be added after a mutation survived, and
+    the reason is chapter 6's sentence about `Sizer`: **the fault is not that
+    one ruler was wrong, it is that there were two.**  The first version
+    trimmed the summary to the budget on its own; the read path then budgets
+    the same number over the summary *and* the heading index *and* the fences,
+    so a summary trimmed to exactly the cap came back truncated by the reader.
+    Nothing failed -- the block simply arrived with `[... memory truncated ...]`
+    in it.  So the question asked here is the read path's own: trim until
+    `overflows()` says no.
+
+    What that marker *means* changed in chapter 16's rewrite and this function
+    did not have to.  It used to decide whether the dedicated search tools got
+    mounted; that gate was this book's invention and is gone (F16-12,
+    `composition.top_level_tools`).  `overflows()` survives as what it always
+    literally was -- "did the reader have to cut anything" -- which is the only
+    thing this function ever asked it.  A budget that rose from 400 to codex's
+    real 2500 (`ext/memories/src/lib.rs:16`) also makes it fire far less often,
+    and it is kept for the reason the cap itself is kept: the summary is sent
+    with every request forever, and the prompt asking for eight bullets is a
+    request.
+    """
+    lines = summary.splitlines()
+    while lines and overflows(
+        Memory(directory=Path("."), summary="\n".join(lines), entries=tuple(entries)),
+        budget=budget,
+    ):
+        lines.pop()
+    return "\n".join(lines).rstrip()
+```
+
+> - 摘要一行一行往下删（`lines.pop()` 删最后一行），直到第 16 章的 `overflows()` 说"不用截了"。
+> - **问的是读路径自己的那把尺子。** 说明里记着这一条的来历：第一版用自己的尺子把摘要裁到上限，而第 16 章读的时候是把"摘要 + 目录 + 围栏"一起算的——于是自己写进去的记忆，读出来时被自己截断了，带着一个"[... memory truncated"。变异检查找到的：一条变异活了下来，因为测试测的是这个函数本身，没测"写进去再读出来"。第 6 章那句话第二次：**错不在某一把尺子不准，在于有两把。**
+
+```python
+def _usage(directory: Path) -> dict[str, dict[str, Any]]:
+    path = Path(directory) / USAGE_FILE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _record_first_seen(
+    directory: Path, pruned: Prune, counts: dict[str, dict[str, Any]], *, now: float
+) -> None:
+    """Stamp new entries, forget the rows of dropped ones.
+
+    `usage.json` is chapter 16's file and this is the write path adding a
+    field to it, which is worth naming rather than doing quietly: the read side
+    increments `count`, the write side sets `first_seen` and deletes rows.  Two
+    owners of one file is a thing to be nervous about, and it survives here for
+    one reason -- there is no third operation, and splitting it would give the
+    forgetting policy two files to read that must agree about which entries
+    exist.
+    """
+    # Rebuilt from the entries that survive, rather than the pruned ones
+    # deleted from the old table: an entry can also leave because the *merge*
+    # stopped emitting it, and that path leaves no row in `pruned.dropped`.
+    # The first version subtracted instead of rebuilding, and `usage.json`
+    # accumulated counts for headings that no longer existed -- which the
+    # forgetting policy then read.
+    updated: dict[str, dict[str, Any]] = {}
+    for entry in pruned.kept:
+        row = dict(counts.get(entry.entry_id) or {})
+        row.setdefault("count", 0)
+        row.setdefault("first_seen", now)
+        updated[entry.entry_id] = row
+    try:
+        (Path(directory) / USAGE_FILE).write_text(
+            json.dumps(updated, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError:  # pragma: no cover
+        return
+```
+
+> - **`_usage`**：读 `usage.json`，读坏了就当空的。
+> - **`_record_first_seen`**：**从活下来的条目重建**整张表，而不是从旧表里减去被删的。注释里讲了第一版的 bug：条目还有第三条离开的路——合并时模型不再输出它——那条路不经过 `pruned.dropped`，于是 `usage.json` 里攒下了一堆已经不存在的标题的计数，而遗忘策略还会去读它们。
+> - `row.setdefault("first_seen", now)`：只有第一次出现的条目才写上时间，已有的不动。
+
+```python
+def _entry(slug: str, title: str) -> Entry:
+    return Entry(f"{BODY_FILE}#{slug}", title, f"The rule about {title}.", (1, 2))
+
+
+def test_F17_07_the_old_and_used_entry_outlives_the_new_and_unused_one() -> None:
+    """The listed fix for F17-06 is a window of unused days; taken literally it
+    is F17-07.  Nine months old and consulted every week is exactly what an
+    age rule deletes first.
+    """
+    now = time.time()
+    entries = (_entry("deploy", "Deploy"), _entry("colours", "Colours"))
+    counts = {
+        f"{BODY_FILE}#deploy": {
+            "count": 34,
+            "last_used": now - 3 * DAY,
+            "first_seen": now - 270 * DAY,
+        },
+        f"{BODY_FILE}#colours": {"count": 0, "last_used": 0, "first_seen": now - 60 * DAY},
+    }
+    result = prune(entries, counts, now=now, max_entries=1)
+    assert [e.title for e in result.kept] == ["Deploy"]
+    assert [e.title for e, _ in result.dropped] == ["Colours"]
+
+
+def test_F17_06_an_uncited_entry_leaves_only_after_the_window() -> None:
+    now = time.time()
+    entries = (_entry("new", "New"), _entry("old", "Old"))
+    counts = {
+        f"{BODY_FILE}#new": {"count": 0, "first_seen": now - 1 * DAY},
+        f"{BODY_FILE}#old": {"count": 0, "first_seen": now - 60 * DAY},
+    }
+    result = prune(entries, counts, now=now)
+    assert [e.title for e in result.kept] == ["New"]
+    assert "never cited in 60 days" in result.dropped[0][1]
+
+
+def test_F17_07_zero_citations_alone_never_drops_anything() -> None:
+    """Chapter 16 measured the bias this compensates for.
+
+    A model reports the memory that shaped its *answer* and not the memory
+    that shaped its *actions*: on the `runner` task it ran `python -m pytest`
+    -- a string only memory knew -- and then wrote `none`, 3/3.  So a zero in
+    the citation column is not evidence of an unused entry, and it takes zero
+    citations *and* a month *and* the cap being over.
+    """
+    now = time.time()
+    entries = tuple(_entry(f"e{i}", f"E{i}") for i in range(5))
+    counts = {e.entry_id: {"count": 0, "first_seen": now - 1 * DAY} for e in entries}
+    assert prune(entries, counts, now=now).dropped == ()
+
+
+def test_F17_06_an_entry_with_no_record_at_all_is_new_not_ancient() -> None:
+    """The first run against a memory written before the counter existed.
+
+    The other way round deletes all of it.
+    """
+    now = time.time()
+    entries = (_entry("a", "A"),)
+    assert prune(entries, {}, now=now).dropped == ()
+
+
+def test_F17_06_the_cap_is_a_cap(tmp_path: Path) -> None:
+    now = time.time()
+    entries = tuple(_entry(f"e{i}", f"E{i}") for i in range(MAX_ENTRIES + 5))
+    counts = {e.entry_id: {"count": 0, "first_seen": now} for e in entries}
+    result = prune(entries, counts, now=now)
+    assert len(result.kept) == MAX_ENTRIES
+    assert all("cap" in why for _, why in result.dropped)
+
+
+def test_F17_07_the_ranking_decides_what_survives_not_what_order_it_is_in() -> None:
+    """Sorted back into file order before writing.
+
+    Re-ordering the file on every merge makes the git diff -- the mechanism
+    F17-08 depends on -- unreadable, and a diff nobody can read is a diff
+    nobody uses.
+    """
+    now = time.time()
+    entries = (_entry("a", "A"), _entry("b", "B"), _entry("c", "C"))
+    counts = {
+        f"{BODY_FILE}#a": {"count": 1, "first_seen": now},
+        f"{BODY_FILE}#b": {"count": 9, "first_seen": now},
+        f"{BODY_FILE}#c": {"count": 5, "first_seen": now},
+    }
+    assert [e.title for e in prune(entries, counts, now=now).kept] == ["A", "B", "C"]
+
+
+def test_F17_06_forgetting_an_entry_forgets_its_usage_row_too(tmp_path: Path) -> None:
+    """Otherwise a heading reused a year later inherits somebody else's count.
+
+    `record_uses` takes `CitedEntry` values rather than bare ids since chapter
+    16 adopted codex's real citation format (F16-13): a citation now names a
+    line range, and only the ones that resolve to a real entry count.
+    """
+    now = time.time()
+    gone = _entry("gone", "Gone")
+    record_uses(
+        tmp_path,
+        (CitedEntry(path=BODY_FILE, line_start=1, line_end=2, note="why", entry=gone),),
+        now=now - 90 * DAY,
+    )
+    raw = json.loads((tmp_path / USAGE_FILE).read_text(encoding="utf-8"))
+    raw[f"{BODY_FILE}#gone"]["first_seen"] = now - 90 * DAY
+    (tmp_path / USAGE_FILE).write_text(json.dumps(raw), encoding="utf-8")
+
+    write_memory(
+        tmp_path,
+        summary="- keep",
+        body="## Keep\n\nthe only survivor\n",
+        now=now,
+        lock_path=tmp_path / "merge.lock",
+    )
+    after = json.loads((tmp_path / USAGE_FILE).read_text(encoding="utf-8"))
+    assert f"{BODY_FILE}#gone" not in after
+    assert after[f"{BODY_FILE}#keep"]["first_seen"] == now
+
+
+def test_F17_06_the_written_summary_is_inside_chapter_sixteens_cap(tmp_path: Path) -> None:
+    """Through `write_memory`, not through `trim_summary`.
+
+    The direct test below was green with the call to it deleted: it tested the
+    function, and what has to hold is that **nothing this program writes needs
+    the read path to truncate it**.  A merge that produces forty bullets is not
+    an error, it is an over-long resident block, and the place that catches it
+    is the writer.
+
+    1500 bullets, not the 200 this was written with.  Chapter 16's rewrite took
+    the budget from a number this book invented (400) to codex's real one
+    (2500, `ext/memories/src/lib.rs:16`), and 200 bullets now fit -- so the
+    fixture stopped reaching the bound, and both mutations of the
+    `trim_summary` call it exists to catch survived.  Caught by
+    `probe_mutations_ch17.py`, which is the second time in two chapters that a
+    changed constant quietly retired a test rather than breaking it.
+    """
+    from minicodex.memory import resident_block
+    from minicodex.tokens import estimate_messages
+
+    write_memory(
+        tmp_path,
+        summary="\n".join(f"- rule number {i} about something or other" for i in range(1500)),
+        body="## A\n\nb\n",
+        lock_path=tmp_path / "merge.lock",
+    )
+    block = resident_block(load(tmp_path)) or ""
+    assert "[... memory truncated" not in block, "the read path had to truncate what we wrote"
+    written = (tmp_path / SUMMARY_FILE).read_text(encoding="utf-8")
+    assert estimate_messages([{"role": "user", "content": written}]) <= SUMMARY_TOKEN_BUDGET
+
+
+def test_F17_06_the_resident_half_is_trimmed_by_code_not_by_request() -> None:
+    """The merge prompt asks for at most eight bullets.  A prompt is a request.
+
+    The resident block is sent with every request forever, so chapter 16's cap
+    is enforced on the way in as well as on the way out.
+
+    The fixture is 1500 bullets rather than the 200 it was written with, and
+    that is chapter 16's rewrite arriving here: the budget went from a number
+    this book invented (400) to codex's real one (2500,
+    `ext/memories/src/lib.rs:16`), and 200 bullets now fit inside it.  A test
+    whose input no longer reaches the bound it is testing passes for the wrong
+    reason -- it did, until this line changed.
+    """
+    long_summary = "\n".join(f"- rule number {i} about something" for i in range(1500))
+    trimmed = trim_summary(long_summary)
+    assert len(trimmed) < len(long_summary)
+    from minicodex.tokens import estimate_messages
+
+    assert estimate_messages([{"role": "user", "content": trimmed}]) <= SUMMARY_TOKEN_BUDGET
+    # ...and the same call, told what else is going into the block, cuts more.
+    # One ruler: the question asked is the read path's own (F06-12 again).
+    entries = tuple(_entry(f"e{i}", f"Section {i}") for i in range(30))
+    assert len(trim_summary(long_summary, entries)) < len(trimmed)
+```
+
+```python
+def test_F17_13_zero_citations_alone_never_drops_an_entry() -> None:
+    """The conservatism that was belt-and-braces is now load-bearing.
+
+    Chapter 16 measured its own citation format resolving **0 of 9** times: the
+    model supplies plausible line numbers it never looked up, and a citation
+    that does not resolve never becomes a count here.  So "this entry has no
+    citations" is not evidence about the entry -- it is the ordinary state of
+    every entry.  Dropping on that alone would empty a working memory.
+    """
+    now = time.time()
+    entries = (_entry("a", "A"), _entry("b", "B"))
+    # Nothing has ever been cited, and both entries are recent.
+    kept = prune(entries, {}, now=now).kept
+    assert [e.title for e in kept] == ["A", "B"]
+
+    # Still nothing cited, and now both are far past the window -- but the cap
+    # is not exceeded, so age alone does not drop them either... except that
+    # age *plus* zero citations is exactly the pair the window is for.
+    old = {
+        f"{BODY_FILE}#a": {"count": 0, "first_seen": now - 400 * DAY},
+        f"{BODY_FILE}#b": {"count": 1, "first_seen": now - 400 * DAY},
+    }
+    dropped = prune(entries, old, now=now).dropped
+    assert [e.title for e, _ in dropped] == ["A"], "one citation is enough to survive the window"
+
+
+def test_F17_13_the_behavioural_signal_is_not_wired_into_ranking() -> None:
+    """codex keeps the two usage signals apart, and so does this.
+
+    The behavioural one (`usage_kind_for_call`) sees the model actually open
+    `MEMORY.md` and cannot be lied to -- which makes it tempting as a
+    replacement for the citation counter `prune` ranks on.  codex does not do
+    that: it feeds a telemetry counter and stops (`core/src/memory_usage.rs:
+    9-27`), while retention reads only the citation-fed columns
+    (`core/src/stream_events_utils.rs:184` ->
+    `state/src/runtime/memories.rs:55-73`, consumed at `:389-413`).
+
+    The reason is granularity, and it is checkable rather than stylistic: the
+    behavioural signal names a *file*, and every decision `prune` makes is
+    about one *entry*.  This test pins the shape -- a kind is a bare file
+    label, carrying no entry id for `prune` to rank by.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from minicodex import memory_write
+    from minicodex.memory import MEMORY_MD_KIND, Memory, usage_kind_for_call
+
+    memory = Memory(directory=Path("/tmp/mem"), summary="s", entries=(_entry("a", "A"),))
+    kind = usage_kind_for_call(memory, "read_file", {"path": "/tmp/mem/MEMORY.md"})
+    assert kind == MEMORY_MD_KIND
+    assert f"{BODY_FILE}#a" not in str(kind), "a kind cannot identify which entry was used"
+
+    # And the ranking function genuinely does not consult it. Parsed rather
+    # than grepped, and that is the point: `prune`'s docstring explains at
+    # length why it does *not* use this signal, so a substring check over the
+    # function's text finds the explanation and reports it as a use. Dropping
+    # the docstring node leaves only what runs.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(memory_write.prune)))
+    fn = tree.body[0]
+    assert isinstance(fn, ast.FunctionDef)
+    statements = fn.body[1:] if ast.get_docstring(fn) is not None else fn.body
+    names = {
+        node.id for stmt in statements for node in ast.walk(stmt) if isinstance(node, ast.Name)
+    } | {
+        node.attr
+        for stmt in statements
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Attribute)
+    }
+    assert not any("usage_kind" in name for name in names), sorted(names)
+
+
+def test_F17_13_an_entry_whose_heading_the_merge_reworded_is_new_not_ancient() -> None:
+    """A reworded heading is a new `entry_id`, so its citations do not follow it.
+
+    That is a real cost of deriving ids from headings, and it is paid in the
+    safe direction: the entry looks new, not unused.  The other way round would
+    delete an entry for the crime of having been improved by the merge that
+    just ran.
+    """
+    now = time.time()
+    counts = {f"{BODY_FILE}#running-tests": {"count": 30, "first_seen": now - 400 * DAY}}
+    # The merge renamed the section; the old row no longer matches anything.
+    renamed = (_entry("how-to-run-tests", "How to run tests"),)
+    kept = prune(renamed, counts, now=now).kept
+    assert [e.title for e in kept] == ["How to run tests"]
+```
+
+> - `test_F17_13_the_behavioural_signal_is_not_wired_into_ranking` 用 `inspect.getsource` 取出 `prune` 的源码、用 `ast` 解析，断言函数体里没有用到第 16 章的行为信号（名字里带 `usage_kind` 的东西）。说明里讲了为什么要解析而不是搜字符串：`prune` 的文档字符串里长篇解释了它**为什么不用**这个信号，按字符串搜会把解释当成使用。它防的是 §10.2.1 那个"诱人的修法"。
+
+**`usage.json` 的两个主人，还有一个没处理的竞态。** §10.4 说读路径（第 16 章的 `record_uses`，在每次 `ask` 的末尾）和写路径（这里的 `_record_first_seen`，在合并里）都会改这个文件。改写时我注意到它们**不共享任何锁**：两个进程里，一个刚读完 `usage.json` 准备加一次引用，另一个合并完重建了整张表，然后前一个把它的版本写回去——那次合并新加的 `first_seen` 就丢了，或者反过来丢一次引用。后果是一次计数不准，不是丢记忆；而让 `record_uses` 也去拿合并锁，意味着每次 `ask` 结束都要等一个可能正在跑的合并。**没有改**，记在这里。
 
 ## §11 F17-10：这条故障在这里不成立，而它的形状出现了两次
 
@@ -1382,6 +4669,54 @@ remember_this returned: Proposed. It is not memory yet: it goes to notes/ ...
 
 ---
 
+### 11.4 测试
+
+```python
+def test_F17_10_a_note_call_is_not_part_of_the_transcript(tmp_path: Path) -> None:
+    """The one place this program can reach F17-10's shape.
+
+    A `remember_this` call is already an input to stage 2 through `notes/`.
+    Leaving it in the transcript delivers the same sentence twice -- measured,
+    3/3 extractions of a session that proposed a note re-derived the note as a
+    bullet of its own.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(
+        sessions,
+        "s1",
+        ["remember: the linter is ruff"],
+        calls=[(NOTE_NAME, '{"note": "The linter is ruff."}'), ("read_file", '{"path": "a.py"}')],
+    )
+    text, _ = transcript_of(read_rollout(sessions / "s1.jsonl"))
+    assert NOTE_NAME not in text
+    assert "read_file" in text
+    assert "remember: the linter is ruff" in text
+
+
+def test_F17_10_system_and_developer_notes_are_not_extracted_from(tmp_path: Path) -> None:
+    """The program's own words are not the session's content.
+
+    An extractor shown the permissions block, the turn-budget warning or -- the
+    interesting one -- the *memory block itself* reports them back as things
+    worth remembering, which is a loop with no fixed point and no error
+    message.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(
+        sessions,
+        "s1",
+        ["hello"],
+        notes=["You have 2 turns left.", "<memory>\n- Always use uv.\n</memory>"],
+    )
+    text, _ = transcript_of(read_rollout(sessions / "s1.jsonl"))
+    assert "2 turns left" not in text
+    assert "Always use uv" not in text
+    assert "hello" in text
+```
+
+> - 第一个：会话里有一次 `remember_this` 调用和它的返回，`transcript_of` 的输出里两样都不能有。
+> - 第二个：会话里有一条系统消息（`_write_session(..., notes=[...])`），抽取器不能看到它。
+
 ## §12 F17-11：同意、看得见、删得掉
 
 第 16 章已经付了便宜的那一半（`--memory` 默认关、`minicodex memory` 能看能删）。
@@ -1405,13 +4740,15 @@ codex 的 TUI 也是两个弹窗（`Enable memories?` / `Reset all memories?`）
 
 ```
 $ minicodex memory --jobs
-  20260816T002539-39752        done     attempt 1
-  20260816T002611-31188        done     attempt 1
-  20260816T003149-15548        pending  attempt 0
+  20261115T081203-4127         done     attempt 1
+  20261115T081544-4127         done     attempt 1
 
-  done: 2, pending: 1
-  3 session file(s) in .minicodex\sessions are eligible
+  done: 2
+  1 session file(s) in sessions not picked up yet
+  locked, skipped: 20261115T083311-5530.jsonl (pid 5530). If that process is gone, delete 20261115T083311-5530.jsonl.lock and it will be picked up.
 ```
+
+（这是改写之后的输出，这次在 Linux 上造了四个会话实测。最后两行是改写时加的：一行原来写着"N session file(s) are eligible"，数的是所有已结束的会话，包括已经处理完的；最后一行是 §4.7。）
 
 ```python
 def _memory_jobs(jobs_path: Path, session_dir: Path) -> int:
@@ -1463,6 +4800,405 @@ def _memory_jobs(jobs_path: Path, session_dir: Path) -> int:
 一个说了的遗留物是用户的选择，一个没说的遗留物是这个程序在骗人。
 
 ---
+
+### 12.4 代码：命令行
+
+`__main__.py` 的导入区加上：
+
+```python
+from minicodex.memory import (
+    ...
+    USAGE_FILE,
+    ...
+)
+from minicodex.memory_jobs import DEFAULT_JOBS_PATH, JobStore, locked_sessions, pending_sessions
+from minicodex.memory_write import (
+    NOTE_NAME,
+    NOTES_DIR,
+    RAW_DIR,
+    pending_notes,
+    remember_instructions,
+    run_pipeline,
+)
+```
+
+`ask` 的参数，接在第 16 章的 `--dedicated-tools` 后面：
+
+```python
+# A *second* switch, not a mode of the first, and the split is the whole of
+# F17-11's expensive half.  Reading what you wrote by hand and letting a
+# model write things down about you are two different consents, and the
+# cost of asking for them separately is one flag.  codex asks the same
+# question in a dialog box with two buttons.
+ask.add_argument(
+    "--remember",
+    action="store_true",
+    help=(
+        "let this session be turned into memory later, and give the agent "
+        f"`{NOTE_NAME}` (off by default; see `minicodex memory`)"
+    ),
+)
+ask.add_argument("--memory-dir", type=Path, default=DEFAULT_MEMORY_DIR)
+ask.add_argument("--jobs-db", type=Path, default=DEFAULT_JOBS_PATH)
+```
+
+> `--memory-dir` 挪到了这里（第 16 章的那一行删掉）：读和写用的是同一个目录。
+
+`memory` 子命令多四个参数：
+
+```python
+memory_cmd.add_argument(
+    "--jobs",
+    action="store_true",
+    help="show which sessions have been turned into memory, and which are waiting",
+)
+memory_cmd.add_argument(
+    "--remember-now",
+    action="store_true",
+    help="run the writer in the foreground over what is pending, and wait for it",
+)
+memory_cmd.add_argument("--session-dir", type=Path, default=DEFAULT_DIR)
+memory_cmd.add_argument("--jobs-db", type=Path, default=DEFAULT_JOBS_PATH)
+memory_cmd.add_argument("--provider", choices=sorted(PROVIDERS), default="openai")
+memory_cmd.add_argument("--model", default=None)
+```
+
+`main()` 里两处：`memory` 子命令把新参数都传进去；`ask` 把两个新参数传给 `_ask`：
+
+```python
+                remember=args.memory_dir if args.remember else None,
+                jobs_path=args.jobs_db,
+```
+
+`_ask` 的签名多 `remember: Path | None` 和 `jobs_path: Path = DEFAULT_JOBS_PATH`，`top_level_tools(...)` 多传 `remember=remember`。
+
+`minicodex memory` 本身：
+
+```python
+def _memory(
+    directory: Path,
+    *,
+    forget_all: bool = False,
+    jobs: bool = False,
+    remember_now: bool = False,
+    session_dir: Path = DEFAULT_DIR,
+    jobs_path: Path = DEFAULT_JOBS_PATH,
+    provider: str = "openai",
+    model: str | None = None,
+) -> int:
+    """Everything a user needs to answer "what does it know about me".
+
+    Three things, and the order is the order somebody asks them in: where it
+    is, what is in it, and how to make it stop. `minicodex rules` (chapter 5)
+    is the same command for a different store, and the reason both exist is
+    the same one: a thing nobody can see is a thing nobody can revoke.
+
+    Chapter 17 adds two more questions the same person asks next -- *where does
+    it come from* (`--jobs`) and *do it now* (`--remember-now`) -- and one
+    obligation to the first: `--forget-all` has to delete the extracted
+    material and the job records too, or "delete everything" leaves the
+    intermediate copies behind and marks every session that produced them as
+    already processed.
+    """
+    if forget_all:
+        removed = []
+        for name in (SUMMARY_FILE, BODY_FILE, USAGE_FILE):
+            path = directory / name
+            if path.is_file():
+                path.unlink()
+                removed.append(name)
+        # The two directories chapter 17 writes.  `raw/` holds stage-1 output
+        # -- preferences extracted from sessions, in a file that is memory in
+        # everything but name -- and `notes/` holds what the model proposed.
+        # A `--forget-all` that leaves those is a `--forget-all` that lies.
+        for name in (RAW_DIR, NOTES_DIR):
+            folder = directory / name
+            if folder.is_dir():
+                for path in folder.glob("*.md"):
+                    path.unlink()
+                removed.append(f"{name}/")
+        if Path(jobs_path).exists():
+            with JobStore(jobs_path) as store:
+                store.forget_all()
+            removed.append(jobs_path.name)
+        print(f"deleted {', '.join(removed) if removed else 'nothing'} from {directory}")
+        if (directory / ".git").is_dir():
+            # Said, not done.  The whole point of the git repository is that a
+            # merge cannot silently eat a hand edit, and quietly deleting the
+            # history to satisfy a `--forget-all` would be this program
+            # destroying the one record it kept of its own changes.
+            print(f"note: the git history in {directory / '.git'} still has every past version.")
+            print(f"      remove it with: rm -rf {directory / '.git'}")
+        return 0
+
+    if jobs:
+        return _memory_jobs(jobs_path, session_dir)
+
+    if remember_now:
+        return _remember_now(
+            directory,
+            session_dir=session_dir,
+            jobs_path=jobs_path,
+            provider=provider,
+            model=model,
+        )
+
+    print(f"memory directory: {directory.resolve()}")
+    try:
+        memory = load_memory(directory)
+    except MemoryError_ as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    print(f"  {memory.describe()}")
+    if not memory:
+        print(f"\nTo start one, write {directory}/{SUMMARY_FILE}:")
+        print("  v1\n  - Run tests as `python -m pytest`.")
+        print(f"and, optionally, longer sections in {directory}/{BODY_FILE}:")
+        print("  v1\n\n  ## Running tests\n\n  ...")
+        print("\nMemory is off unless you pass --memory.")
+        return 0
+
+    counts = usage(directory)
+    for entry in memory.entries:
+        row = counts.get(entry.entry_id, {})
+        used = row.get("count", 0)
+        print(f"  {entry.entry_id:<40} cited {used} time(s)  {entry.headline()[:40]}")
+    pending = pending_notes(directory)
+    if pending:
+        print(f"\n  {len(pending)} proposed note(s) not merged yet, in {directory / NOTES_DIR}")
+    print(f"\ndelete everything with: minicodex memory --forget-all --memory-dir {directory}")
+    return 0
+```
+
+> - **`--forget-all`** 现在删五样：两个记忆文件、`usage.json`、`raw/` 和 `notes/` 里的文件、任务表里的所有行。最后**说出**还剩什么——git 历史——并告诉用户怎么删，但不替他删（§12.3）。
+> - 三个分支之后是第 16 章原来的"列出记忆"，末尾多一行"还有几条提议的笔记没合并"。
+
+```python
+def _memory_jobs(jobs_path: Path, session_dir: Path) -> int:
+    """Which sessions became memory, which are waiting, and which gave up.
+
+    The answer to "why does it not know that yet", which is the first question
+    a user asks about a feature that runs when they are not looking.  A
+    background job whose state is only in a database nobody can read is a
+    background job that gets reported as broken.
+    """
+    if not Path(jobs_path).exists():
+        print(f"no job records at {jobs_path} (nothing has been remembered yet)")
+    else:
+        with JobStore(jobs_path) as store:
+            rows = store.rows()
+            counts = store.counts()
+            for row in rows[:20]:
+                detail = f"  {row['detail']}" if row["detail"] else ""
+                print(
+                    f"  {row['session_id']:<28} {row['state']:<8} attempt {row['attempts']}{detail}"
+                )
+            if counts:
+                print(f"\n  {', '.join(f'{k}: {v}' for k, v in sorted(counts.items()))}")
+            # Not yet in the table. The first version printed every finished
+            # session as "eligible", including the ones already `done`.
+            waiting = sum(
+                1
+                for session_id, _ in pending_sessions(session_dir)
+                if store.state_of(session_id) is None
+            )
+            print(f"  {waiting} session file(s) in {session_dir} not picked up yet")
+    # Printed whether or not anything has been remembered: the case it exists
+    # for -- a session killed before it could release its lock -- is as likely
+    # on the first day as on the hundredth.
+    for path, holder in locked_sessions(session_dir):
+        print(
+            f"  locked, skipped: {path.name} (pid {holder}). If that process is gone, "
+            f"delete {path.name}.lock and it will be picked up."
+        )
+    return 0
+
+
+def _remember_now(
+    directory: Path,
+    *,
+    session_dir: Path,
+    jobs_path: Path,
+    provider: str,
+    model: str | None,
+) -> int:
+    """Run the writer in the foreground, and say what it did.
+
+    The same function the background task runs -- not a second implementation
+    of it.  What differs is who waits: here the user asked, so waiting is the
+    thing they asked for.
+    """
+    default_url, default_model = PROVIDERS[provider]
+    client = ChatCompletionsModel(
+        base_url=default_url,
+        model=model or default_model,
+        api_key=os.environ.get("OPENAI_API_KEY") if provider == "openai" else None,
+        tools=[],
+    )
+    print(f"memory directory: {directory.resolve()}")
+    try:
+        report = asyncio.run(
+            run_pipeline(
+                client,
+                directory=directory,
+                sessions_dir=session_dir,
+                jobs_path=jobs_path,
+                # No `exclude`: this command is not a session, so there is no
+                # current session to leave out -- and no `headroom` either,
+                # because the user is standing here having asked for it. The
+                # quota rule is about work nobody requested.
+            )
+        )
+    except Exception as exc:
+        # Every failure is a sentence and an exit code here, for the reason in
+        # `_finish_writer`: the writer calls the client directly, so its
+        # provider errors are not `ModelFailed`.
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    print(f"  {report.describe()}")
+    for session_id, detail in report.failed:
+        print(f"  failed: {session_id}: {detail}", file=sys.stderr)
+    return 0
+```
+
+> - **`_memory_jobs`**：最多 20 行任务，每行"会话 id、状态、第几次、失败原因"；再一行每种状态各几个；再一行"还有几个会话没被登记"；最后是 §4.7 的被锁住的会话。
+>   - 改写时还改了一处小事：第一版那一行写的是"N session file(s) are eligible"，数的是**所有**已结束的会话，包括已经处理完的。现在数的是"还不在任务表里的"——`store.state_of(session_id) is None`。
+>   - `if counts:`：表是空的时候不打印一个空的统计行。
+> - **`_remember_now`**：在前台跑同一个 `run_pipeline`，不另写一份。没有 `exclude`（这条命令不是一次会话），没有 `headroom`（用户就站在这儿要求它跑，额度规则管的是没人要求的工作）。`except Exception`：§3.6。
+
+```python
+def test_F17_11_writing_is_off_unless_asked_for(tmp_path: Path) -> None:
+    """Two switches, not one: reading what you wrote and letting a model write
+    about you are different consents."""
+    tools = top_level_tools(tmp_path, Session(approver=AllowAll()), _sub_context(tmp_path))
+    assert NOTE_NAME not in tools.handlers
+    with_writing = top_level_tools(
+        tmp_path, Session(approver=AllowAll()), _sub_context(tmp_path), remember=tmp_path / "mem"
+    )
+    assert NOTE_NAME in with_writing.handlers
+
+
+def test_F17_11_the_prompt_describes_the_tools_that_exist(tmp_path: Path) -> None:
+    """Chapter 5's F05-10: a prompt that names a tool the configuration does
+    not have gets the model to call it, measured at 2/3."""
+    from minicodex.__main__ import _instructions
+
+    session = Session(approver=AllowAll())
+    without = top_level_tools(tmp_path, session, _sub_context(tmp_path))
+    with_writing = top_level_tools(
+        tmp_path, session, _sub_context(tmp_path), remember=tmp_path / "mem"
+    )
+    assert NOTE_NAME not in _instructions(session, without)
+    assert NOTE_NAME in _instructions(session, with_writing)
+
+
+def test_F17_11_forget_all_deletes_the_extracted_material_too(tmp_path: Path) -> None:
+    """ "Delete everything" that leaves `raw/` behind has not deleted everything.
+
+    Stage-1 output is memory in all but name -- it is the user's preferences,
+    extracted -- and the job records are what would make a regenerated memory
+    come back empty.
+    """
+    from minicodex.__main__ import _memory
+
+    directory = tmp_path / "mem"
+    jobs = tmp_path / "jobs.db"
+    write_memory(directory, summary="- a", body="## A\n\nb\n", lock_path=tmp_path / "merge.lock")
+    write_raw(directory, Stage1(session_id="s1", preferences=("Use uv.",)))
+    propose(directory, "a proposal")
+    with JobStore(jobs) as store:
+        store.enrol([("s1", Path("s1.jsonl"))])
+
+    assert _memory(directory, forget_all=True, jobs_path=jobs) == 0
+    assert not (directory / SUMMARY_FILE).exists()
+    assert not (directory / BODY_FILE).exists()
+    assert not (directory / USAGE_FILE).exists()
+    assert pending_raw(directory) == ()
+    assert pending_notes(directory) == ()
+    with JobStore(jobs) as store:
+        assert store.rows() == []
+
+
+def test_jobs_counts_only_sessions_not_yet_picked_up(tmp_path: Path, capsys: Any) -> None:
+    from minicodex.__main__ import main
+
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "done-one", ["a"])
+    _write_session(sessions, "new-one", ["b"])
+    jobs = tmp_path / "jobs.db"
+    with JobStore(jobs) as store:
+        store.enrol([("done-one", sessions / "done-one.jsonl")])
+        store.finish("done-one")
+
+    main(["memory", "--jobs", "--jobs-db", str(jobs), "--session-dir", str(sessions)])
+    assert "1 session file(s)" in capsys.readouterr().out
+```
+
+```python
+def test_F17_12_everything_the_write_path_owns_is_under_one_home() -> None:
+    """The lock and the jobs database moved with the memory directory.
+
+    Chapter 16 moved memory out of the repository and under the user's home
+    (F16-10), matching codex's `memory_root()` =
+    `codex_home.join("memories")` (`memories/write/src/lib.rs:116-117`).  The
+    two things this chapter owns had to move with it, and the reason is not
+    tidiness: they are *about* that one global directory, so leaving them
+    per-repository would mean one lock per checkout guarding one shared file.
+    """
+    from minicodex.memory import DEFAULT_MEMORY_DIR, MINICODEX_HOME
+    from minicodex.memory_jobs import DEFAULT_JOBS_PATH
+    from minicodex.memory_write import MERGE_LOCK
+
+    assert DEFAULT_MEMORY_DIR.parent == MINICODEX_HOME
+    assert MERGE_LOCK.parent == MINICODEX_HOME
+    assert DEFAULT_JOBS_PATH.parent == MINICODEX_HOME
+    # Beside the memory directory, never inside it: it is a git repository and
+    # a binary rewritten on every operation has no readable diff.
+    assert DEFAULT_MEMORY_DIR not in MERGE_LOCK.parents
+    assert DEFAULT_MEMORY_DIR not in DEFAULT_JOBS_PATH.parents
+
+
+def test_F17_12_nothing_defaults_into_the_working_directory() -> None:
+    """The specific regression: a relative default is read against the cwd.
+
+    Before the move these were `Path(".minicodex") / ...`, so running the
+    program from two checkouts gave two locks and two job tables -- each
+    believing it was the only writer of the one memory they now share.  An
+    absolute default is what makes "the single writer" true across checkouts
+    rather than only within one.
+    """
+    from minicodex.memory import DEFAULT_MEMORY_DIR
+    from minicodex.memory_jobs import DEFAULT_JOBS_PATH
+    from minicodex.memory_write import MERGE_LOCK
+
+    for path in (DEFAULT_MEMORY_DIR, MERGE_LOCK, DEFAULT_JOBS_PATH):
+        assert path.is_absolute(), f"{path} is relative and would follow the cwd"
+
+
+def test_F17_12_a_stale_project_local_memory_is_not_read(tmp_path: Path) -> None:
+    """A leftover `.minicodex/memories` from before the move is not memory.
+
+    The failure this guards is silent: the old directory is still on disk in
+    every repository that ran the previous version, and a loader that fell
+    back to it would serve a year-old memory to a program that thinks it is
+    reading the new one.  Nothing falls back -- `load` reads the directory it
+    is given, and the default is absolute.
+    """
+    from minicodex.memory import load as load_memory
+
+    stale = tmp_path / ".minicodex" / "memories"
+    stale.mkdir(parents=True)
+    (stale / SUMMARY_FILE).write_text(f"{FORMAT_VERSION}\n\n- old and wrong\n", encoding="utf-8")
+
+    fresh = tmp_path / "home" / ".minicodex" / "memories"
+    fresh.mkdir(parents=True)
+    (fresh / SUMMARY_FILE).write_text(f"{FORMAT_VERSION}\n\n- current\n", encoding="utf-8")
+
+    assert "current" in load_memory(fresh).summary
+    assert "old and wrong" not in load_memory(fresh).summary
+```
+
+> F17-12 的三个测试守的是 §2.1 那次搬家：锁、任务库、记忆目录都在 `MINICODEX_HOME` 下；没有任何一个默认路径落在当前目录里；一个第 16 章第一版留在项目里的旧记忆目录，不会被读到。
 
 ## §13 结果：自动生成的记忆 vs 手写的
 
@@ -1563,267 +5299,509 @@ $ uv run python probe_memory_write.py ab --samples 3
 
 ---
 
-## §14 清点：这一章写了多少代码
+### 13.4 代码：把两段串起来的那个函数
 
-| 文件 | 行数 | 完整代码在哪一节 |
-|---|---|---|
-| `src/minicodex/memory_write.py` | 1395 | §2.3、§5.5、§6.2、§8.2、§9.1、§10.2、§11.2 |
-| `src/minicodex/memory_jobs.py` | 312 | §4.1、§4.3、§4.4、§12.3 |
-| `tests/test_faults_ch17.py` | 1159 | 摘录散在各节；56 个测试全部离线 |
-| `probe_memory_write.py` | 860 | §4.2、§5.8、§6.2、§9.2 |
-| `probe_mutations_ch17.py` | 323 | §15.5 |
-| `src/minicodex/model.py` | +55 | §7.1、§7.2 |
-| `src/minicodex/__main__.py` | +262 / -5 | §3.2、§3.3、§12 |
-| `src/minicodex/composition.py` | +10 | §8.2 |
-| `src/minicodex/rollout.py` | ±8 | §11.1（一个字段的诞生与删除） |
+报告：
 
-**没有进正文的部分**，以及为什么：
+```python
+@dataclass(frozen=True)
+class WriteReport:
+    """What one run of the pipeline did, in a form that prints in one line.
 
-- `Stage1` / `Merged` / `Prune` / `WriteReport` 四个 dataclass 的完整定义——
-  字段都在各节里被逐个解释过了。
-- `merge_request()` 的拼接顺序（手改 diff 放最后并且带标签）——
-  一句 docstring 说完的事：*"the input with the highest authority and the one
-  most easily read as more of the same"*。
-- `_git()` 的 subprocess 封装——三行，没有判断。
-- `JobStore.rows()` / `counts()` / `state_of()`——纯读，给 `--jobs` 用。
+    A report rather than a log, because the pipeline runs while the user is
+    doing something else and the only place it can say anything is one line at
+    the end of somebody else's task.  A background job that says nothing is a
+    background job nobody can tell is broken -- and this one silently changes
+    every future request.
+    """
 
----
+    skipped: str = ""
+    sessions: tuple[str, ...] = ()
+    empty: tuple[str, ...] = ()
+    merged: bool = False
+    pruned: Prune | None = None
+    secrets_removed: int = 0
+    seconds: float = 0.0
+    failed: tuple[tuple[str, str], ...] = ()
+    # Set when another process held the merge lock: this run's extraction is
+    # on disk in `raw/` and the other process, or the next run, merges it.
+    deferred: str = ""
 
-## §15 收工：commit、PR、review
-
-### 15.1 commit 序列
-
-七个：
-
-```
-1  feat(memory): a claim table for sessions waiting to become memory
-
-   The first database in this program, and the argument is on three axes
-   rather than on "it got complicated": every row is updated, rows are
-   contended between processes, and losing the contention has to be atomic.
-   Chapter 7's append-only JSONL is the opposite choice on all three.
-
-   `isolation_level=None` plus an explicit BEGIN IMMEDIATE, because the
-   obvious select-then-update version is not a claim: three processes, six
-   jobs, 4 duplicates, 4 runs out of 4, no error anywhere. Python opens a
-   transaction on the first DML statement, and a SELECT is not one.
-
-2  feat(memory): stage 1, one session in, at most a few statements out
-
-   Two model calls, no tools, no agent: there is nothing to iterate and a
-   tool loop would hand a model somewhere to write, which is the one thing
-   the next commit exists to prevent.
-
-   The shipped prompt asks for a verdict -- `DURABLE: yes|no` -- before it
-   shows a shape that could be filled, and `parse_stage1` enforces the
-   verdict rather than trusting it. The careful version without that (kept
-   as STAGE1_QUOTA) produced three bullets for every session including one
-   that taught nothing, 3/3. "At most three bullets per section" is a quota.
-
-   Chapter 16 met the same mechanism from the other side: under codex's real
-   citation format, an unconditional ask produces a block 9/9 times and 0 of
-   those 9 resolve to a real entry. A required shape is filled whether or not
-   there is anything to put in it -- and it is filled with plausible material,
-   which is why neither failure announces itself.
-
-3  feat(memory): stage 2, and the only function that writes MEMORY.md
-
-   Everything else produces a proposal. This validates before it opens
-   anything (F04-11), refuses an empty result rather than writing it
-   (F06-08), holds an O_EXCL lock while it writes (F07-08), and adds the
-   `v1` line itself so that a model can never get it wrong.
-
-   The merge lock is chapter 7's lock, copied. Second occurrence, not third:
-   the rule of three says copy with a note.
-
-4  feat(memory): redact on both sides of the model
-
-   A key the session happened to read was never repeated by the extractor
-   (0/3). A key the *user asked to have remembered* came back 3/3, twice in
-   one sample. An inbound-only scrub cannot help with the second: the model
-   was asked to write the key down and it did.
-
-5  feat(memory): forget by citation first, age last
-
-   The listed fix for "memory grows forever" is a window of unused days, and
-   taken literally that deletes the nine-month-old entry consulted every
-   week. Citations first, recency second, age as a tie-break -- and zero
-   citations alone never drops anything, because chapter 16 measured the
-   signal under-reporting exactly the entries that change behaviour.
-
-6  feat(memory): make the memory directory a git repository
-
-   Not version control for its own sake. An addition a person makes to
-   MEMORY.md survives a merge either way, because the edited file is what
-   the merge is shown. A *deletion* is not in the file -- that is what
-   deleting means -- so the diff is the only evidence it happened: with the
-   diff the deletion stuck 3/3, without it the merge put the section back
-   3/3.
-
-7  feat(cli): --remember, off by default, and the writer in the background
-
-   Reading what you wrote and letting a model write about you are two
-   consents, so two flags. The pipeline runs at the *start* of the next
-   session beside the first request, not at the end of this one: the same
-   work at the end is 15.4 measured seconds a user waits for something they
-   did not ask for.
-
-   `minicodex memory --jobs` answers "why does it not know that yet", and
-   --forget-all now deletes raw/, notes/ and the job table -- leaving those
-   would mark every source session `done`, so regenerating would produce
-   nothing and the feature would look broken.
+    def describe(self) -> str:
+        if self.skipped:
+            return f"memory writer: skipped ({self.skipped})"
+        if not self.sessions and not self.merged:
+            return "memory writer: nothing to do"
+        parts = [f"{len(self.sessions)} session(s) read"]
+        if self.empty:
+            parts.append(f"{len(self.empty)} had nothing to keep")
+        if self.merged and self.pruned is not None:
+            parts.append(self.pruned.describe())
+        elif self.deferred:
+            parts.append(f"merge left to {self.deferred}")
+        elif not self.merged:
+            parts.append("no merge")
+        if self.secrets_removed:
+            parts.append(f"{self.secrets_removed} secret(s) removed")
+        if self.failed:
+            parts.append(f"{len(self.failed)} failed")
+        return f"memory writer: {', '.join(parts)} in {self.seconds:.1f}s"
 ```
 
-一条**没有**单独成 commit 的改动：`SessionMeta.ephemeral` 的诞生与删除。
-它从来没有进过任何一个 commit——写出来、找不到调用者、删掉，
-留下一段注释说明它去哪了。**没有调用者的字段不该有历史。**
+> 一份报告，打印成一行，挂在别人的任务后面。说明里那句是这个类型存在的理由：**一个不说话的后台任务，是一个没人能判断它坏没坏的后台任务——而这一个会悄悄改变以后的每一个请求。**
 
-### 15.2 PR 描述
+整条管线：
 
-```markdown
-## What
+```python
+async def run_pipeline(
+    model: Any,
+    *,
+    directory: Path,
+    sessions_dir: Path,
+    jobs_path: Path,
+    limit: int = 2,
+    exclude: Sequence[str] = (),
+    headroom: float | Callable[[], float | None] | None = None,
+    now: float | None = None,
+    lock_path: Path = MERGE_LOCK,
+) -> WriteReport:
+    """Extract from what is pending, merge, prune, commit.
 
-The write path: sessions become memory, and memory forgets.
+    Runs at the **start** of the next session rather than at the end of this
+    one, which is the whole of F17-01: a user who has just been told the answer
+    wants their prompt back, not fourteen seconds of a progress line about
+    bookkeeping.  Starting it means it overlaps with the first model call
+    instead of with nothing.
 
-* `memory_write.py` — stage 1 (extract), stage 2 (merge), prune, redact, the
-  single writer, and `remember_this` (the only write access a model has).
-* `memory_jobs.py` — a sqlite claim table: claim, lease, backoff, give up.
-* `--remember` (off by default), `minicodex memory --jobs / --remember-now`,
-  a `--forget-all` that deletes the extracted material too.
+    Everything in here is bounded: `limit` sessions per run, a lease on each
+    one, one merge, one lock.  The unbounded version is a program that appears
+    to hang the first time somebody switches it on after a month of sessions.
+    """
+    began = time.monotonic()
+    stamp = now if now is not None else time.time()
+    # A callable is allowed, and the reason is a real ordering problem rather
+    # than flexibility for its own sake: this task is created *before* the
+    # foreground run's first request, so at creation time nobody has seen a
+    # rate-limit header yet.  Passing the number would mean passing `None`
+    # forever; passing the question means it is answered at the moment it
+    # matters.  `None` means "the provider does not say", which is not the
+    # same as "there is plenty" -- and the choice made here is to proceed,
+    # because the alternative switches the feature off entirely against every
+    # server that reports nothing, ollama included.
+    if callable(headroom):
+        headroom = headroom()
+    if headroom is not None and headroom < MIN_RATE_LIMIT_REMAINING_PERCENT:
+        # Background work gives way to foreground work.  Not a queue, not a
+        # slower rate: nothing at all, until the window resets.  The failure
+        # this prevents is the one where a user's actual task gets the 429 that
+        # the memory writer earned (F17-02).
+        return WriteReport(skipped=f"{headroom:.0f}% quota left", seconds=0.0)
 
-## Why
+    from minicodex.memory_jobs import JobStore, pending_sessions
 
-Chapter 16 proved that reading a **hand-written** memory is worth 4/12 → 12/12.
-This is the same question for a **generated** one, and the answer is that on
-every task the pipeline had material for, it is indistinguishable from the
-hand-written fixture.
+    read: list[str] = []
+    empty: list[str] = []
+    failed: list[tuple[str, str]] = []
+    secrets = 0
+    with JobStore(jobs_path) as store:
+        store.enrol(pending_sessions(sessions_dir, exclude=exclude), now=stamp)
+        for job in store.claim(limit=limit, now=stamp):
+            try:
+                from minicodex.rollout import read_rollout
 
-## How
+                stage1 = await extract(model, read_rollout(job.path))
+            except Exception as exc:
+                # Chapter 0's rule, in a place with no model to hand the error
+                # to: one unreadable session cannot be allowed to stop the
+                # other one, and it cannot be allowed to take the user's run
+                # down either.  It goes back in the queue with a backoff, and
+                # after three attempts it stops coming back.
+                failed.append((job.session_id, f"{type(exc).__name__}: {exc}"))
+                store.fail(job.session_id, f"{type(exc).__name__}: {exc}", now=stamp)
+                continue
+            secrets += stage1.secrets_removed
+            read.append(job.session_id)
+            if stage1:
+                write_raw(directory, stage1)
+            else:
+                # Nothing worth keeping is a *success*, and the job is done.
+                # Writing an empty raw file instead would make the merge step
+                # read a page of empty headings on every run.
+                empty.append(job.session_id)
+            store.finish(job.session_id, now=stamp)
 
-* The pipeline runs at the start of the *next* session, beside its first
-  request. 15.4s of work nobody waits for; the price is that memory is always
-  one session out of date, which is visible in the first two runs of §1.1.
-* Stage 1 must answer `DURABLE: yes|no` before it is shown a fillable shape,
-  and the answer is enforced in code.
-* Redaction runs on the transcript and again on the model's answer.
-* Forgetting starts from chapter 16's citation counts, not from age.
-* The memory directory is a git repository, for one measured reason: a
-  deletion a person makes is only visible in a diff.
+    def report(**extra: Any) -> WriteReport:
+        return WriteReport(
+            sessions=tuple(read),
+            empty=tuple(empty),
+            secrets_removed=secrets,
+            seconds=time.monotonic() - began,
+            failed=tuple(failed),
+            **extra,
+        )
 
-## Testing
+    # Stage 2 runs under the merge lock from the first read to the last
+    # delete, not only around the write. The first version took the lock
+    # inside `write_memory`, so two processes could each read the memory, each
+    # spend a model call merging, and then write one after the other: the
+    # second write was built on a memory from before the first, and silently
+    # replaced it. Measured with two overlapping runs over two sessions: both
+    # reported success, one session's material was in neither file, and its
+    # `raw/` file had been deleted by the run whose write was then overwritten.
+    #
+    # A run that finds the lock taken does not wait for it and does not fail.
+    # Its extraction is already in `raw/`, which is exactly where the run
+    # holding the lock -- or the next one -- will look.
+    try:
+        fd = _lock(lock_path)
+    except MemoryWriteError:
+        return report(deferred="another minicodex")
+    try:
+        raw = pending_raw(directory)
+        notes = pending_notes(directory)
+        if not raw and not notes:
+            return report()
 
-56 new tests, all offline. 38 mutations; two survived the first run and both
-were defences with no caller in the tests. Fixing the second turned up a real
-fault behind it (see the notes).
+        ensure_repo(directory)
+        write_gitignore(directory)
+        from minicodex.memory import load as load_memory
 
-## Notes for the reviewer
-
-* **Two listed faults did not reproduce as written.** F17-04's flow-of-work
-  diary never appeared; what appeared was a *quota being filled*, which needs
-  the opposite fix from the one chapter 16 bought. F17-10 cannot happen here
-  at all — the writer is not an agent — and I deleted the field I had written
-  for it. Its shape turned up twice elsewhere.
-* **A real fault behind a mutation:** the writer trimmed the resident summary
-  with its own 400-token ruler while the reader budgets 400 over the summary
-  *and* the heading index. A memory this program wrote came back truncated by
-  the program that reads it, silently, and the truncation marker is also what
-  decides whether the search tools get mounted (F16-09). One ruler now: the
-  writer asks `overflows()`.
-* Three of the faults in this chapter are in its own probes, again.
+        # Read here, under the lock, and never taken from the caller. A
+        # memory loaded when the session started is one some other process
+        # may have rewritten since, which is the lost update above by a
+        # second route.
+        current = load_memory(directory)
+        merged = await consolidate(
+            model, memory=current, raw=raw, notes=notes, hand_edits=hand_edits(directory)
+        )
+        pruned = write_memory(
+            directory, summary=merged.summary, body=merged.body, now=stamp, lock_path=None
+        )
+        commit(directory, f"memory: {len(raw)} session(s), {len(notes)} note(s)")
+        # Consumed only once the write succeeded.  The other order loses the
+        # extraction work on any failure in the merge, and the extraction is the
+        # expensive half.
+        for path, _ in (*raw, *notes):
+            try:
+                path.unlink()
+            except OSError:  # pragma: no cover
+                pass
+    finally:
+        _unlock(fd, lock_path)
+    return WriteReport(
+        sessions=tuple(read),
+        empty=tuple(empty),
+        merged=True,
+        pruned=pruned,
+        secrets_removed=secrets + merged.secrets_removed,
+        seconds=time.monotonic() - began,
+        failed=tuple(failed),
+    )
 ```
 
-### 15.3 Code review
+从上往下：
 
-我扮演 reviewer，五条：
+> 1. **额度**（§7）：`headroom` 是函数就现在调用它；低于 25% 就整个不跑。
+> 2. **第一段**：`with JobStore(...) as store:` 打开任务表；`enrol` 登记新会话；`claim` 最多认领 `limit` 条。每一条：读会话、抽取。**抽取失败**就交还给任务表退避（`store.fail`），**继续下一条**——一条读不了的会话不能挡住另一条（第 0 章的规矩）。抽取成功：有东西就写 `raw/`，没东西就记一笔"没什么可留的"，两种都算 `finish`。
+> 3. **第二段**：§8.7 的全部——拿锁，读 `raw/` 和 `notes/`，没东西就收工；有就确保 git 仓库、从磁盘读当前记忆、合并、写盘、提交、删掉用过的临时文件、放锁。
+> 4. **"临时文件写盘成功之后才删"**：反过来的话，合并一出错，抽取的结果就丢了——而抽取才是贵的那一半。
 
-> **1（正确性）**：`prune()` 在 `write_memory()` 里跑，而 `write_memory()` 是
-> 合并的最后一步。也就是说，**模型刚刚辛辛苦苦合并出来的条目，可能立刻被剪掉**，
-> 而模型完全不知道这件事。下一次合并它又会把同样的东西写回来，然后又被剪掉。
-> 这不是一个循环吗？
+`from minicodex.memory_jobs import ...` 和 `from minicodex.rollout import read_rollout` 都写在函数里面：`memory_write` 被 `composition` 导入，`memory_jobs` 又导入 `memory`，延迟导入让模块之间的箭头保持简单（插曲 B 的分层检查会盯着）。
 
-是，而且这条意见是对的。现在的缓解是 `MAX_ENTRIES = 40` 远大于任何真实记忆，
-所以这个循环在实践中不会启动。但它确实存在，正确的修法是**把剪掉的条目告诉下一次合并**
-（"these were dropped and why; do not re-propose them"）。
-记为已知边界，写进 step README 的 "deliberately not done"。
-**一个不会启动的循环仍然是一个循环，区别只是没人踩到。**
+```python
+def test_the_pipeline_extracts_merges_prunes_and_cleans_up(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "s1", ["always use uv"])
+    directory = tmp_path / "mem"
+    propose(directory, "The linter is `ruff check --fix`.")
 
-> **2（边界）**：`transcript_of()` 把 system / developer note 全扔了，
-> 理由是"那是程序自己的话"。可 `AGENTS.md` 也是 developer note，
-> 那是**人写的项目规约**——一个会话里最像"稳定偏好"的东西，被你扔了。
+    model = _Scripted(
+        [
+            "DURABLE: yes\n## Preference signals\n- This project is run with `uv`.\n",
+            f"{SUMMARY_MARK}\n- Use uv.\n{BODY_MARK}\n## Tooling\n\nRun everything with `uv`.\n",
+        ]
+    )
+    report = asyncio.run(
+        run_pipeline(
+            model,
+            directory=directory,
+            sessions_dir=sessions,
+            jobs_path=tmp_path / "jobs.db",
+            lock_path=tmp_path / "merge.lock",
+        )
+    )
+    assert report.merged
+    assert report.sessions == ("s1",)
+    memory = load(directory)
+    assert [e.title for e in memory.entries] == ["Tooling"]
+    # Consumed only after the write succeeded.
+    assert pending_raw(directory) == ()
+    assert pending_notes(directory) == ()
+    # ...and the merge was shown both inputs.
+    assert "ruff check --fix" in model.requests[1][1]["content"]
+    assert "This project is run with `uv`." in model.requests[1][1]["content"]
 
-说得对，而且这是一个真正的取舍。理由是：`AGENTS.md` 的内容**已经在版本库里了**，
-把它抽进记忆等于把同一句话存两份，而且两份会漂移。
-第 16 章那张三层表说得很清楚：`AGENTS.md` 是第一层，便宜两个数量级，
-记忆不该去复制它。这条补进 `transcript_of` 的 docstring——
-**因为"我们扔了它"和"我们扔了它，因为它已经在别处"是两回事。**
 
-> **3（可测试性）**：`race` 那个探针用 `subprocess` 起三个进程，
-> 而三个进程能不能"同时"到达 `claim()` 是靠运气的。这个测量为什么是可信的？
+def test_the_raw_file_survives_a_merge_that_fails(tmp_path: Path) -> None:
+    """Extraction is the expensive half, so it is never thrown away for free.
 
-因为它不依赖时序。三个进程都在启动后立刻 `claim()`，
-朴素版**四次运行都是 4 个重复**——如果它靠运气，应该看到 0～4 之间的分布。
-看到的是常数。原因也清楚：那个 select 完全不加锁，任何两个进程只要在
-同一个毫秒量级内到达就会读到同一批行，而进程启动的抖动比这大得多。
-第 8 章 F08-09 是同一个形状的反例（"只在慢机器上复现"实测是反的）：
-**竞态窗口大到某个程度，它就不是竞态了，是必然。**
+    The other order -- delete the raw files, then merge -- loses a model call
+    per session on any failure in the second stage.
+    """
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "s1", ["always use uv"])
+    directory = tmp_path / "mem"
+    model = _Scripted(
+        [
+            "DURABLE: yes\n## Preference signals\n- This project is run with `uv`.\n",
+            "I am afraid I cannot do that.",
+        ]
+    )
+    with pytest.raises(MemoryWriteError):
+        asyncio.run(
+            run_pipeline(
+                model,
+                directory=directory,
+                sessions_dir=sessions,
+                jobs_path=tmp_path / "jobs.db",
+                lock_path=tmp_path / "merge.lock",
+            )
+        )
+    assert len(pending_raw(directory)) == 1
 
-> **4（命名）**：`scrub()` 返回 `(text, count)`，调用点几乎都不用那个 count。
-> 一个返回二元组的函数逼着每个调用点写 `text, _ = scrub(...)`。
 
-有三个调用点用了它（`transcript_of`、`extract`、`parse_merged`），
-它们的值最后汇进 `WriteReport.secrets_removed`，而那个数字要打印给用户。
-一个静默的脱敏是一个没人审计的脱敏——这正是它不能是 `str -> str` 的理由。
-`_` 出现在两个地方（测试和探针），我认为可以接受。
+def test_one_unreadable_session_does_not_stop_the_other(tmp_path: Path) -> None:
+    """Chapter 0's rule in a place with no model to hand the error to."""
+    sessions = tmp_path / "sessions"
+    _write_session(sessions, "good", ["always use uv"])
+    (sessions / "bad.jsonl").write_text(
+        json.dumps({"type": "meta", "session_id": "bad"}) + "\n" + '{"type": "user"}\n',
+        encoding="utf-8",
+    )
+    jobs = tmp_path / "jobs.db"
+    model = _Scripted(
+        [
+            "DURABLE: yes\n## Preference signals\n- This project is run with `uv`.\n",
+            f"{SUMMARY_MARK}\n- Use uv.\n{BODY_MARK}\n## Tooling\n\nRun everything with `uv`.\n",
+        ]
+    )
+    report = asyncio.run(
+        run_pipeline(
+            model,
+            directory=tmp_path / "mem",
+            sessions_dir=sessions,
+            jobs_path=jobs,
+            lock_path=tmp_path / "merge.lock",
+        )
+    )
+    # The unreadable one is not even eligible: `read_rollout` refuses it during
+    # the scan, so it never becomes a job at all.
+    assert report.sessions == ("good",)
+    assert report.merged
+    with JobStore(jobs) as store:
+        assert store.state_of("bad") is None
+```
 
-> **5（风格）**：`memory_write.py` 1395 行，比第 16 章那个 914 行的
-> `memory.py` 还长。第 16 章 review 第 5 条说"该拆的时刻是第 17 章"，
-> 现在到了，为什么还不拆？
+> - 第一个是整条路走一遍：一次会话、一条提议的笔记、两次模型调用（抽取、合并），然后检查记忆里只有合并出来的那一节、临时文件都删了、合并时**两样输入都给模型看了**。
+> - 第二个：合并的回答缺标记，`run_pipeline` 抛错——`raw/` 文件必须还在。
+> - 第三个：两条会话，第一条的文件是坏的；第二条照样被处理，第一条进了 `failed` 列表。
 
-因为第 16 章那条预测**说错了拆的位置**。当时的判断是"读和写共享文件格式，
-所以该有一个 `memory_format.py`"。真写完之后去数：
-`memory_write.py` 从 `memory.py` 导入的是 `BODY_FILE`、`SUMMARY_FILE`、
-`FORMAT_VERSION`、`USAGE_FILE`、`SUMMARY_TOKEN_BUDGET`、`Entry`、`Memory`、
-`parse_entries`、`overflows`——**九个名字，其中六个是常量**。
+## §14 验证
 
-为了共享六个常量和一个解析函数新开一个模块，会让 `memory.py` 和
-`memory_write.py` 都去 import 第三个文件，而那个文件里没有行为。
-FB-03 的原话：**区分"必要的倒置"与"仪式性抽象"**。
+### 14.1 测试文件
 
-真正该拆的缝在别的地方，而且它现在还看不清楚：如果以后 `prune` 长成一个
-带策略的东西（按项目、按标签、按用户显式 pin），那时 `forgetting.py` 是一条真缝。
-现在拆是猜。
+`tests/test_faults_ch17.py` 的开头：
 
-**一个被写进上一章 review 的预测，到期时要去核对，而不是执行。**
+```python
+"""Chapter 17 -- memory, the write path: extraction, merging, forgetting.
 
-### 15.4 Merge 与 CI
+Offline, all of it, for chapter 14's reason (F14-05).  Two model calls sit in
+the middle of this subsystem and both are replaced here by a scripted answer:
+what a real one produces is measured in `probe_memory_write.py`, with the
+sample counts written down, and what is pinned here is everything that is a
+fact about the program -- what is claimed, what is written, what is refused,
+what is forgotten and in what order.
 
-squash 进 `main`。
+The one thing worth saying about the split: the *prompts* are pinned here as
+snapshots even though their effect is measured elsewhere.  That is chapter 3's
+F03-10 discipline (an edit to a measured wording must be a visible edit), and
+this chapter has two wordings whose difference was bought at 3/3 against 0/3.
+"""
 
-`ci.yml` **一行没改**——第 -1 章那个"阻塞 CI 最多六步"的上限第五次起作用。
-`postmerge.yml` 加一步，而且是被那条元测试逼着加的：
+from __future__ import annotations
+
+import asyncio
+import json
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, ClassVar
+
+import pytest
+
+from minicodex.approval import AllowAll, Session
+from minicodex.composition import top_level_tools
+from minicodex.memory import (
+    BODY_FILE,
+    FORMAT_VERSION,
+    SUMMARY_FILE,
+    SUMMARY_TOKEN_BUDGET,
+    USAGE_FILE,
+    CitedEntry,
+    Entry,
+    load,
+    record_uses,
+)
+from minicodex.memory_jobs import (
+    BACKOFF_BASE_SECONDS,
+    MAX_ATTEMPTS,
+    MAX_PER_STARTUP,
+    JobStore,
+    locked_sessions,
+    pending_sessions,
+)
+from minicodex.memory_write import (
+    BODY_MARK,
+    MAX_ENTRIES,
+    MIN_RATE_LIMIT_REMAINING_PERCENT,
+    NOTE_NAME,
+    NOTES_DIR,
+    RAW_DIR,
+    REDACTED,
+    STAGE1_QUOTA,
+    STAGE1_SYSTEM,
+    STAGE2_SYSTEM,
+    SUMMARY_MARK,
+    MemoryWriteError,
+    Stage1,
+    commit,
+    ensure_repo,
+    extract,
+    git_available,
+    hand_edits,
+    merge_request,
+    note_toolset,
+    parse_merged,
+    parse_stage1,
+    pending_notes,
+    pending_raw,
+    propose,
+    prune,
+    run_pipeline,
+    scrub,
+    transcript_of,
+    trim_summary,
+    write_memory,
+    write_raw,
+)
+from minicodex.model import RateLimit
+from minicodex.rollout import RolloutWriter, SessionMeta, read_rollout
+from minicodex.subagent import SubAgentContext
+
+DAY = 86400.0
+
+needs_git = pytest.mark.skipif(not git_available(), reason="git is not on PATH")
+```
+
+底部的三个辅助：
+
+```python
+class _Scripted:
+    """Answers each request with the next canned string, and keeps the requests.
+
+    Not a `ScriptedModel` from an earlier chapter: those speak the agent loop's
+    protocol (tool calls, turns).  Stage 1 and stage 2 are single completions
+    with no tools at all, and a fixture that modelled turns here would be
+    modelling something this subsystem does not have.
+    """
+
+    def __init__(self, answers: list[str], *, finish: bool = True) -> None:
+        self.answers = list(answers)
+        self.finish = finish
+        self.requests: list[list[dict[str, Any]]] = []
+
+    async def _stream(self, messages):
+        from minicodex.model import Completed, TextDelta
+
+        self.requests.append(list(messages))
+        yield TextDelta(self.answers.pop(0) if self.answers else "")
+        if self.finish:
+            yield Completed("stop")
+
+    def stream(self, messages):
+        return self._stream(messages)
+
+
+def _write_session(
+    directory: Path,
+    session_id: str,
+    users: list[str],
+    *,
+    parent: str | None = None,
+    notes: list[str] | None = None,
+    calls: list[tuple[str, str]] | None = None,
+) -> Path:
+    """A real rollout file, written through the real writer.
+
+    Hand-rolled JSON would be a second implementation of the format, and
+    chapter 14 has a whole section on what a fixture that reimplements the
+    code under test measures.
+    """
+    from minicodex.agent_types import ToolCall
+    from minicodex.history import AssistantMessage, SystemNote, ToolResult, UserMessage
+
+    meta = SessionMeta(session_id=session_id, parent=parent)
+    path = directory / f"{session_id}.jsonl"
+    with RolloutWriter(path, meta) as writer:
+        for note in notes or []:
+            writer.append(SystemNote(note))
+        for text in users:
+            writer.append(UserMessage(text))
+        made = [ToolCall(f"c{i}", name, {}, args) for i, (name, args) in enumerate(calls or [])]
+        writer.append(AssistantMessage("on it", tuple(made)))
+        for call in made:
+            writer.append(ToolResult(call.call_id, call.name, "done"))
+        if not made:
+            writer.append(AssistantMessage("done", ()))
+    return path
+
+
+def _sub_context(root: Path) -> SubAgentContext:
+    from minicodex.composition import sub_context
+    from minicodex.shell import ShellSession
+
+    return sub_context(
+        build_model=lambda tools: None,
+        root=root,
+        session=Session(approver=AllowAll()),
+        parent_shell=ShellSession(),
+        wiring=__import__("minicodex.agent", fromlist=["Wiring"]).Wiring(),
+    )
+```
+
+> - **`_Scripted`**：每次被问就按顺序说出列表里的下一句，并把收到的消息存进 `requests`。`finish=False` 时不发结束信号——用来测"提前断掉的流"。说明里讲了为什么不用前几章的 `ScriptedModel`：那些说的是 Agent 循环的协议（工具调用、多轮），而这一章的两段都是一问一答，没有工具。
+> - **`_write_session`**：用第 7 章真正的 `RolloutWriter` 写一个会话文件，可以带系统消息、子 Agent 的 `parent`、工具调用。
+> - `_sub_context`：造一个最小的子 Agent 上下文，给"子 Agent 有没有笔记工具"那个测试用。
 
 ```
-FAILED tests/test_packaging.py::test_F_1_05_every_mutation_script_runs_somewhere
-E       AssertionError: mutation scripts nothing runs: ['probe_mutations_ch17.py']
+$ uv run pytest tests/test_faults_ch17.py
+..................................................................       [100%]
+66 passed in 3.57s
 ```
 
-第 12 章加的那条元测试，第二次当场生效。**"散文里的承诺不是机制"这条教训，
-被机制化之后就是这个样子：我没有机会忘。**
-
-### 15.5 变异测试
+### 14.2 这些测试自己靠得住吗
 
 ```
 $ uv run python probe_mutations_ch17.py
-38 mutations, tests/test_faults_ch17.py tests/test_faults_ch16.py
-              tests/test_faults_ch07.py tests/test_schemas.py
+50 mutations, tests/test_faults_ch17.py tests/test_faults_ch16.py tests/test_faults_ch07.py tests/test_schemas.py
 
-   10 test(s) fail  <-  the claim is a select followed by an update, outside any transaction
+   11 test(s) fail  <-  the claim is a select followed by an update, outside any transaction
     1 test(s) fail  <-  an expired lease is never taken back, so a killed run loses the session
     3 test(s) fail  <-  the attempt is counted on failure instead of on claim
     1 test(s) fail  <-  a failing job comes back forever instead of giving up
     1 test(s) fail  <-  failure retries immediately, with no backoff
     2 test(s) fail  <-  every session is eligible, including the ones the program had with itself
-    1 test(s) fail  <-  a session that is still being written is eligible
+    2 test(s) fail  <-  a session that is still being written is eligible
     1 test(s) fail  <-  the extraction prompt goes back to the quota wording measured at 0/3 no-ops
     1 test(s) fail  <-  `DURABLE: no` is advisory: the bullets under it are kept anyway
     1 test(s) fail  <-  a placeholder bullet becomes a memory entry
@@ -1835,81 +5813,158 @@ $ uv run python probe_mutations_ch17.py
     1 test(s) fail  <-  a credential named as one but not shaped like one gets through
     2 test(s) fail  <-  one secret matched by two patterns is reported as two
     1 test(s) fail  <-  the merge answer is written without being scrubbed
-    1 test(s) fail  <-  forgetting is by age, which deletes the entry that is old and used
-   10 test(s) fail  <-  an entry with no citations is dropped whatever its age
-    7 test(s) fail  <-  an entry nothing has recorded yet is treated as ancient rather than new
+    2 test(s) fail  <-  forgetting is by age, which deletes the entry that is old and used
+   12 test(s) fail  <-  an entry with no citations is dropped whatever its age
+    9 test(s) fail  <-  an entry nothing has recorded yet is treated as ancient rather than new
     1 test(s) fail  <-  the cap is not a cap
     1 test(s) fail  <-  the writer trims the summary with its own ruler, not the reader's
-    1 test(s) fail  <-  the file is rewritten in ranking order, so every merge reshuffles the diff
+    2 test(s) fail  <-  the file is rewritten in ranking order, so every merge reshuffles the diff
     1 test(s) fail  <-  usage rows for entries that no longer exist are kept
     1 test(s) fail  <-  the resident half is left at whatever length the merge produced
-   12 test(s) fail  <-  the merge lock is not taken
+   10 test(s) fail  <-  the merge lock is not taken
     1 test(s) fail  <-  a merge that produced nothing replaces the memory with nothing
     2 test(s) fail  <-  a merge answer with no markers is treated as the body
     3 test(s) fail  <-  a note may be written straight into the body file
     1 test(s) fail  <-  one session may propose as many notes as it likes
     2 test(s) fail  <-  a note overwrites the one before it
     1 test(s) fail  <-  the extractor is shown the note the same session proposed
-    9 test(s) fail  <-  the extractor is shown the program's own system notes, memory included
+   10 test(s) fail  <-  the extractor is shown the program's own system notes, memory included
     1 test(s) fail  <-  the writer runs whatever is left of the quota
-    5 test(s) fail  <-  an unknown headroom is read as no headroom
+    6 test(s) fail  <-  an unknown headroom is read as no headroom
     3 test(s) fail  <-  the note tool is present whether or not the user asked to be remembered
     1 test(s) fail  <-  the rate-limit headers are never read
+    2 test(s) fail  <-  the memory directory is back inside whatever repository is the cwd
+    2 test(s) fail  <-  the merge lock is per-repository again, so two checkouts both hold it
+    3 test(s) fail  <-  the jobs database is per-repository, so one session is extracted once per checkout
+    2 test(s) fail  <-  the jobs database moves inside the memory directory the merge diffs
+   12 test(s) fail  <-  zero citations alone is enough to forget an entry
+    9 test(s) fail  <-  an entry nobody has a record of is treated as ancient rather than as new
+    1 test(s) fail  <-  a run that finds the merge lock taken fails instead of leaving its raw file
+    1 test(s) fail  <-  stage 2 reads, merges and writes without holding the merge lock
+    1 test(s) fail  <-  a writer failure reported by the task itself escapes after the answer
+    1 test(s) fail  <-  a writer failure during the grace wait escapes after the answer
+    1 test(s) fail  <-  a session locked by a dead process is skipped without being named
+    1 test(s) fail  <-  --jobs counts sessions that are already done as waiting
 
 every mutation was caught.
 ```
 
-第一次跑活下来两条，**都是"有防御、没有调用者去证明它"**：
+（这次在 Linux 上实测。）
 
-1. **速率限制头从来没被读过。** 我的测试测的是 `RateLimit.from_headers()`，
-   而这个函数是我自己调的。把 `model.py` 里那一行改成 `self.rate_limit = None`，
-   所有测试照绿。这是第 6 章那条教训（"测试重新实现了被测代码，
-   于是删掉守卫它照样绿"）**一字不差的重演**。修法也一样：用
-   `httpx.MockTransport` 驱动真正的 `stream()`。
+最后六条是改写时加的，一个修复一条。最上面那条——`BEGIN IMMEDIATE` 换成 `pass`——有 11 个测试变红，说明"先拿写锁"这件事被守得很牢；可它守住的是**第一段**。§8.7 那个丢失更新在第二段，第一版的 44 条变异里没有一条碰到它，因为没有一条测试在"两个进程都走到第二段"这个场景里。
 
-2. **写入侧的摘要上限。** 我测的是 `trim_summary()` 这个函数，
-   不是"写出去的东西在不在预算内"。改成后者之后，
-   **它立刻抓到了一个真的 bug**：
-
-```
-E       AssertionError: the read path had to truncate what we wrote
-```
-
-写入方按自己的尺子裁剪摘要；而读取方的同一个预算是算在
-**摘要 + 小节索引 + 围栏**上的。于是这个程序自己写出来的记忆，
-被这个程序自己的读路径截断了——一声不吭，而且那个截断标记
-**同时还是"要不要挂检索工具"的开关**（第 16 章 F16-09）。
-
-第 6 章 F06-12 那句话第二次出现：
-
-> **问题不是尺子不准，是有两把尺子。**
-
-修法是让写入方去问读取方：
-
-```python
-    lines = summary.splitlines()
-    while lines and overflows(
-        Memory(directory=Path("."), summary="\n".join(lines), entries=tuple(entries)),
-        budget=budget,
-    ):
-        lines.pop()
-```
-
-### 15.6 全套
+### 14.3 全套
 
 ```
 $ uv run pytest
-1682 passed, 9 skipped in 104.57s (0:01:44)
+1781 passed in 72.18s (0:01:12)
 
-$ uv run python scripts/check_layers.py
-ok  no import cycles
-ok  __init__ is a leaf
-ok  forbidden edges
-ok  one Agent construction site
-ok  every module imports alone
+$ uv run ruff format --check . && uv run ruff check .
+All checks passed!
+
+$ uv run python scripts/check_layers.py --quiet && echo ok
+ok
 ```
 
+### 14.4 改写时的一次自伤
+
+这一节值得记一笔，因为它是这本书讲了很多遍的那种错，这一次是我自己在改写时犯的。
+
+修完这一章的 bug，我要把同样的改动同步到后面几章的快照里。做法是 `git diff` 出一个补丁，再一个个打上去。打补丁的时候，第 14.2 节的变异脚本**正在后台跑**——它的工作方式是把源码改坏一行、跑测试、再改回来。我生成补丁的那一刻，`memory_jobs.py` 正处于"`BEGIN IMMEDIATE` 被换成 `pass`"的状态。
+
+于是这个被改坏的版本被打进了第 15、18 到 23 章和 `minicodex-live`。后面那些快照的测试一跑，11 个红——正是变异检查本来要证明"会红"的那 11 个。
+
+修好很简单。值得记的是：**变异检查会在磁盘上留下"故意改坏的代码"**，哪怕只有几秒钟。第 13 章记过一次"变异脚本被打断，留下一行被改坏的源码"，那次的修法是脚本退出时一定还原（`atexit`）。这一次脚本没被打断，是**别的东西在它跑的时候读了文件**。规矩加一条：变异检查跑着的时候，不要从同一个目录里复制、打补丁、提交任何东西。
+
 ---
+
+## §15 收工
+
+### 15.1 这一章动了哪些文件
+
+| 文件 | 变化 | 哪一节 |
+|---|---|---|
+| `src/minicodex/memory_write.py` | 新增 | §2.5、§5.9、§6.5、§8.5–§8.7、§9.5、§10.5、§13.4 |
+| `src/minicodex/memory_jobs.py` | 新增 | §4.5、§4.7 |
+| `src/minicodex/memory.py` | `MINICODEX_HOME`；几段说明 | §2.5 |
+| `src/minicodex/model.py` | `RateLimit`；成功响应上读额度 | §7.5 |
+| `src/minicodex/composition.py` | `remember` 参数，挂笔记工具 | §8.5 |
+| `src/minicodex/__main__.py` | 后台写入、`_finish_writer`、`--remember`、`memory --jobs/--remember-now` | §3.5、§12.4 |
+| `src/minicodex/rollout.py` | 一段注释：一个字段的诞生与删除 | §11.1 |
+| `tests/test_faults_ch17.py` | 新增，66 个测试 | 各节 |
+| `probe_memory_write.py` | 新增，九段 | §3–§13 |
+| `probe_mutations_ch17.py` | 新增，50 条 | §14.2 |
+
+`probe_memory_write.py` 八百多行，正文只引了它的输出。它和前几章的探针是同一种东西：每一段对应一次测量，用的都是这一章讲过的函数。
+
+### 15.2 这一章的提交
+
+```
+fix(memory): hold the merge lock across stage 2; never let the writer fail the run
+feat(memory): forget-all, --jobs and --remember-now
+feat(memory): forgetting -- citations first, recency second, age only to break ties
+feat(memory): the memory directory is a git repository, and hand edits are the merge's input
+feat(memory): stage 2 merges under a single-writer lock; the model only proposes
+feat(memory): read the provider's remaining quota off every successful response
+feat(memory): stage 1 asks for a verdict before it shows a shape, and scrubs twice
+feat(memory): run the writer beside the next session, not after this one
+feat(memory): a claim table for sessions waiting to become memory
+```
+
+（最新的在最上面。）最上面那条是改写时找到的四处，放在一个提交里：它们修的地方散在前面几个提交里，但都是被同一个问题问出来的——"两个进程同时跑会怎样""写入失败了用户看到什么"——而第一版只在一个进程、一切顺利的情况下量过。
+
+### 15.3 PR 描述
+
+```markdown
+## What
+
+The program writes its own memory: finished sessions are read at the start
+of the next one (stage 1, one model call each, at most two per startup),
+merged into chapter 16's two files under a single-writer lock (stage 2),
+and pruned by citation count. `--remember` turns it on; `minicodex memory
+--jobs` shows where it stands; `--forget-all` deletes all of it.
+
+## Why
+
+Chapter 16 measured a hand-written memory as the upper bound. This
+measures how close an automatic one gets: on every task it had material
+for, as close as the hand-written one (15/18 against 17/18; the gap is one
+task, explained in §13.2).
+
+## Testing
+
+66 tests, all offline; 50 mutations, all caught.
+
+## Notes for the reviewer
+
+- First database in the book (sqlite, stdlib). `BEGIN IMMEDIATE` is not
+  decoration: the obvious select-then-update duplicated claims in 3 of 6
+  runs here, every run on the machine it was first measured on.
+- Stage 2 holds the merge lock from its first read to its last delete;
+  a run that finds it taken leaves its raw file and says so.
+- The model can only append a note. `write_memory` is the one function
+  that writes MEMORY.md.
+- Known: the "per bullet" junk filter is not done (§5.7); `usage.json`
+  has two writers that share no lock (§10.5).
+```
+
+### 15.4 自己审一遍
+
+> **1.** 第二段拿不到锁就"延后"。如果拿着锁的那个进程被杀了呢？
+
+锁文件留下，以后每一次运行都拿不到锁，每一次都"延后"。好在它会**说出来**：报告里是 "merge left to another minicodex"，而 `_lock` 的错误消息里有 pid 和"那个进程没了就删掉这个文件"——只是现在那条消息被 `run_pipeline` 吞掉了，换成了一个不带 pid 的 "another minicodex"。这是一个退步，应该把 pid 带进报告。记成已知问题，章末练习 2。
+
+> **2.** `_finish_writer` 现在接住所有 `Exception`。一个真正的编程错误（比如 `TypeError`）也会被吞成一行"failed, nothing written"。
+
+会。它不会被吞掉看不见——那一行字会打印出来，带着异常的类型和消息——只是不会有 traceback、退出码也是 0。取舍是：用户的问题已经回答了，一个记笔记的后台任务里的 bug 不该把这次运行变成失败。如果要查，`--remember-now` 在前台跑同一个函数。
+
+> **3.** `pending_sessions` 每次启动都把会话目录里**每一个**文件完整读一遍，包括早就处理完的。
+
+是。几百个会话时这会变慢。正确的做法是先查任务表、只读不在表里的那些——可 `pending_sessions` 的工作恰恰是决定"哪些该进表"，需要读会话的 `parent` 字段。可以按文件名先过滤掉已在表里的。没做，记下来。
+
+> **4.** `locked_sessions` 把每个带锁的会话都列出来，包括**正在**跑的那个（另一个终端里的 `minicodex`）。用户会不会照着提示把一个活着的会话的锁删掉？
+
+可能。提示里写的是"如果那个进程已经不在了"，和第 7 章的措辞一样，把判断交给人。
 
 ## §16 对照 codex
 
@@ -1950,7 +6005,7 @@ codex 那 1449 行大概率也是——只是它买的东西比我多得多。
 |---|---|
 | F17-01 | **复现，量出来是 15.4 秒**（四条会话：2.8+2.4+2.6+2.6 抽取 + 5.0 合并）。挪到下一次会话开头，和第一个请求并行；代价是"记忆永远晚一次会话"，写在 §1.1 的两次运行里 |
 | F17-02 | 未观测到（额度一直是 99.87%），但机制照做。真正的产出是把第 12 章只在 429 时才解析的那些头，改成**成功响应上就读**——以及"不知道 ≠ 没有"这条明写的选择 |
-| F17-03 | **强复现，而且是确定性的**：三个进程六条待办，朴素的 select-then-update **4/4 次运行都是 4 个重复**。病因不在我写的那几行里，在 Python `sqlite3` 那个"SELECT 不开事务"的默认值里 |
+| F17-03 | **强复现**：三个进程六条待办，朴素的 select-then-update 在第一次写这一章的 Windows 机器上 **4/4 次运行都是 4 个重复**；改写时在 Linux 上重跑，**6 次里 3 次**有重复（§4.6）。病因不在我写的那几行里，在 Python `sqlite3` 那个"SELECT 不开事务"的默认值里 |
 | F17-04 | **药方被推翻**。清单说的"流水账"一次没出现；出现的是**配额被填满**——那句 "at most three bullets per section" 让模型在一条什么都没教的会话上产出 3/3 条垃圾。而修法与第 16 章 F16-07 **方向相反**：那里要把判断改成格式，这里要把格式改回判断。只修好了"每次会话"这一级，"每条"一级是欠债 |
 | F17-05 | **两条臂，结论相反**：顺手读到的 key，抽取器 0/3 不抄；用户**要求记住**的 key，3/3 抄了（有一次两遍）。只测第一条臂会发单侧脱敏。计数还多报了一次（一个 secret 两个正则） |
 | F17-06 | 复现（机制层面）。上限 + 未使用窗口 + 剪枝都做了，而窗口这条**单独用就是 F17-07** |
@@ -1976,7 +6031,18 @@ codex 那 1449 行大概率也是——只是它买的东西比我多得多。
 | **`git` 让我自己的清理代码崩了**：`.git/objects` 是 0444，Windows 认真执行 | 🔴 | `shutil.rmtree(onexc=...)` 里 chmod。引入新依赖，第一个被绊倒的不是主流程 |
 | **我的两个测量指标各测了别的东西**：流水账分类器只命中 60 条里的 2 条（真垃圾语法上和真信号一样），"无解析"把每一次正确的空答案都算成解析失败 | 🟠 | 一个标注为"它测的不是这个"并保留，一个加上 `DURABLE: no` 的判断 |
 
-发现方式分布（20 条）：
+改写这一章时又找到的 5 条（加上一次自伤）：
+
+| 故障 | 发现 | 修法 |
+|---|---|---|
+| **第二段的锁只包住了"写"**：两个进程各自读旧记忆、各花一次模型调用合并、先后写盘，后写的覆盖了先写的；被覆盖的那次会话的 `raw/` 文件已被删，什么都没剩，两边都报告成功 | 🟢 两个假模型摆出这个顺序 | 第二段从第一次读到最后一次删全程持锁；拿不到锁的进程把 `raw/` 留给持锁者（§8.7） |
+| **合并时服务商一报错，用户的答案后面跟一段 traceback，退出码 1**：`_finish_writer` 只列了四种异常，写入管线的 provider 错误不是 `ModelFailed`；而在宽限期里失败的走的是另一条路，连那四种都接不到 | 🟣 读 `except` 名单 | 两处都接 `Exception`（§3.6） |
+| **被直接杀掉的会话永远不会变成记忆，而且任何地方都不说** | 🟣 读 `pending_sessions` 对照第 7 章的锁 | `locked_sessions()`，`--jobs` 列出 pid（§4.7） |
+| **`--jobs` 把已处理完的会话也算成"eligible"** | 🟠 读输出 | 只数不在表里的（§12.4） |
+| **这个竞态在 Linux 上时有时无**：原文写"确定性，4/4" | 🟢 重跑六次 | 照实改写（§4.6） |
+| **改写时自己把一个变异打进了后面七个快照**：生成补丁时变异检查正在跑 | 🔴 后面快照的测试红了 11 个 | 还原；变异检查跑着时不从同一目录复制任何东西（§14.4） |
+
+第一次写这一章时的发现方式分布（20 条）：
 
 | 方式 | 条数 |
 |---|---|
@@ -2024,869 +6090,77 @@ codex 那 1449 行大概率也是——只是它买的东西比我多得多。
 
 ## 动手练习
 
-1. **把判决门退回去，亲手撞一次那三条垃圾。**
-   把 `memory_write.py` 里的 `STAGE1_SYSTEM = ...` 改成 `STAGE1_SYSTEM = STAGE1_QUOTA`，
-   然后跑 `uv run python probe_memory_write.py signal --arms shipped --only <那条 nothing 会话>`。
-   看着它在一条只问"calc.py 有哪些函数"的会话上产出三条记忆。
-   然后把 `parse_stage1` 里那三行 `DURABLE` 判断注释掉，再跑一次：
-   **模型说 no 之后还写了几条？**（这个数字我没量，留给你。）
+前三个要你自己写代码，先别看快照。
 
-2. **给"每条"一级加一个过滤，然后证明它有没有用。**
-   §5.7 说判决门只解决了"每次会话"这一级。写一个第二遍调用：
-   把每条 bullet 单独送回模型，问它"这条能不能通过三十秒测试，yes/no"。
-   用 §5.2 那四条会话量：**它砍掉了几条真信号？** 多花了几次调用？
-   如果它砍掉了 `runner` 那条，你就亲手撞到了"精度换召回"的代价。
+1. **给第一段加一个"每条"级别的过滤。** §5.7 说判决门只管住了"每次会话"，没管住"每条"：`The calc.py file defines two functions` 这种条目还是会进来。在 `parse_stage1` 之后加一个函数 `drop_obvious(stage1, root)`：一条 bullet 里提到的每个路径（借第 16 章的 `_PATHISH`）都在仓库里存在、而且这条 bullet 里没有"always / never / must / don't"这类词，就丢掉它。先写测试：那条 `calc.py` 的会丢、`Always use python -m pytest` 的不丢。然后想一想：你的规则会误伤哪种有用的条目？
 
-3. **让遗忘循环起来。** §15.3 review 第 1 条说的那个循环：
-   把 `MAX_ENTRIES` 改成 3，然后连续跑三次 `minicodex memory --remember-now`
-   （每次之间造一条新会话）。观察 `git -C ~/.minicodex/memories log -p`：
-   **同一条记忆是不是被写进去、剪掉、又写回来？**
-   然后实现 review 里说的修法（把剪掉的条目和原因告诉下一次合并），再跑一次。
+2. **把锁的主人带进报告。** §15.4 第 1 问：`run_pipeline` 拿不到锁时，报告里只说 "another minicodex"，丢掉了 `_lock` 错误消息里的 pid。改成 `deferred=f"pid {pid}"`，并且让 `minicodex memory --jobs` 在锁文件存在时也打印它（照 §4.7 的样子）。先写测试。
 
-4. **（难）测一次"记忆的记忆"。** §11.3 说抽取器不看 system note，
-   否则它会把注入的记忆重新学一遍。把那个 `isinstance` 判断改成
-   `(UserMessage, SystemNote)`，然后做这件事：开着 `--memory --remember` 连跑五次，
-   每次问一个无关问题。观察 `MEMORY.md` **每一代都长了什么**。
-   这是本书唯一一个你能亲眼看到"信息在系统里自我放大"的地方。
+3. **让 `pending_sessions` 不再读已经处理过的会话。** §15.4 第 3 问。给它加一个参数 `known: set[str]`（任务表里已有的会话 id），从文件名里取出会话 id，在表里的直接跳过、不读文件。提示：第 7 章的会话文件名就是会话 id 加 `.jsonl`。改完之后，`run_pipeline` 里怎么拿到 `known`？
 
-5. **（难）把第二段换成一个子 Agent。** codex 的 Phase 2 是一个受限子 Agent。
-   用第 10 章的 `run_task` 实现它：给它一个只能写 `notes/` 的工具集、
-   `AskForApproval::Never`、深度上限 0。然后回答两个问题：
-   **它多花了几次模型调用？** 以及——更重要的——**它的会话文件出现在
-   `sessions/` 里之后，下一次启动会不会把它捞起来抽取？**
-   如果会，你就复现了 F17-10 本来的样子，而 `ephemeral` 这个字段
-   在你的代码里就有调用者了。
+4. **量一下名字匹配的误伤。** §6.5 说 `keyfunc=lambda` 会被当成密钥换掉。造一段典型的 Python 代码（几个 `sorted(key=...)`、`tokenizer = ...`、`max_tokens = 4096`），喂给 `scrub`，数一数误伤几处。然后改 `_SECRET_ASSIGNMENT`，让它只认"全大写的名字"（`OPENAI_API_KEY=...` 的样子），重跑 §6 的测试——哪一个会红？那一个红的说明了什么？
+
+5. **（有 key 的话）重跑 §13 的 A/B**：`uv run python probe_memory_write.py ab --samples 3`。第 16 章修过行号之后（第 16 章 §5.3），模型写出的引用有可能真的被认出来了——`usage.json` 里的引用数还是 0 吗？如果不是，§10.2.1 的结论要怎么改？
+
+下一章换一个方向：不是"记住发生过什么"，而是"有一份写好的操作手册，需要的时候去翻"——技能。
+
 ---
 
-# 附录 · 代码到底怎么敲出来的（新手向，逐段精讲）
-
-跟第 16 章附录同一个规矩：正文讲"为什么"，这里补"怎么写"。默认你已经读过
-前面几章的附录（`dataclasses`、`asyncio`、`sqlite3` 基础、第 16 章的
-`Entry`/`Memory`），这里只讲这一章新出现的、容易让新手卡住的写法。代码摘自
-`steps/step17_memory_write/src/minicodex/`（`memory_write.py` 和
-`memory_jobs.py`），逐段核对过。
-
-先把范围说死：
-
-1. 本附录只解释第 17 章在 `steps/step17_memory_write/` 里新增或修改的代码。
-   第 16 章已经讲过的读侧（`memory.py`）不重复，但本章调用它时会写清参数
-   形状和返回边界。
-2. 完整函数代码块里不使用代表遗漏实现的省略号，也不把关键分支写成
-   "此处略"。示例字符串或命令文本里出现的三个点，如果本来就是源码的
-   一部分，会原样保留。
-3. 代码块按当前源码核对。正文已经给了全文的（`render_stage1`、
-   `ensure_repo` 的 docstring、`scrub` 的片段、`write_memory` 的 docstring），
-   本附录不再整段重复，只补正文明确说"没进正文"的（§14 自述：四个 dataclass
-   完整定义、`merge_request` 拼接顺序、`_git` 封装、`JobStore.rows()/
-   counts()/state_of()`），以及正文只有片段的核心函数（`parse_stage1`、
-   `transcript_of`、`extract`、`prune`、`run_pipeline`、`JobStore.claim`）。
-
-先画一张图，把写侧分成五块：
-
-~~~text
-写侧（memory_write.py + memory_jobs.py）
-    │
-    ├─ 脱敏      scrub / _SECRET_SHAPES / _SECRET_ASSIGNMENT（正文 §6）
-    ├─ 阶段一    提取：transcript_of → extract → parse_stage1 → write_raw（H1）
-    ├─ 出口箱    note_toolset / propose / pending_notes（H2）
-    ├─ 阶段二    合并：merge_request → consolidate → parse_merged（H3）
-    │              └─ write_memory（校验+剪枝+写盘+锁）→ prune / trim_summary（H4）
-    ├─ git       _git / git_available / ensure_repo / hand_edits / commit（H5）
-    └─ 任务表    memory_jobs.py：JobStore（enrol/claim/finish/fail）→ run_pipeline（H6）
-~~~
-
-## H1 · 阶段一：从一次会话到几条 durable 语句
-
-### H1.1 `transcript_of`：把 rollout 变成给抽取器的文本
-
-正文只提了"system note 被排除"的设计，完整函数：
-
-```python
-def transcript_of(rollout: Rollout, *, budget: int = TRANSCRIPT_TOKEN_BUDGET) -> tuple[str, int]:
-    parts: list[str] = []
-    for item in rollout.items:
-        if isinstance(item, UserMessage):
-            parts.append(f"user: {item.text}")
-        elif isinstance(item, AssistantMessage):
-            if item.text.strip():
-                parts.append(f"assistant: {item.text.strip()}")
-            for call in item.tool_calls:
-                if call.name == NOTE_NAME:
-                    continue
-                parts.append(f"assistant calls {call.name} {call.raw_arguments}")
-        elif isinstance(item, ToolResult):
-            if item.name == NOTE_NAME:
-                continue
-            parts.append(f"{item.name} returned: {clip(item.content, TOOL_RESULT_CHARS)}")
-    text = "\n".join(parts)
-    text, secrets = scrub(text)
-    if estimate_messages([{"role": "user", "content": text}]) > budget:
-        text = clip(text, budget * 4)
-    return text, secrets
-```
-
-四个细节：
-
-1. **`NOTE_NAME` 的调用和结果都被排除。** 一个 `remember_this` 调用**本来**
-   就通过 `notes/` 目录进入阶段二（H2），留在 transcript 里会把它再抽一遍
-   ——实测 3/3 的会话把 note 重新推导成 bullet（注释里那句 "F17-10 的形状"）。
-2. **`ToolResult` 截断到 `TOOL_RESULT_CHARS`（800）。** 一个工具结果可以很
-   长，而抽取器只需要知道"命令成功/失败/输出大概什么样"。截断在转录这一层，
-   不给抽取器一个巨大的输入。
-3. **两次脱敏，第一次在这里。** 进入抽取器之前先 `scrub`（F17-05 的入口侧）。
-4. **超预算时 `clip(text, budget * 4)`。** 头尾各留一半（第 2 章的形状）——
-   用户的原始请求在会话顶部、最后成功的东西在底部，tail-only 剪法每次都
-   丢掉第一个。
-
-### H1.2 `extract`：一次模型调用，没有 Agent
-
-```python
-async def extract(
-    model: Any,
-    rollout: Rollout,
-    *,
-    system: str = STAGE1_SYSTEM,
-) -> Stage1:
-    text, secrets = transcript_of(rollout)
-    answer = await _ask(
-        model,
-        [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"<transcript>\n{text}\n</transcript>"},
-        ],
-    )
-    answer, more = scrub(answer)
-    stage1 = parse_stage1(answer, session_id=rollout.meta.session_id)
-    return Stage1(
-        session_id=stage1.session_id,
-        preferences=stage1.preferences,
-        knowledge=stage1.knowledge,
-        failures=stage1.failures,
-        secrets_removed=secrets + more,
-    )
-```
-
-- **不是 `Agent`，注释明说为什么**：输入是已经存在的 transcript，输出是
-  文本，没有要迭代的东西。套一个工具循环等于把第 0～12 章所有失败模式
-  请回来，换不来任何东西，还会给模型一个"能写"的地方（F17-09）。
-- **第二次脱敏在这里**（出口侧）：抽取器的回答要落盘、要注入未来每个
-  请求。正文 §6.2 测过只脱敏入口侧的版本：模型能从上下文里重建被部分
-  遮盖的值。
-- **`secrets_removed = secrets + more`**：入口侧的数量 + 出口侧的数量，
-  一并记进报告。
-
-### H1.3 `parse_stage1`：宽容解析，严格筛选
-
-```python
-def parse_stage1(text: str, *, session_id: str = "") -> Stage1:
-    verdict = _VERDICT.search(text)
-    if verdict is not None and verdict.group(1).lower() == "no":
-        return Stage1(session_id=session_id)
-    wanted = {title.lower(): key for key, title in _SECTIONS}
-    found: dict[str, list[str]] = {key: [] for key, _ in _SECTIONS}
-    current: str | None = None
-    for line in text.splitlines():
-        heading = _H2.match(line)
-        if heading:
-            current = wanted.get(heading.group(1).strip().lower())
-            continue
-        if current is None:
-            continue
-        bullet = _BULLET.match(line)
-        if bullet:
-            body = bullet.group(1).strip()
-            if body.lower().strip(" .") in {"none", "n/a", "nothing", "(none)", ""}:
-                continue
-            found[current].append(body)
-    return Stage1(
-        session_id=session_id,
-        preferences=tuple(found["preferences"]),
-        knowledge=tuple(found["knowledge"]),
-        failures=tuple(found["failures"]),
-    )
-```
-
-三个新手容易漏的点：
-
-1. **`DURABLE: no` 一票否决。** 模型被要求在**看到可填的形状之前**先做
-   一个判断（`DURABLE: yes/no`），这一行让那个判断有约束力：说了 no，
-   标题下的 bullets 只是"形状在说话"。`_VERDICT` 正则
-   `^\W*durable\W*:\W*(yes|no)\b` 宽容 `**DURABLE: no**` 这种加粗写法，
-   忽略大小写。
-2. **`wanted` 把标题小写化做映射**，`_H2.match` 命中的标题经
-   `.strip().lower()` 查表——模型写的 `## Preference signals` 和
-   `## preference signals` 落到同一个 key。**不认识的标题 `current = None`，
-   其下的内容全部丢弃**——宽容方向是"格式花了"，严格方向是"什么都不
-   乱收"。
-3. **`"- none"`、`"- ..."`、`"- n/a"` 这些空条目被过滤。** 模型被要求
-   留空时会写 `- none` 而不是什么都不写；`...` 是 prompt 里 `_SHAPE` 的
-   占位符被照抄。这两者都会让记忆永远出现一个说"none"的小节，所以
-   `body.lower().strip(" .") in {...}` 全部跳过。
-
-### H1.4 `_ask`：非流式收集，[DONE] 检查
-
-```python
-async def _ask(model: Any, messages: list[dict[str, Any]]) -> str:
-    from minicodex.model import Completed, TextDelta
-
-    out: list[str] = []
-    finished = False
-    async for event in model.stream(messages):
-        if isinstance(event, TextDelta):
-            out.append(event.text)
-        elif isinstance(event, Completed):
-            finished = True
-    if not finished:
-        raise MemoryWriteError("the model stream ended without a [DONE] sentinel")
-    return "".join(out)
-```
-
-- **`finished` 标志 + 结尾检查**：第 0 章 F00-04 的规则第三次应用——一个
-  提前断掉的流不是"短一点的回答"，在这里它是"写进磁盘、被读回永久的半条
-  记忆"。没有 `[DONE]` 就抛 `MemoryWriteError`，什么都不落盘。
-- **延迟 import**（`from minicodex.model import ...` 在函数内）：第 6 章
-  `make_summariser` 同一个做法，避免模块顶部循环 import。
-- 和第 6 章的 `make_summariser` 长得像但不共享：那个要建 `History`、渲染
-  消息，这个只要两条字面量消息、不要历史。两条六行函数看着像不是
-  "一个函数的两个调用点"（注释里专门说了）。
-
-## H2 · 出口箱：`remember_this` 工具
-
-正文 §8 讲了设计（append-only outbox），`note_toolset` 的函数体没进正文：
-
-```python
-def note_toolset(directory: Path, *, limit: int = 5) -> ToolSet:
-    written = 0
-
-    async def do_note(args: dict[str, Any]) -> str:
-        nonlocal written
-        note = args.get("note")
-        if not isinstance(note, str) or not note.strip():
-            return tool_error(
-                f'{NOTE_NAME} needs a "note" argument, a non-empty string',
-                you_sent=repr(args.get("note")),
-                do_this='Example: {"note": "Tests are run with `python -m pytest`."}',
-            )
-        if written >= limit:
-            return tool_error(
-                f"{limit} note(s) is the limit for one session",
-                do_this="Continue with the task; what you have proposed is enough.",
-            )
-        body, _ = scrub(note.strip()[:MAX_NOTE_CHARS])
-        written += 1
-        path = propose(Path(directory), body)
-        return (
-            f"Proposed. It is not memory yet: it goes to {path.parent.name}/ and is "
-            "reviewed when memory is next merged."
-        )
-
-    return ToolSet(handlers={NOTE_NAME: do_note}, schemas=[NOTE_SCHEMA])
-```
-
-- **`written` 闭包计数器（`nonlocal`）**，每运行限 5 条——一个发现这个工具
-  好用的模型可以把一次会话变成五十条提议，而合并阶段要为每一条付费。
-- **写之前先 `scrub`**（第三次脱敏，出口箱这一侧也要过一遍）。
-- **`propose` 写文件，永不覆盖**：
-
-```python
-def propose(directory: Path, note: str, *, now: float | None = None) -> Path:
-    stamp = now if now is not None else time.time()
-    notes = Path(directory) / NOTES_DIR
-    notes.mkdir(parents=True, exist_ok=True)
-    for suffix in range(100):
-        name = f"{int(stamp)}-{os.getpid()}-{suffix}.md"
-        path = notes / name
-        if not path.exists():
-            path.write_text(note.strip() + "\n", encoding="utf-8")
-            return path
-    raise MemoryWriteError(f"cannot find an unused note name in {notes}")  # pragma: no cover
-```
-
-文件名 `时间戳-pid-序号.md`：时间戳让同进程内的多次调用不同名，
-pid 让两个进程永远不会选同一个名。`if not path.exists()` 是最后一道保险。
-
-## H3 · 阶段二：合并请求的组装与解析
-
-### H3.1 `merge_request`：什么按什么顺序给模型看
-
-正文 §14 明说这个函数"一句 docstring 说完"，完整实现：
-
-```python
-def merge_request(
-    *,
-    memory: Memory,
-    raw: Sequence[tuple[Path, str]],
-    notes: Sequence[tuple[Path, str]],
-    hand_edits: str,
-) -> str:
-    parts = [
-        "# Memory as it stands\n",
-        f"## {SUMMARY_FILE}\n{memory.summary or '(empty)'}",
-        f"## {BODY_FILE}\n" + ("\n\n".join(e.render() for e in memory.entries) or "(empty)"),
-        "\n# New material extracted from recent sessions\n",
-    ]
-    parts.extend(text for _, text in raw)
-    if notes:
-        parts.append("\n# Notes proposed during those sessions\n")
-        parts.extend(f"- {text}" for _, text in notes)
-    if hand_edits.strip():
-        parts.append(
-            "\n# Edits a human made by hand since the last merge (git diff)\n"
-            "These are the user's own words. Preserve them.\n\n" + hand_edits
-        )
-    return "\n\n".join(parts)
-```
-
-顺序就是优先级（docstring 那句话："the input with the highest authority and
-the one most easily read as more of the same"）：**现状 → 新抽取 → 模型提议 →
-人手改的 diff**。人手改的 diff 放最后并带标签"These are the user's own
-words. Preserve them."——它是权威最高、也最容易跟新材料混淆成"同类"的输入，
-放最后 + 显式标签让它读起来就是"这段不一样"。
-
-### H3.2 `parse_merged`：拒绝，而不是猜
-
-```python
-def parse_merged(text: str) -> Merged:
-    if SUMMARY_MARK not in text or BODY_MARK not in text:
-        raise MemoryWriteError(
-            f"merge answer is missing its markers ({SUMMARY_MARK} / {BODY_MARK}); "
-            f"nothing was written. First 200 characters: {text[:200]!r}"
-        )
-    _, rest = text.split(SUMMARY_MARK, 1)
-    summary, body = rest.split(BODY_MARK, 1)
-    summary, hits_a = scrub(summary.strip())
-    body, hits_b = scrub(body.strip())
-    return Merged(summary=summary, body=body, secrets_removed=hits_a + hits_b)
-```
-
-- **两个标记缺一个就抛错，什么都不写。** 兜底方案（"整个当 body"）会把
-  模型的评论写进一个注入每个请求的文件——比失败严重得多。
-- **`split(mark, 1)` 只切第一次**：`marker` 前面的内容丢弃（`_`），后面
-  从 `BODY_MARK` 再切一次。如果模型把标记写进了正文，`split(..., 1)` 保证
-  只认第一个。
-- **第三次脱敏**在合并输出的两边都做一遍。
-
-## H4 · 写盘：`write_memory`、`prune`、`trim_summary`
-
-### H4.1 `write_memory`：唯一写 `MEMORY.md` 的函数（完整实现）
-
-正文 §8.2 只给了 docstring。函数体：
-
-```python
-def write_memory(
-    directory: Path,
-    *,
-    summary: str,
-    body: str,
-    now: float | None = None,
-    lock_path: Path = MERGE_LOCK,
-) -> Prune:
-    stamp = now if now is not None else time.time()
-    directory = Path(directory)
-    entries = parse_entries(body)
-    if not entries and not summary.strip():
-        raise MemoryWriteError(
-            "the merge produced neither a summary nor a section; refusing to "
-            "replace the existing memory with nothing"
-        )
-
-    counts = _usage(directory)
-    kept = prune(entries, counts, now=stamp)
-    summary = trim_summary(summary.strip(), kept.kept)
-
-    fd = _lock(lock_path)
-    try:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / SUMMARY_FILE).write_text(f"{FORMAT_VERSION}\n\n{summary}\n", encoding="utf-8")
-        body_text = "\n\n".join(entry.render() for entry in kept.kept)
-        (directory / BODY_FILE).write_text(
-            f"{FORMAT_VERSION}\n\n{body_text}\n" if body_text else f"{FORMAT_VERSION}\n",
-            encoding="utf-8",
-        )
-        _record_first_seen(directory, kept, counts, now=stamp)
-    finally:
-        _unlock(fd, lock_path)
-    return kept
-```
-
-顺序就是全部设计，四步：
-
-1. **校验在开写之前**（`parse_entries(body)` + 空检查）。"既没有摘要也没有
-   小节"的合并结果被拒绝——那是被销毁的记忆，不是更小的记忆（F06-08）。
-2. **剪枝在写之前**（`prune`，H4.2），剪完的 `kept.kept` 喂给
-   `trim_summary`——摘要按**剪枝后**的条目算预算，因为剪掉的条目不该占
-   常驻预算。
-3. **锁在写之前**（`_lock`，第 7 章 `O_EXCL` 锁的第二次实现，正文 §2.4
-   解释了为什么不抽 `locks.py`）。`try/finally` 保证任何异常都 `_unlock`。
-4. **`v1` 版本行由程序加，不由模型加**（§8.3 的测试钉死了
-   `FORMAT_VERSION not in STAGE2_SYSTEM`）。两行写入都带 `{FORMAT_VERSION}\n\n`。
-
-### H4.2 `prune`：引用优先，新近次之，年龄最后
-
-```python
-def prune(
-    entries: Sequence[Entry],
-    counts: dict[str, dict[str, Any]],
-    *,
-    now: float,
-    max_entries: int = MAX_ENTRIES,
-    unused_days: float = UNUSED_DAYS,
-) -> Prune:
-    scored: list[tuple[float, float, float, int, Entry]] = []
-    for index, entry in enumerate(entries):
-        row = counts.get(entry.entry_id, {})
-        cited = float(row.get("count", 0) or 0)
-        last_used = float(row.get("last_used", 0) or 0)
-        first_seen = float(row.get("first_seen", 0) or 0) or now
-        scored.append((-cited, -last_used, -first_seen, index, entry))
-    scored.sort()
-
-    kept: list[Entry] = []
-    dropped: list[tuple[Entry, str]] = []
-    for cited, _, _, _, entry in scored:
-        row = counts.get(entry.entry_id, {})
-        first_seen = float(row.get("first_seen", 0) or 0) or now
-        age_days = max(0.0, (now - first_seen) / 86400.0)
-        if len(kept) >= max_entries:
-            dropped.append((entry, f"over the {max_entries}-entry cap"))
-        elif cited == 0 and age_days > unused_days:
-            dropped.append((entry, f"never cited in {age_days:.0f} days"))
-        else:
-            kept.append(entry)
-    order = {entry.entry_id: i for i, entry in enumerate(entries)}
-    kept.sort(key=lambda e: order[e.entry_id])
-    return Prune(kept=tuple(kept), dropped=tuple(dropped))
-```
-
-F17-06/F17-07 的整个论证都在排序元组里：
-
-- **`(-cited, -last_used, -first_seen, index, entry)`**：主键是引用次数
-  （第 16 章的回执产生的信号），次键是最近使用时间，第三键是第一次见到
-  的时间。三个都是负号，让 `sorted` 从"最好"到"最差"。
-- **删除条件有两个，缺一不可**：超过 `MAX_ENTRIES`（40）**或**
-  "零引用 + 超过 `UNUSED_DAYS`（30）天"。零引用本身**从不**删——回执有
-  已知偏差（模型报"影响回答的"，不报"影响动作的"，第 16 章 §11.5），
-  零引用不是"没用"的证据。
-- **`first_seen` 缺失时按 `now` 算**：没有记录的条目当"新"不当"古"——
-  反过来的话，第一次在旧记忆上跑这个函数会把所有条目全删了。
-- **剪完按文件顺序重排**（`order` dict + `kept.sort(key=...)`）：排名决定
-  *什么*活下来，不能让它顺便决定*顺序*——否则每次合并都重排整个文件，
-  git diff（F17-08 依赖的机制）就废了。
-
-### H4.3 `trim_summary`：把常驻摘要压回第 16 章的预算
-
-```python
-def trim_summary(
-    summary: str,
-    entries: Sequence[Entry] = (),
-    *,
-    budget: int = SUMMARY_TOKEN_BUDGET,
-) -> str:
-    lines = summary.splitlines()
-    while lines and overflows(
-        Memory(directory=Path("."), summary="\n".join(lines), entries=tuple(entries)),
-        budget=budget,
-    ):
-        lines.pop()
-    return "\n".join(lines).rstrip()
-```
-
-注释里讲了一个变异测试活下来的教训：第一版只把摘要剪到预算，而读侧
-把预算算在"摘要 + 索引 + 围栏"上——剪到恰好的摘要回来还是带截断标记。
-**这里问的是读侧自己的问题**（`overflows()` 说 yes 就继续 pop），两把尺子
-变成一把。
-
-### H4.4 `_lock` / `_unlock`：第 7 章锁的第二次实现
-
-```python
-def _lock(path: Path = MERGE_LOCK) -> int:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        holder = ""
-        try:
-            holder = path.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:  # pragma: no cover
-            pass
-        raise MemoryWriteError(
-            f"memory is being merged by another minicodex (pid {holder or '?'}). "
-            f"Nothing was written. Delete {path} if that process is gone."
-        ) from None
-    os.write(fd, str(os.getpid()).encode())
-    return fd
-
-
-def _unlock(fd: int, path: Path = MERGE_LOCK) -> None:
-    os.close(fd)
-    try:
-        path.unlink()
-    except OSError:  # pragma: no cover
-        pass
-```
-
-- **`os.O_CREAT | os.O_EXCL`**：创建成功 = 拿到锁；`FileExistsError` = 别人
-  拿着。`os.open` 是原子的（第 7 章 `RolloutWriter._acquire_lock` 同一个
-  机制）。
-- **锁文件里写 pid**，冲突时报"哪个进程拿着"，`from None` 吞掉原始
-  `FileExistsError` 的链（用户不需要看"File exists: ..."）。
-- **`_unlock` 里 unlink 失败也吞**——锁可能被外部删了，不致命。
-
-## H5 · git：`_git` 封装与四个函数
-
-正文 §9 给了 `ensure_repo` 的 docstring，§14 说 `_git` 是"三行，没有判断"。
-完整实现：
-
-```python
-def _git(directory: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(directory), *args],
-        capture_output=True,
-        text=True,
-        check=check,
-        timeout=30,
-    )
-
-
-def git_available() -> bool:
-    try:
-        return _git(Path("."), "--version").returncode == 0
-    except (OSError, subprocess.SubprocessError):  # pragma: no cover - git missing
-        return False
-
-
-def hand_edits(directory: Path) -> str:
-    directory = Path(directory)
-    if not (directory / ".git").exists():
-        return ""
-    result = _git(directory, "diff", "--", SUMMARY_FILE, BODY_FILE)
-    if result.returncode != 0:  # pragma: no cover - a broken repository is not fatal
-        return ""
-    return result.stdout.strip()
-
-
-def commit(directory: Path, message: str) -> bool:
-    directory = Path(directory)
-    if not (directory / ".git").exists():
-        return False
-    _git(directory, "add", "--", SUMMARY_FILE, BODY_FILE)
-    result = _git(directory, "commit", "--quiet", "-m", message)
-    return result.returncode == 0
-```
-
-- **`hand_edits` 就是 `git diff`**：这个程序写文件和提交是同一个动作，
-  所以工作区里所有未提交的东西，按定义就不是它写的（正文 §9.1 的原话）。
-- **`commit` 只 add 两个文件**——`raw/` 和 `notes/` 是临时目录，进了版本
-  库会让 log 不可读（`write_gitignore` 把它们挡在外面）。
-- **`ensure_repo` 在 `git init` 后设置本地 `user.email`/`user.name`**
-  （CI 镜像里没有全局配置，不设的话第一次 commit 才报错）——注意
-  `commit.gpgsign=false`，CI 里签名会失败。
-
-## H6 · 任务表与管线：`memory_jobs.py` + `run_pipeline`
-
-### H6.1 `JobStore`：claim 表的全部方法
-
-正文 §4 讲了 `isolation_level=None`（F17-03 的核心），方法体大部分没进正文：
-
-```python
-class JobStore:
-    def __init__(self, path: Path = DEFAULT_JOBS_PATH, *, timeout: float = 10.0) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, timeout=timeout, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
-        self.db.executescript(_SCHEMA)
-```
-
-三个 PRAGMA 各管一件事：`WAL` 让 `--jobs` 的读者和写者共存；
-`busy_timeout` 把"database is locked"从异常变成等待（第二个进程晚一毫秒
-启动时真正想要的）；`row_factory = sqlite3.Row` 让行可以按列名取
-（`row["session_id"]` 而不是 `row[0]`）。
-
-**`enrol`：`INSERT OR IGNORE` 让数据库决定谁先到。**
-
-```python
-def enrol(self, sessions: Iterable[tuple[str, Path]], *, now: float | None = None) -> int:
-    stamp = now if now is not None else time.time()
-    added = 0
-    for session_id, path in sessions:
-        cursor = self.db.execute(
-            "INSERT OR IGNORE INTO jobs(session_id, path, state, updated) "
-            "VALUES (?, ?, 'pending', ?)",
-            (session_id, str(path), stamp),
-        )
-        added += cursor.rowcount or 0
-    return added
-```
-
-**`claim`：`BEGIN IMMEDIATE` 是 F17-03 的全部修复。**
-
-```python
-def claim(
-    self,
-    *,
-    limit: int = MAX_PER_STARTUP,
-    now: float | None = None,
-    lease: float = LEASE_SECONDS,
-) -> tuple[Job, ...]:
-    stamp = now if now is not None else time.time()
-    deadline = stamp + lease
-    self.db.execute("BEGIN IMMEDIATE")
-    try:
-        rows = self.db.execute(
-            "SELECT session_id, path, attempts FROM jobs "
-            " WHERE (state = 'pending' AND not_before <= ?) "
-            "    OR (state = 'claimed' AND lease_until <= ?) "
-            " ORDER BY updated LIMIT ?",
-            (stamp, stamp, limit),
-        ).fetchall()
-        claimed = []
-        for row in rows:
-            self.db.execute(
-                "UPDATE jobs SET state='claimed', attempts=attempts+1, lease_until=?, "
-                "claimed_by=?, updated=? WHERE session_id=?",
-                (deadline, str(os.getpid()), stamp, row["session_id"]),
-            )
-            claimed.append(
-                Job(row["session_id"], Path(row["path"]), attempts=row["attempts"] + 1)
-            )
-        self.db.execute("COMMIT")
-    except BaseException:
-        self.db.execute("ROLLBACK")
-        raise
-    return tuple(claimed)
-```
-
-- **`BEGIN IMMEDIATE` 在 SELECT 之前**：拿写锁，再查再改——`isolation_level
-  = None`（自动提交）下裸 SELECT + UPDATE 是两个事务，两个进程会选到同一批
-  pending 行，都做一遍（实测 3 进程 6 个任务 4 次重复 claim）。
-- **SELECT 的条件是两个**：`pending 且到时间了`（`not_before <= now`，
-  失败回退的延迟）**或** `claimed 但租约过期了`（`lease_until <= now`，
-  进程被杀后回收）。**不因为"慢"回收**——租约比活长。
-- **`attempts` 在 claim 时 +1**（`attempts=attempts+1`），而不是在 fail 时
-  ——进程在 claim 和 fail 之间死掉也必须用掉一次尝试，否则一个让抽取器
-  崩溃的 rollout 会被下一个进程永远 claim。
-- **`except BaseException` 而不是 `except Exception`**：`KeyboardInterrupt`
-  也要 ROLLBACK，不能让事务悬着。
-
-**`fail`：带回退地还回去，或放弃。**
-
-```python
-def fail(self, session_id: str, detail: str, *, now: float | None = None) -> None:
-    stamp = now if now is not None else time.time()
-    row = self.db.execute(
-        "SELECT attempts FROM jobs WHERE session_id=?", (session_id,)
-    ).fetchone()
-    attempts = row["attempts"] if row else MAX_ATTEMPTS
-    if attempts >= MAX_ATTEMPTS:
-        self.db.execute(
-            "UPDATE jobs SET state='failed', lease_until=0, claimed_by=NULL, "
-            "detail=?, updated=? WHERE session_id=?",
-            (detail[:500], stamp, session_id),
-        )
-        return
-    self.db.execute(
-        "UPDATE jobs SET state='pending', lease_until=0, claimed_by=NULL, "
-        "not_before=?, detail=?, updated=? WHERE session_id=?",
-        (stamp + BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)), detail[:500], stamp, session_id),
-    )
-```
-
-- **`detail` 截断到 500 字符**（`detail[:500]`）——一条失败的完整 traceback
-  不该塞满数据库行。
-- **回退是 `BACKOFF_BASE_SECONDS * 2 ** (attempts - 1)`**（60s、120s、240s）：
-  第 12 章测过"对不可能成功的请求立即重试"的代价，这里为 provider 类失败
-  做指数回退。
-- **`attempts >= MAX_ATTEMPTS`（3）就永久失败**——一个抽三次都不行的
-  rollout 不太可能开始行：它通常要么巨大、要么被模型拒绝，都是文件本身的
-  属性而不是时刻的属性（常量注释）。
-
-**三个纯读方法**（正文 §14 明说没进正文）：
-
-```python
-def rows(self) -> list[dict[str, Any]]:
-    return [dict(r) for r in self.db.execute("SELECT * FROM jobs ORDER BY updated DESC")]
-
-def counts(self) -> dict[str, int]:
-    return {
-        row["state"]: row["n"]
-        for row in self.db.execute("SELECT state, COUNT(*) AS n FROM jobs GROUP BY state")
-    }
-
-def state_of(self, session_id: str) -> str | None:
-    row = self.db.execute("SELECT state FROM jobs WHERE session_id=?", (session_id,)).fetchone()
-    return row["state"] if row else None
-```
-
-`rows` 里 `dict(r)` 把 `sqlite3.Row` 变成普通 dict（`--jobs` 打印用）；
-`counts` 用 `GROUP BY state` 一次数完；`state_of` 是 `fetchone` +
-`row["state"] if row else None` 的三行模式。
-
-### H6.2 `pending_sessions`：哪些会话"算数"
-
-正文 §4.3 讲了三个排除，函数体：
-
-```python
-def pending_sessions(
-    directory: Path,
-    *,
-    exclude: Sequence[str] = (),
-) -> list[tuple[str, Path]]:
-    directory = Path(directory)
-    if not directory.is_dir():
-        return []
-    out: list[tuple[str, Path]] = []
-    for path in sorted(directory.glob("*.jsonl")):
-        if path.with_suffix(path.suffix + ".lock").exists():
-            continue
-        try:
-            rollout = read_rollout(path)
-        except RolloutError:
-            continue
-        if rollout.meta.parent or rollout.meta.session_id in exclude:
-            continue
-        if not rollout.items:
-            continue
-        out.append((rollout.meta.session_id, path))
-    return out
-```
-
-- **`.lock` 文件 = 会话还没结束**（第 7 章 `O_EXCL` 锁的第三次使用：它的
-  存在被复用来回答"这个会话结束了吗"——比"写一个 footer 记录"可靠，崩溃
-  的进程不写 footer）。
-- **`rollout.meta.parent` 排除子 Agent 的会话**（第三个排除，是跑出来的
-  不是设计的）：子会话会产出父会话已经说过的内容的第三、四份拷贝，而且
-  没有用户。
-- **`not rollout.items` 跳过空会话**。
-
-### H6.3 `run_pipeline`：整个写侧的组装
-
-正文 §7 讲了配额让路，完整函数在这里（这是写侧最长的函数，拆五块）：
-
-```python
-async def run_pipeline(
-    model: Any,
-    *,
-    directory: Path,
-    sessions_dir: Path,
-    jobs_path: Path,
-    memory: Memory | None = None,
-    limit: int = 2,
-    exclude: Sequence[str] = (),
-    headroom: float | Callable[[], float | None] | None = None,
-    now: float | None = None,
-    lock_path: Path = MERGE_LOCK,
-) -> WriteReport:
-    began = time.monotonic()
-    stamp = now if now is not None else time.time()
-    if callable(headroom):
-        headroom = headroom()
-    if headroom is not None and headroom < MIN_RATE_LIMIT_REMAINING_PERCENT:
-        return WriteReport(skipped=f"{headroom:.0f}% quota left", seconds=0.0)
-
-    from minicodex.memory_jobs import JobStore, pending_sessions
-
-    read: list[str] = []
-    empty: list[str] = []
-    failed: list[tuple[str, str]] = []
-    secrets = 0
-    with JobStore(jobs_path) as store:
-        store.enrol(pending_sessions(sessions_dir, exclude=exclude), now=stamp)
-        for job in store.claim(limit=limit, now=stamp):
-            try:
-                from minicodex.rollout import read_rollout
-
-                stage1 = await extract(model, read_rollout(job.path))
-            except Exception as exc:
-                failed.append((job.session_id, f"{type(exc).__name__}: {exc}"))
-                store.fail(job.session_id, f"{type(exc).__name__}: {exc}", now=stamp)
-                continue
-            secrets += stage1.secrets_removed
-            read.append(job.session_id)
-            if stage1:
-                write_raw(directory, stage1)
-            else:
-                empty.append(job.session_id)
-            store.finish(job.session_id, now=stamp)
-
-    raw = pending_raw(directory)
-    notes = pending_notes(directory)
-    if not raw and not notes:
-        return WriteReport(
-            sessions=tuple(read),
-            empty=tuple(empty),
-            secrets_removed=secrets,
-            seconds=time.monotonic() - began,
-            failed=tuple(failed),
-        )
-
-    ensure_repo(directory)
-    write_gitignore(directory)
-    from minicodex.memory import load as load_memory
-
-    current = memory if memory is not None else load_memory(directory)
-    merged = await consolidate(
-        model, memory=current, raw=raw, notes=notes, hand_edits=hand_edits(directory)
-    )
-    pruned = write_memory(
-        directory, summary=merged.summary, body=merged.body, now=stamp, lock_path=lock_path
-    )
-    commit(directory, f"memory: {len(raw)} session(s), {len(notes)} note(s)")
-    for path, _ in (*raw, *notes):
-        try:
-            path.unlink()
-        except OSError:  # pragma: no cover
-            pass
-    return WriteReport(
-        sessions=tuple(read),
-        empty=tuple(empty),
-        merged=True,
-        pruned=pruned,
-        secrets_removed=secrets + merged.secrets_removed,
-        seconds=time.monotonic() - began,
-        failed=tuple(failed),
-    )
-```
-
-**第一块：配额让路（正文 §7 的核心）。** `headroom` 可以是数字也可以是
-函数——创建这个 task 时（`__main__` 里）还没见过任何 rate-limit 头，所以
-传"问句"而不是"答案"，在它真正重要的时候才问。`MIN_RATE_LIMIT_REMAINING_
-PERCENT`（25%）以下**什么都不做**——后台工作给前台让路，防止用户的任务
-拿到记忆写入赚来的 429（F17-02）。
-
-**第二块：claim 循环。** `enrol` 先登记没见过的会话，`claim` 拿最多
-`limit`（2）个。**单个会话的 `except Exception` 不中断整个管线**（第 0 章
-规则在"没有模型可转交错误"的地方）：失败回队列带退避，三次后停止。
-
-**第三块：空原始材料直接返回。** `raw` 和 `notes` 都空 = 没有可合并的
-新材料，不用调合并模型。注意 `empty`（"没产出"的会话）不算失败——那是
-成功（"nothing worth keeping" 是正常结局，不写空 raw 文件）。
-
-**第四块：合并 + 写盘 + 提交。** `ensure_repo`/`write_gitignore` 保证
-git 可用；`current` 用调用方传的 `memory` 或重新 `load`；`consolidate`
-调合并模型；`write_memory` 校验+剪枝+写盘；`commit` 记录。**`raw`/`notes`
-的消费在写成功之后**——反过来的顺序会在合并失败时丢掉昂贵的抽取结果。
-
-**第五块：报告。** `WriteReport` 的一次性 `describe()` 就是第 15 章
-`_finish_writer` 打印的那一行。
-
-## H7 · 新手常见报错/坑对照表
-
-| 症状 | 原因 | 修法 |
+# 附录 · 对照检查
+
+## T1 · 每个文件是在哪一节写出来的
+
+`src/minicodex/memory_write.py`，从上到下：
+
+| 内容 | 小节 |
+|---|---|
+| 模块说明、导入、`RAW_DIR` 到 `MIN_RATE_LIMIT_REMAINING_PERCENT`、`MemoryWriteError` | §2.5 |
+| `_SECRET_SHAPES`、`_SECRET_ASSIGNMENT`、`REDACTED`、`scrub` | §6.5 |
+| `Stage1`、`_SECTIONS`、三份提示词、`_VERDICT`、`_BULLET`、`_H2`、`parse_stage1` | §5.9 |
+| `render_stage1`、`transcript_of`、`extract`、`_ask` | §5.9 |
+| `NOTE_NAME` 到 `write_raw` | §8.5 |
+| `SUMMARY_MARK`、`BODY_MARK`、`STAGE2_SYSTEM`、`Merged`、`parse_merged`、`merge_request`、`consolidate` | §8.6 |
+| `Prune`、`prune`、`trim_summary` | §10.5 |
+| `_lock`、`_unlock`、`write_memory` | §8.6 |
+| `_usage`、`_record_first_seen` | §10.5 |
+| `_git` 到 `write_gitignore` | §9.5 |
+| `WriteReport`、`run_pipeline` | §13.4（第二段：§8.7） |
+| `__all__` | 照着上面所有公开的名字列一遍 |
+
+`src/minicodex/memory_jobs.py`：
+
+| 内容 | 小节 |
+|---|---|
+| 模块说明、常量、`_SCHEMA`、`Job` | §4.5 |
+| `JobStore` 全部方法 | §4.5 |
+| `pending_sessions` | §4.5 |
+| `locked_sessions` | §4.7 |
+
+改动的旧文件：
+
+| 文件 | 改了什么 | 小节 |
 |---|---|---|
-| 两个进程都处理了同一个会话 | `claim` 的 SELECT 和 UPDATE 不在一个事务里 | `isolation_level=None` + `BEGIN IMMEDIATE`，在 SELECT 之前拿写锁 |
-| 进程被杀后会话永远没人处理 | 只有"done"标记，没有租约 | `claim` 设 `lease_until`，`claim` 的 SELECT 带 `lease_until <= now` 回收 |
-| 让抽取器崩溃的会话被永远反复 claim | attempts 在 fail 时才 +1 | `attempts` 在 `claim` 时 +1（进程死在 claim 和 fail 之间也耗掉一次） |
-| 失败后立即重试同一个 provider 错误 | 没回退 | `fail` 设 `not_before = now + 60 * 2 ** (attempts-1)` |
-| `"DURABLE: no"` 了还写 bullets | 没解析判决行 | `parse_stage1` 先查 `_VERDICT`，`no` 直接返回空 `Stage1` |
-| 记忆里出现 `- none` 或 `- ...` 条目 | 空占位被当内容 | `body.lower().strip(" .") in {"none", "n/a", "nothing", "(none)", ""}` 跳过 |
-| 模型把 `remember_this` 的提议又抽成一条记忆 | 转录里包含 note 调用 | `transcript_of` 排除 `NOTE_NAME` 的调用和结果 |
-| 合并输出把模型评论写进 MEMORY.md | `parse_merged` 没检查标记就拆 | 两个标记缺一即抛 `MemoryWriteError`，不写盘 |
-| 手改的 diff 被新材料吞掉 | diff 放中间、没标签 | `merge_request` 把 `hand_edits` 放最后并标 "These are the user's own words" |
-| 每次合并整个文件顺序都变 | 排名决定顺序 | `prune` 最后按原文件顺序 `kept.sort(key=order.get)` |
-| 零引用的老条目被删 | 年龄规则直接删 | 零引用 + 超 30 天 + 超 40 条上限，三者（后两者）才删 |
-| `git commit` 在 CI 里失败 | 没设 user.email/name | `ensure_repo` 里 `git config user.email/name`（本地，非全局） |
-| `raw/`、`notes/` 进版本库 | 没写 .gitignore | `write_gitignore` 挡 `RAW_DIR/`、`NOTES_DIR/`、`USAGE_FILE` |
-| 合并失败丢掉抽取结果 | raw 文件先删了 | 消费（unlink）放在 `write_memory`/`commit` 成功之后 |
+| `memory.py` | `MINICODEX_HOME` | §2.5 |
+| `model.py` | `RateLimit`、`self.rate_limit` | §7.5 |
+| `composition.py` | `remember` 参数、笔记工具 | §8.5 |
+| `__main__.py` | `_instructions` 里笔记工具那段 | §8.5 |
+| `__main__.py` | `_ask`：后台写入、两处 `_finish_writer` | §3.5 |
+| `__main__.py` | `WRITER_GRACE_SECONDS`、`_finish_writer` | §3.5、§3.6 |
+| `__main__.py` | 参数、`_memory`、`_memory_jobs`、`_remember_now` | §12.4 |
+
+## T2 · 常见报错对照表
+
+| 你看到的 | 多半是因为 | 去哪看 |
+|---|---|---|
+| `sqlite3.OperationalError: cannot commit - no transaction is active` | `claim` 里的 `BEGIN IMMEDIATE` 不见了——或者你复制了一份正在被变异检查改着的文件 | §4.3、§14.4 |
+| 同一条会话被抽取了两次，`raw/` 里两份一样的 | 认领是"先查再改"，没有包在 `BEGIN IMMEDIATE` 里 | §4.2 |
+| `[memory writer: nothing to do]`，可你明明跑过好几次 | 记忆永远晚一次会话；或者那几次会话还开着（旁边有 `.lock`） | §3.2、§4.7 |
+| `minicodex memory --jobs` 里有 `locked, skipped: ...` | 那次会话的进程被直接杀掉了，锁没删 | §4.7 |
+| `[memory writer: ... merge left to another minicodex ...]` | 另一个进程正在合并；或者一个被杀掉的进程留下了 `memory_merge.lock` | §8.7、§15.4 |
+| 答案打印出来之后跟着一段 traceback | `_finish_writer` 只接住了一部分异常 | §3.6 |
+| `MemoryWriteError: merge answer is missing its markers` | 第二段的模型没按格式回答；`raw/` 文件还在，下次再合 | §8.6 |
+| `MemoryWriteError: the merge produced neither a summary nor a section` | 合并回答切不出任何内容；旧记忆没被覆盖 | §8.6 |
+| 记忆里有一条 `- ...` | `parse_stage1` 的过滤表里少了 `...` | §5.9 |
+| 自己写进去的记忆，读出来带着 `[... memory truncated` | `trim_summary` 用的不是第 16 章的 `overflows()` | §10.5 |
+| `PermissionError` 删不掉 `.git/objects/...`（Windows） | git 把对象文件设成只读 | §9.4 |
+| 测试显示 `SKIPPED ... git is not on PATH` | 这台机器上没装 git | §9.5 |
