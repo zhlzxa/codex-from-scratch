@@ -17,11 +17,22 @@
 
 export type OAuthConnectPhase = "starting" | "waiting" | "connected" | "timed_out" | "error";
 
+// `previous` and `token` are fingerprints of the stored token (`routes.py`),
+// before this attempt and now.  "Connected" means a token is on file that was
+// not on file when the attempt started -- not merely that some token is.  The
+// first version polled `connected` alone, so Reconnect on a server that
+// already had a (dead) token reported success on its first poll, before the
+// person had done anything.  Found when chapter 22 was rewritten.
 export interface OAuthConnectDeps {
-  start: () => Promise<{ authorize_url: string }>;
-  status: () => Promise<{ connected: boolean }>;
+  start: () => Promise<{ authorize_url: string; previous?: string | null }>;
+  status: () => Promise<{ connected: boolean; token?: string | null }>;
   openTab: (url: string) => void;
   sleep?: (ms: number) => Promise<void>;
+  // The clock the deadline reads.  Injected for the same reason `sleep` is:
+  // the first version's timeout test advanced a counter through a fake
+  // `sleep` while the deadline read the real `Date.now()`, so it was really
+  // a 25ms busy loop on the wall clock.
+  now?: () => number;
   pollIntervalMs?: number;
   timeoutMs?: number;
 }
@@ -40,11 +51,15 @@ export async function runOAuthConnect(
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const interval = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const timeout = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const now = deps.now ?? (() => Date.now());
 
   onPhase("starting");
   let authorizeUrl: string;
+  let previous: string | null;
   try {
-    ({ authorize_url: authorizeUrl } = await deps.start());
+    const started = await deps.start();
+    authorizeUrl = started.authorize_url;
+    previous = started.previous ?? null;
   } catch (exc) {
     onPhase("error", (exc as Error).message);
     return;
@@ -53,12 +68,15 @@ export async function runOAuthConnect(
   deps.openTab(authorizeUrl);
   onPhase("waiting");
 
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
+  const deadline = now() + timeout;
+  while (now() < deadline) {
     await sleep(interval);
     try {
-      const { connected } = await deps.status();
-      if (connected) {
+      const { connected, token } = await deps.status();
+      // A status without `token` (an older backend) can only say "a token
+      // exists"; take that as it is rather than wait for a field that will
+      // never arrive.
+      if (connected && (token === undefined || token !== previous)) {
         onPhase("connected");
         return;
       }

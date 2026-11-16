@@ -105,6 +105,56 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "            if await storage.get_tokens() is None:",
         "            if True:",
     ),
+    # ---- added when chapter 22 was rewritten --------------------------------
+    (
+        "src/minicodex/web/routes.py",
+        "the callback page puts the authorization server's text in as HTML",
+        "message=html.escape(message)",
+        "message=message",
+    ),
+    (
+        "src/minicodex/web/routes.py",
+        "add_mcp accepts a second server with a name already in use",
+        '    if any(r.get("name") == body.name for r in _console(request).store.all("mcp.json")):',
+        "    if False:",
+    ),
+    (
+        "src/minicodex/web/routes.py",
+        "deleting a server leaves its token for the next server with that name",
+        '            await OwnerTokenStorage(DEFAULT_OWNER, server=record["name"]).forget()',
+        "            pass",
+    ),
+    (
+        "src/minicodex/web/routes.py",
+        "the status route stops saying which token is on file",
+        '"token": _token_fingerprint(tokens)}',
+        '"token": None}',
+    ),
+    (
+        "src/minicodex/web/routes.py",
+        "a record saved before chapter 22 goes out with no kind",
+        '    public = {**record, "kind": record_kind(record)}',
+        "    public = dict(record)",
+    ),
+    (
+        "src/minicodex/web/routes.py",
+        "a token file that cannot be written becomes a 500 in the callback",
+        "        OAuthStorageError,\n        httpx2.HTTPError,\n"
+        "    ) as exc:\n        return _oauth_result_page",
+        "        httpx2.HTTPError,\n    ) as exc:\n        return _oauth_result_page",
+    ),
+    (
+        "src/minicodex/web/oauth.py",
+        "begin() ignores the metadata URL the server names in its 401",
+        "    named = extract_resource_metadata_from_www_auth(challenge) if challenge else None",
+        "    named = None",
+    ),
+    (
+        "src/minicodex/web/runtime.py",
+        "one unusable record fails the whole turn instead of being skipped",
+        "        except (RemoteConfigError, KeyError, TypeError, ValueError) as exc:",
+        "        except () as exc:",
+    ),
 ]
 
 ORIGINALS = {name: (ROOT / name).read_text(encoding="utf-8") for name, _, _, _ in MUTATIONS}

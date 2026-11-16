@@ -51,6 +51,7 @@ from minicodex.model import ChatCompletionsModel
 from minicodex.plan import TaskPlan, unfinished_note
 from minicodex.recorder import Recorder
 from minicodex.registry import McpRegistry, connect, elicitation_handler
+from minicodex.remote import RemoteConfigError
 from minicodex.retry import ModelFailed
 from minicodex.rollout import (
     RolloutError,
@@ -206,7 +207,24 @@ async def resolve_mcp_configs(
     """
     configs = []
     for s in enabled:
-        config = server_config(s)
+        try:
+            config = server_config(s)
+        except (RemoteConfigError, KeyError, TypeError, ValueError) as exc:
+            # One record that cannot become a config -- a hand-edited
+            # `mcp.json` with a token *and* OAuth, a remote record with no
+            # `url` -- is that record's problem, reported by its name.  The
+            # first version let the exception out of here, and every turn
+            # failed, with every server, until someone found the file.  Found
+            # when chapter 22 was rewritten.
+            emit(
+                {
+                    "type": "mcp_status",
+                    "name": str(s.get("name", "?")),
+                    "status": "error",
+                    "detail": f"this server's saved settings cannot be used: {exc}",
+                }
+            )
+            continue
         if record_kind(s) == "remote" and config.oauth is not None:
             storage = OwnerTokenStorage(owner, server=config.name)
             if await storage.get_tokens() is None:

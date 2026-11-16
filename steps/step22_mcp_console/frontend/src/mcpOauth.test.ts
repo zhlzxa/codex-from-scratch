@@ -57,26 +57,30 @@ describe("runOAuthConnect", () => {
   it("times out rather than polling forever when nobody finishes authorizing", async () => {
     const phases: string[] = [];
     let now = 0;
-    // A fake clock local to this test: `Date.now` is not stubbed globally,
-    // `sleep` just advances a counter the deadline math reads through
-    // `pollIntervalMs`/`timeoutMs` set small enough that two polls elapse the
-    // budget without a real timer ever running.
+    let polls = 0;
+    // A fake clock: `sleep` advances it, and `now` is what the deadline reads
+    // -- so the budget of 25 is three polls of 10, with no real time passing.
 
     await runOAuthConnect(
       {
         start: async () => ({ authorize_url: "https://auth.example/authorize" }),
-        status: async () => ({ connected: false }),
+        status: async () => {
+          polls += 1;
+          return { connected: false };
+        },
         openTab: () => undefined,
         sleep: async () => {
           now += 10;
         },
+        now: () => now,
         pollIntervalMs: 10,
         timeoutMs: 25,
       },
       (phase) => phases.push(phase),
     );
 
-    expect(now).toBeGreaterThan(0);
+    expect(polls).toBe(3);
+    expect(now).toBe(30);
     expect(phases.at(-1)).toBe("timed_out");
   });
 
@@ -99,6 +103,30 @@ describe("runOAuthConnect", () => {
     );
 
     expect(calls).toBe(2);
+    expect(phases).toEqual(["starting", "waiting", "connected"]);
+  });
+
+  it("on Reconnect, waits for a different token than the one already on file", async () => {
+    // The token on file before the attempt is "old"; the first two polls still
+    // see it, the third sees the new one.  The first version reported
+    // "connected" on the first poll.
+    const phases: string[] = [];
+    let calls = 0;
+
+    await runOAuthConnect(
+      {
+        start: async () => ({ authorize_url: "https://auth.example/authorize", previous: "old" }),
+        status: async () => {
+          calls += 1;
+          return { connected: true, token: calls >= 3 ? "new" : "old" };
+        },
+        openTab: () => undefined,
+        sleep: instant,
+      },
+      (phase) => phases.push(phase),
+    );
+
+    expect(calls).toBe(3);
     expect(phases).toEqual(["starting", "waiting", "connected"]);
   });
 });

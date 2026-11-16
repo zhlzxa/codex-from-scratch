@@ -201,7 +201,9 @@ export const api = {
   deleteMcp: (id: string) => call<{ ok: boolean }>("DELETE", `/api/mcp/${id}`),
 
   startMcpOauth: (serverId: string) =>
-    call<{ authorize_url: string }>("POST", "/api/mcp/oauth/start", { server_id: serverId }),
+    call<{ authorize_url: string; previous: string | null }>("POST", "/api/mcp/oauth/start", {
+      server_id: serverId,
+    }),
   mcpOauthStatus: (serverId: string) =>
-    call<{ connected: boolean }>("GET", `/api/mcp/${serverId}/oauth/status`),
+    call<{ connected: boolean; token: string | null }>("GET", `/api/mcp/${serverId}/oauth/status`),
 };

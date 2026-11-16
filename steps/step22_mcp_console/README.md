@@ -8,10 +8,10 @@ actually use is not a shipped capability. This chapter closes that.
 
 ```bash
 uv sync --all-extras
-uv run pytest                                  # 1881 tests, all offline
+uv run pytest                                  # 2006 tests, all offline
 uv run python scripts/check_layers.py
-uv run python probe_mutations_ch22.py          # 12 mutations, 0 survivors
-cd frontend && npm run typecheck && npm test   # tsc clean, 4 tests
+uv run python probe_mutations_ch22.py          # 20 mutations, 0 survivors
+cd frontend && npm run typecheck && npm test   # tsc clean, 5 tests
 ```
 
 ## What is new
@@ -22,10 +22,10 @@ cd frontend && npm run typecheck && npm test   # tsc clean, 4 tests
 | `src/minicodex/web/mcp_config.py` | one stored `mcp.json` record → the config object `mcp.connect` takes; called from `routes.py` and `runtime.py`, written once |
 | `src/minicodex/web/routes.py` | `McpIn` now expresses either shape; `POST /api/mcp/oauth/start`, `GET /api/mcp/oauth/callback`, `GET /api/mcp/{id}/oauth/status`; bearer tokens redacted on the way out |
 | `src/minicodex/web/runtime.py` | `resolve_mcp_configs` — dispatches on record shape and refuses an unconnected OAuth server by name |
-| `frontend/src/mcpOauth.ts` | the browser side of one connection, every side effect injected so it tests without a popup or a clock |
+| `frontend/src/mcpOauth.ts` | the browser side of one connection, every side effect -- the clock included -- injected so it tests without a popup or real time |
 | `frontend/src/components/Extensions.tsx` | local/remote toggle, two authentication paths, a Connect GitHub shortcut |
-| `tests/test_faults_ch22.py` | 24 tests, including the full `start → authorize → callback → storage` chain against a stub authorization server |
-| `probe_mutations_ch22.py` | 12 mutations against this chapter's own code |
+| `tests/test_faults_ch22.py` | 33 tests, including the full `start → authorize → callback → storage` chain, and one step further: a turn using that token against a real MCP endpoint |
+| `probe_mutations_ch22.py` | 20 mutations against this chapter's own code (12 in the first version) |
 
 ## The one architectural fact this chapter is about
 
@@ -150,3 +150,28 @@ OAuth tokens are stored under `DEFAULT_OWNER` through chapter 20's `Owner`
 seam — the right shape with exactly one occupant. Authentication, sessions and
 quotas for this project's own multi-user deployment are chapter 23's; until
 they exist, "who is this browser" has one answer.
+
+## Found when the chapter was rewritten
+
+Every end-to-end test was taken one step further (use the token in a turn),
+and the MCP endpoint was put on a different port from its authorization
+server. What that found:
+
+- **The callback page was an XSS.** `error_description` -- the authorization
+  server's text -- went into the page as HTML, on the console's origin, where
+  a script can add a stdio server with any command. Now escaped.
+- **A deleted server's token went to the next server with that name.**
+  Measured: a GitHub token sent to a different host. Names are now unique, and
+  deleting a remote server forgets its token.
+- **Reconnect said "connected" on its first poll**, because the old token was
+  still on file. The status now carries a fingerprint and the browser waits
+  for a new one.
+- **`begin()` never read the server's 401**, so a server that names its
+  metadata only there could not be connected from the console.
+- **One unusable record failed every turn.** It is now reported and skipped.
+- A pre-chapter-22 record went out without `kind`; a broken token file made
+  the callback a 500; the frontend timeout test read the real clock;
+  `OAuthStartError` was never raised.
+- **The first version's console-connected servers failed in every turn** --
+  chapter 21's `McpClient` lost the `Owner` (fixed in chapter 21's rewrite).
+  No test here went past "the token is on disk".
