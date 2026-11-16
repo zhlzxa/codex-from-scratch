@@ -1252,6 +1252,20 @@ server advertises no `registration_endpoint` (measured in chapter 21, F21-08b)
 and so the SDK's dynamic registration has nothing to call. The button does not
 remove that step; it makes every step after it a click.
 
+Found when the chapter was rewritten for beginners (2026-11), by taking every
+end-to-end test one step further -- use the token in a turn -- and by putting
+the MCP endpoint and its authorization server on different ports:
+
+| Fault | Found | Fix |
+|---|---|---|
+| **The OAuth callback page rendered the authorization server's text as HTML.** `error_description` from the redirect, and a token endpoint's response body inside `OAuthTokenError`, were formatted into the page unescaped, on the console's own origin -- where a script can `POST /api/mcp` and add a stdio server with any command. The authorization server is the remote server operator's | 🟢 boundary test | `html.escape`; `minicodex-live` already escaped it |
+| **Tokens are stored by server name, and names were neither unique nor released.** Two records called `gh` shared one token; deleting `gh` left its token for the next server added under that name. Measured: a new `gh` at another URL showed "Connected" without connecting, and its first request carried the GitHub token | 🟡 silent | `add_mcp` refuses a name in use (409); `delete_mcp` forgets the name's token. The CLI and the console still share `DEFAULT_OWNER`'s token file by name -- said, not fixed |
+| **Reconnect reported success before anyone authorized anything.** The status route only answered "is there a token"; on a server that already had one -- the case the runtime's own renewal message sends people to -- the first poll said yes | 🟡 silent | Status carries a token fingerprint, `start` returns the one on file before; the browser waits for a different one |
+| **The console's discovery never asked the server.** `begin()` passed `None` where the SDK passes the 401's `resource_metadata` and `scope`, and only guessed well-known paths on the MCP server's own origin -- a server that names its metadata only in the challenge worked from the CLI and not from the console | 🟢 boundary test | `_challenge` sends an unauthenticated `initialize` and feeds the 401 into discovery |
+| **One unusable record failed every turn.** `server_config`'s second check against a hand-edited record raised out of `resolve_mcp_configs`, taking every server down with it | 🟢 boundary test | The record is reported by name and skipped |
+| **A record saved before chapter 22 reached the frontend without `kind`**, which `types.ts` promised it would always have; its card showed a blank line. A broken token file made the callback a 500 instead of a page. The frontend timeout test read the real clock while its comment said otherwise (25ms, its budget). `OAuthStartError` was never raised | 🟣 review | `_public_mcp` adds `kind`; `OAuthStorageError` handled; `now` injectable; `OAuthStartError` removed |
+| **No test used a console-connected server in a turn.** The end-to-end tests stopped at "the token is on disk"; one step further, chapter 21's `McpClient` lost the `Owner` and every turn failed (fixed in chapter 21's rewrite) | 🟣 review | A test connects through the console, then runs a turn's `resolve_mcp_configs` + `connect()` against a real MCP endpoint with that token |
+
 ---
 
 ## Chapter 23 · Who is using this console ✅
