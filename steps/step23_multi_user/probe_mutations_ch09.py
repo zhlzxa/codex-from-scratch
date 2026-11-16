@@ -88,8 +88,11 @@ MUTATIONS = [
     (
         "mcp.py",
         "no startup timeout",
-        "asyncio.shield(opened), timeout=self.config.startup_timeout",
-        "asyncio.shield(opened), timeout=None",
+        # Chapter 21 rewrote the wait as a loop that stops the clock while a
+        # person is at an OAuth consent screen; this is the same mutation
+        # aimed at the line that now enforces the deadline.
+        "                if self._person_since is None and left <= 0:",
+        "                if False:",
     ),
     (
         "registry.py",

@@ -9,8 +9,8 @@ the one step a library cannot do unattended: showing a URL to a person and
 waiting for what comes back.
 
 That is the whole of this module. `TokenStorage` answers "whose disk", bound to
-chapter 20's `Owner` the same way `Owner.mcp_tokens()` was already shaped to
-expect (`tenancy.py`, added ahead of this chapter for exactly this). The two
+chapter 20's `Owner` through `Owner.mcp_tokens()` -- the fourth per-owner
+path, added to `tenancy.py` in this chapter, not ahead of it. The two
 handlers answer "how does a URL reach a person and a code come back", with a
 real default for a terminal with a browser next to it, and every test in this
 chapter driving an injected fake instead -- the same shape chapter 5 gave
@@ -60,7 +60,15 @@ CALLBACK_TIMEOUT_SECONDS = 300.0
 
 
 class OAuthStorageError(RuntimeError):
-    """The on-disk credential file could not be read or written."""
+    """The on-disk credential file could not be read or written.
+
+    The first version declared this and never raised it: a file that would
+    not parse read as an empty store, and the next write replaced it -- every
+    server's token gone, without a word.  A read still treats such a file as
+    "no token" (that is what the console's "needs connection" shows), but a
+    write now refuses to replace it and says which file.  Found when chapter
+    21 was rewritten.
+    """
 
 
 class OwnerTokenStorage:
@@ -90,18 +98,55 @@ class OwnerTokenStorage:
     def path(self) -> Path:
         return self.owner.mcp_tokens()
 
-    def _read_all(self) -> dict[str, Any]:
+    def _read_all(self, *, for_writing: bool = False) -> dict[str, Any]:
+        """The whole file.  A missing file is an empty store.  A file that
+        cannot be read or parsed is an empty store to a reader -- and an
+        error to a writer, which would otherwise replace every other
+        server's entry with nothing."""
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return {}
-        return raw if isinstance(raw, dict) else {}
+        except (OSError, ValueError) as exc:
+            if for_writing:
+                raise OAuthStorageError(
+                    f"{self.path} cannot be read ({exc}); not overwriting it -- "
+                    "move it aside to sign in again"
+                ) from exc
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        if for_writing:
+            raise OAuthStorageError(f"{self.path} does not hold a JSON object; not overwriting it")
+        return {}
 
     def _write_all(self, data: dict[str, Any]) -> None:
+        """Write the whole file, so that no reader ever sees half of it, and
+        so that it is never readable by anyone else -- not even for a moment.
+
+        The first version wrote in place and then `chmod`ed: between the two,
+        the file had the umask's mode (0644 on most machines), and a crash in
+        the middle of the write left half a JSON document -- which the
+        reader above used to turn into "no tokens at all".  Now: a new file
+        created at 0600, filled, and renamed over the old one.  `os.replace`
+        is atomic on the same filesystem, on POSIX and on Windows.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        with contextlib.suppress(OSError):
-            os.chmod(self.path, 0o600)
+        payload = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
+        temp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        try:
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+            # `O_CREAT`'s mode is filtered through the umask, and a file left
+            # over from a crash keeps whatever mode it had -- so say it again.
+            with contextlib.suppress(OSError):
+                os.chmod(temp, 0o600)
+            os.replace(temp, self.path)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                temp.unlink()
+            raise OAuthStorageError(f"cannot write {self.path}: {exc}") from exc
 
     # -- the SDK's TokenStorage protocol --------------------------------------
 
@@ -115,7 +160,7 @@ class OwnerTokenStorage:
             return None
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
-        data = self._read_all()
+        data = self._read_all(for_writing=True)
         entry = data.setdefault(self.server, {})
         entry["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
         # An *absolute* expiry, alongside the token's own relative
@@ -148,7 +193,7 @@ class OwnerTokenStorage:
             return None
 
     async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
-        data = self._read_all()
+        data = self._read_all(for_writing=True)
         entry = data.setdefault(self.server, {})
         entry["client_info"] = client_info.model_dump(mode="json", exclude_none=True)
         self._write_all(data)
@@ -157,7 +202,7 @@ class OwnerTokenStorage:
 
     async def forget(self) -> bool:
         """Remove this server's entry.  Returns whether there was one."""
-        data = self._read_all()
+        data = self._read_all(for_writing=True)
         if self.server not in data:
             return False
         del data[self.server]
@@ -278,11 +323,13 @@ async def preload_tokens(provider: OAuthClientProvider, storage: OwnerTokenStora
     401. And a 401 does **not** fall back to `_refresh_token()`: read
     `async_auth_flow`, and the `if response.status_code == 401:` branch goes
     straight to protected-resource discovery and a fresh interactive
-    authorization, unconditionally. Measured directly (`probe_mcp_remote.py
-    oauth-401`): a provider seeded with an expired token, a live
-    `refresh_token` and a stored `client_info` still called `redirect_handler`
-    with a fresh `/authorize` URL, and never called the token endpoint with
-    `grant_type=refresh_token` at all.
+    authorization, unconditionally. Reproduced directly
+    (`test_F21_15_without_preloading_a_401_launches_a_browser_instead_of_refreshing`):
+    a provider seeded with an expired token, a live `refresh_token` and a
+    stored `client_info` still called `redirect_handler` with a fresh
+    `/authorize` URL, and never called the token endpoint with
+    `grant_type=refresh_token` at all.  (The first version cited a
+    `probe_mcp_remote.py oauth-401` section; the probe has no such section.)
 
     Reconstructing `token_expiry_time` here, from the absolute timestamp
     `OwnerTokenStorage.set_tokens` persists precisely so it can be

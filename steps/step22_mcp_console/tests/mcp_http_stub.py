@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -121,6 +122,7 @@ class HttpMcpStub:
         require_auth: bool = False,
         challenge: str = "",
         delay: float = 0.0,
+        accepts: Callable[[str], bool] | None = None,
     ) -> None:
         #: seconds to sleep before replying to a `tools/call` -- what F21-06's
         #: tool-timeout test needs: a server that is reachable and eventually
@@ -141,6 +143,10 @@ class HttpMcpStub:
         self.declare_resources_capability = declare_resources_capability
         self.require_auth = require_auth
         self.challenge = challenge
+        #: with `require_auth`, which `Authorization` values count.  `None`
+        #: means any at all -- enough for a static token; an OAuth test passes
+        #: the authorization server's own idea of the live token instead.
+        self.accepts = accepts
 
         self._server: asyncio.AbstractServer | None = None
         self.port = 0
@@ -196,7 +202,8 @@ class HttpMcpStub:
         if isinstance(message, dict) and isinstance(message.get("method"), str):
             self.methods_called.append(message["method"])
 
-        if self.require_auth and not headers.get("authorization"):
+        given = headers.get("authorization")
+        if self.require_auth and (not given or (self.accepts and not self.accepts(given))):
             extra = f'Bearer resource_metadata="{self.challenge}"' if self.challenge else "Bearer"
             await _write_response(writer, 401, {"WWW-Authenticate": extra}, b"")
             return
@@ -276,6 +283,10 @@ class OAuthStub:
 
     def __init__(self, *, supports_dcr: bool = True) -> None:
         self.supports_dcr = supports_dcr
+        #: what the protected-resource metadata says it protects.  `None`
+        #: means this server's own `/protected`; a test with a separate MCP
+        #: endpoint behind this authorization server sets it to that URL.
+        self.resource: str | None = None
         self._server: asyncio.AbstractServer | None = None
         self.port = 0
         self.register_calls = 0
@@ -307,6 +318,12 @@ class OAuthStub:
     def prm_url(self) -> str:
         return f"{self.base}/.well-known/oauth-protected-resource"
 
+    def is_live(self, authorization: str) -> bool:
+        """Whether an `Authorization` header carries the token issued last --
+        handed to `HttpMcpStub(accepts=...)` so a real MCP endpoint can sit
+        behind this authorization server."""
+        return authorization == f"Bearer {self._live_access_token}"
+
     async def __aenter__(self) -> OAuthStub:
         self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
         self.port = self._server.sockets[0].getsockname()[1]
@@ -329,7 +346,21 @@ class OAuthStub:
         self.requests.append((method, path))
 
         if path == "/.well-known/oauth-protected-resource":
-            await self._json(writer, 200, {"authorization_servers": [self.base]})
+            # `resource` is required by RFC 9728 and by the SDK's model.  The
+            # first version of this stub left it out; the SDK dropped the
+            # whole document without a word and fell back to "the
+            # authorization server is the resource's own origin" -- which,
+            # here, happened to be true, so every OAuth test passed on the
+            # fallback.  Found when chapter 21 was rewritten, by the first
+            # test that put the MCP endpoint on a different port.
+            await self._json(
+                writer,
+                200,
+                {
+                    "resource": self.resource or self.resource_url,
+                    "authorization_servers": [self.base],
+                },
+            )
             return
         if path == "/.well-known/oauth-authorization-server":
             body_json: dict[str, Any] = {
