@@ -13,11 +13,11 @@ three chapters early.
 
 ```bash
 uv sync --all-extras
-uv run pytest                                  # 1939 tests, all offline
+uv run pytest                                  # 2069 tests, all offline
 uv run python scripts/check_layers.py
-uv run python probe_mutations_ch23.py          # 28 mutations, 0 survivors
+uv run python probe_mutations_ch23.py          # 32 mutations, 0 survivors
 uv run python probe_ws_auth.py                 # the measurement behind F23-02
-cd frontend && npm run typecheck && npm test   # tsc clean, 9 tests
+cd frontend && npm run typecheck && npm test   # tsc clean, 10 tests
 ```
 
 ## What is new
@@ -32,10 +32,10 @@ cd frontend && npm run typecheck && npm test   # tsc clean, 9 tests
 | `src/minicodex/web/routes.py` | `/api/auth/*`, `/api/accounts/*`, and every existing route now resolving through the caller's own store |
 | `frontend/src/components/SignIn.tsx` | the bootstrap form and the login form, chosen by `has_account` |
 | `frontend/src/components/Account.tsx` | signed-in browsers, the quota, the password, and the account list for an admin |
-| `tests/test_faults_ch23.py` | 57 tests, none skipped |
+| `tests/test_faults_ch23.py` | 62 tests (57 in the first version) |
 | `tests/test_packaging.py` | the CI wiring check, now asking the workflow's `run:` commands rather than its text (F23-11) |
 | `probe_ws_auth.py` | two gates, one socket, printed side by side |
-| `probe_mutations_ch23.py` | 28 mutations against this chapter's own code |
+| `probe_mutations_ch23.py` | 32 mutations against this chapter's own code (28 in the first version) |
 
 ## The one idea
 
@@ -126,6 +126,36 @@ be as right as the assumption it inherits from the code.
 The *skills* panel two functions below is workspace-relative and correct, since
 skills stayed per-project when memory moved. The two were written side by side
 with the same shape and only one of them was right.
+
+## Every account is a shell on this server
+
+Read this before creating a second account. The tenancy in this chapter
+separates *records*: through the console's API, one account cannot see or
+change another's threads, providers, MCP servers, tokens or memories. It does
+**not** separate *privileges*. Every account's agent runs commands as the
+system user that runs the console -- approvals are clicked by the same account,
+and a stdio MCP server's command is whatever it types -- so an account can read
+any file that user can, including other accounts' records and, through
+`/proc/<parent>/environ`, the operator's environment (measured when the
+chapter was rewritten). Chapter 20's sandbox is not wired in here, and even
+`--ro-bind / /` would leave everything readable. Only give an account to
+someone you would give a shell on this machine.
+
+## Found when the chapter was rewritten
+
+- **Any account could have the console send the operator's
+  `OPENAI_API_KEY` to a URL it chose** -- a provider with no key and its own
+  `base_url`. The environment key now goes only to `https://api.openai.com`.
+- **A same-site page could POST to the console** (`SameSite=Lax` ignores the
+  port; a bodyless POST needs no preflight). `Origin` must now match `Host`
+  on every unsafe method; the Vite dev proxy no longer rewrites `Host`.
+- **`accounts.json` and `providers.json` were 0644.** Now created 0600.
+- A test that started a turn through an un-entered `TestClient` passed against
+  the unfixed code; the turn had died with the request's event loop.
+- `minicodex-live`'s console could not run a turn at all (a frozen
+  `ToolContext`); fixed there.
+- Upgrading from a single-user console adopts the data directory's records,
+  not `~/.minicodex/memories` or `mcp_tokens.json`, which the CLI still uses.
 
 ## Still not a hosted product
 

@@ -1343,6 +1343,21 @@ shape chapter 19 uses for a frontend confirmation dialog (F19-11), with the
 same limit, which is that a static assertion can tell you a function was
 called and not that it does what its name says.
 
+Found when the chapter was rewritten for beginners (2026-11), by using a
+non-admin account to ask what it can do to the server, by re-measuring on
+Linux, and by making every test that starts a turn wait until that turn has
+reached its model:
+
+| Fault | Found | Fix |
+|---|---|---|
+| **Any account could have the console send the operator's `OPENAI_API_KEY` to a URL it chose.** `resolve_api_key` filled in the environment's key for any `openai` provider with no key of its own, whatever its `base_url` -- and after this chapter a provider is a record every account writes. Measured: a non-admin account's own server received `Bearer sk-...`. A well-meaning account pointing at an "OpenAI-compatible" third party leaks it the same way | 🟢 boundary test | The environment key goes only to `https://api.openai.com` |
+| **The tenancy is not a security boundary, and the first text did not say so.** Every account runs commands as the server's user: its own approvals let `run_shell` do anything, and a stdio MCP server's command is whatever it types. Measured: the agent's shell read the operator's key from `/proc/$PPID/environ`. Other accounts' records, tokens and hashes are files of the same user | 🟣 review | Said, prominently: an account is a shell on the server. Not fixed -- it needs per-account confinement (chapter 20's sandbox, wired and scoped) or per-account system users |
+| **A same-site page could POST to the console.** `SameSite=Lax` ignores the port, so `localhost:3000` sends the cookie to `localhost:8000`; a POST with no body needs no preflight. The gate checked `Origin` only on the socket -- such a page could disable accounts, sign everyone out, cancel turns. (JSON-bodied routes were safe: FastAPI refuses `text/plain` and forms -- a negative result, kept as a test) | 🟢 boundary test | `Origin` must match `Host` on every unsafe method; the Vite dev proxy no longer rewrites `Host` |
+| **`accounts.json` and every tenant's `providers.json` were 0644** -- password hashes and plaintext API keys readable by every user on the machine | 🟢 boundary test | Created 0600 (`open_private`; `minicodex-live`'s `atomic_write_json`) |
+| **No console turn in `minicodex-live` could reach its model.** `run_turn` assigned `context.shell` on a frozen `ToolContext`; `FrozenInstanceError` before the first model call, on `main` as delivered | 🟡 silent | `dataclasses.replace`; the key test above is its regression test |
+| **A test that starts a turn through an un-entered `TestClient` tests nothing**: each request runs on a loop that closes with it, and the background turn dies unsent. The rewrite's own first key test passed against the unfixed code this way | 🟡 silent | The test enters the client and asserts the turn reached the model; `_second_account` says so |
+| Text: the numbers were Windows'; "245 entries" (259); "`tenancy.py` did not change" (its code did not; its docstring did); `adopt_legacy_records` "stops at the first existing target" (it skips that one); "measured in chapter 22" (21). Not said: upgrading leaves `~/.minicodex/memories` and `mcp_tokens.json` where the CLI still reads them, so the console starts with neither | 🟣 review | Corrected, and stated |
+
 ---
 
 **Total: 259 entries**, of which **27 are negative results** — faults predicted
