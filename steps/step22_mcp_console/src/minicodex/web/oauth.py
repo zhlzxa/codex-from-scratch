@@ -50,6 +50,8 @@ from mcp.client.auth.utils import (
     build_protected_resource_metadata_discovery_urls,
     create_client_registration_request,
     create_oauth_metadata_request,
+    extract_resource_metadata_from_www_auth,
+    extract_scope_from_www_auth,
     get_client_metadata_scopes,
     handle_auth_metadata_response,
     handle_protected_resource_response,
@@ -77,10 +79,6 @@ _DISCOVERY_TIMEOUT = 30.0
 # gets more slack rather than the same number reused without thinking about
 # it.
 DEFAULT_PENDING_TTL_SECONDS = 600.0
-
-
-class OAuthStartError(RuntimeError):
-    """`begin()` could not reach a usable authorization URL for this server."""
 
 
 @dataclass
@@ -147,9 +145,44 @@ class PendingOAuthTable:
         return len(self._table)
 
 
+# The request a connection starts with.  `_discover` sends it without a token
+# for the one thing the answer carries: the server's own `WWW-Authenticate`.
+_INITIALIZE = {
+    "jsonrpc": "2.0",
+    "id": 0,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "minicodex-console", "version": "0"},
+    },
+}
+
+
+async def _challenge(context: OAuthContext, client: httpx2.AsyncClient) -> httpx2.Response | None:
+    """Ask the server, unauthenticated, what it wants -- the 401 the SDK's own
+    flow reacts to.  `None` when it does not answer 401."""
+    response = await client.post(
+        context.server_url,
+        json=_INITIALIZE,
+        headers={"Accept": "application/json, text/event-stream"},
+    )
+    return response if response.status_code == 401 else None
+
+
 async def _discover(context: OAuthContext, client: httpx2.AsyncClient) -> None:
     """Steps 1-2 of `OAuthClientProvider.async_auth_flow`'s 401 branch, run
     directly instead of waiting for a 401 to trigger them.
+
+    Including the 401 itself.  The first version passed `None` where the SDK
+    passes what the server's `WWW-Authenticate` names -- the protected-
+    resource metadata URL and the scope -- and so only ever *guessed* the
+    well-known paths on the MCP server's own origin.  RFC 9728 makes the
+    header the primary way a server says where its metadata is; a server that
+    says it only there connected from the CLI (the SDK reads the header) and
+    not from the console.  Found when chapter 22 was rewritten, by the first
+    test that put the MCP endpoint and its authorization server on different
+    ports.
 
     Failure here is not fatal in itself -- a server with no protected-resource
     metadata and no authorization-server metadata is legal (SEP-985's fallback
@@ -159,7 +192,9 @@ async def _discover(context: OAuthContext, client: httpx2.AsyncClient) -> None:
     `authorization_endpoint` to send anyone to, or `check_registration_usable`
     refusing what got registered.
     """
-    for url in build_protected_resource_metadata_discovery_urls(None, context.server_url):
+    challenge = await _challenge(context, client)
+    named = extract_resource_metadata_from_www_auth(challenge) if challenge else None
+    for url in build_protected_resource_metadata_discovery_urls(named, context.server_url):
         response = await client.send(create_oauth_metadata_request(url))
         prm = await handle_protected_resource_response(response)
         if prm is not None:
@@ -180,7 +215,7 @@ async def _discover(context: OAuthContext, client: httpx2.AsyncClient) -> None:
             break
 
     context.client_metadata.scope = get_client_metadata_scopes(
-        None,
+        extract_scope_from_www_auth(challenge) if challenge else None,
         context.protected_resource_metadata,
         context.oauth_metadata,
         context.client_metadata.grant_types,
@@ -315,7 +350,6 @@ __all__ = [
     "DEFAULT_PENDING_TTL_SECONDS",
     "OAuthFlowError",
     "OAuthRegistrationError",
-    "OAuthStartError",
     "OAuthTokenError",
     "PendingOAuth",
     "PendingOAuthTable",

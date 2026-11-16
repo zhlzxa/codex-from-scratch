@@ -22,6 +22,8 @@ all, and is also the strong reference `asyncio` does not keep for you.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import html
 import logging
 import shlex
 from pathlib import Path
@@ -33,7 +35,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from minicodex.approval import ApprovalReply
-from minicodex.mcp_oauth import OwnerTokenStorage
+from minicodex.mcp_oauth import OAuthStorageError, OwnerTokenStorage
 from minicodex.memory import BODY_FILE, SUMMARY_FILE, usage
 from minicodex.memory import load as load_memory
 from minicodex.memory_jobs import JobStore
@@ -968,10 +970,18 @@ class McpIn(BaseModel):
 
 def _public_mcp(record: dict[str, Any]) -> dict[str, Any]:
     """A bearer token never leaves the process, not even to the browser that
-    typed it in -- `_public` (below, for providers) drew this line first."""
+    typed it in -- `_public` (below, for providers) drew this line first.
+
+    `kind` is filled in here as well.  `types.ts` tells the frontend it can
+    rely on `kind` "because the backend has already normalised" it -- and the
+    first version did not: a stdio record saved before chapter 22 went out
+    with no `kind`, and its card showed `m.url` (nothing) where the command
+    should have been.  Found when chapter 22 was rewritten.
+    """
+    public = {**record, "kind": record_kind(record)}
     if record.get("bearer_token"):
-        return {**record, "bearer_token": True}
-    return record
+        public["bearer_token"] = True
+    return public
 
 
 @router.get("/api/mcp")
@@ -989,6 +999,13 @@ def add_mcp(request: Request, body: McpIn) -> dict[str, Any]:
         )
     if not has_command and not has_url:
         raise HTTPException(400, "give this server either a command (stdio) or a url (remote)")
+    # One record per name.  A remote server's OAuth token is stored under its
+    # *name* (`OwnerTokenStorage(owner, server=name)`, chapter 21), so two
+    # records called "gh" shared one token, and a token issued for one URL was
+    # sent to the other.  Found when chapter 22 was rewritten; the tool names
+    # two same-named servers produce collide anyway (chapter 9).
+    if any(r.get("name") == body.name for r in _store(request).all("mcp.json")):
+        raise HTTPException(409, f"a server called {body.name!r} already exists")
     if body.startup_timeout <= 0 or body.tool_timeout <= 0:
         raise HTTPException(400, "timeouts must be positive")
 
@@ -1046,8 +1063,28 @@ def toggle_mcp(request: Request, server_id: str, body: McpToggle) -> dict[str, A
 
 
 @router.delete("/api/mcp/{server_id}")
-def delete_mcp(request: Request, server_id: str) -> dict[str, bool]:
-    return {"ok": _store(request).delete("mcp.json", server_id)}
+async def delete_mcp(request: Request, server_id: str) -> dict[str, bool]:
+    """Remove a server, and the OAuth token and client stored under its name.
+
+    The first version removed only the record.  The token stayed in
+    `mcp_tokens.json` under the name, so the next server added with that name
+    -- any URL at all -- showed "Connected" without ever connecting, and its
+    first request carried the old server's token.  Measured when chapter 22
+    was rewritten: a GitHub token, sent to a different host.
+    """
+    auth = _auth(request)
+    store = _store(request)
+    record = store.get("mcp.json", server_id)
+    ok = store.delete("mcp.json", server_id)
+    still_named = any(r.get("name") == (record or {}).get("name") for r in store.all("mcp.json"))
+    if ok and record is not None and record_kind(record) == "remote" and not still_named:
+        # (`still_named`: a same-named record saved before names were unique
+        # still uses that token.)
+        try:
+            await OwnerTokenStorage(auth.owner, server=record["name"]).forget()
+        except OAuthStorageError as exc:
+            raise HTTPException(500, f"server removed, but its token was not: {exc}") from exc
+    return {"ok": ok}
 
 
 # -- MCP OAuth: the console's own architecture, not chapter 21's -------------
@@ -1074,8 +1111,16 @@ class OAuthStartIn(BaseModel):
     server_id: str
 
 
+def _token_fingerprint(tokens: Any) -> str | None:
+    """Sixteen hex characters that change whenever the stored token does --
+    and that say nothing about the token itself."""
+    if tokens is None:
+        return None
+    return hashlib.sha256(tokens.access_token.encode("utf-8")).hexdigest()[:16]
+
+
 @router.post("/api/mcp/oauth/start")
-async def start_mcp_oauth(request: Request, body: OAuthStartIn) -> dict[str, str]:
+async def start_mcp_oauth(request: Request, body: OAuthStartIn) -> dict[str, Any]:
     console = _console(request)
     auth = _auth(request)
     record = _mcp_record(request, body.server_id)
@@ -1101,11 +1146,15 @@ async def start_mcp_oauth(request: Request, body: OAuthStartIn) -> dict[str, str
         mcp_oauth_flow.OAuthFlowError,
         mcp_oauth_flow.OAuthRegistrationError,
         mcp_oauth_flow.OAuthTokenError,
+        OAuthStorageError,
         httpx2.HTTPError,
     ) as exc:
         raise HTTPException(400, f"could not start OAuth for {record['name']}: {exc}") from exc
     console.mcp_oauth.put(pending)
-    return {"authorize_url": authorize_url}
+    # `previous`: which token is on file *before* this attempt, so the browser
+    # can wait for a different one (`mcpOauth.ts`).  See `mcp_oauth_status`.
+    previous = await OwnerTokenStorage(auth.owner, server=record["name"]).get_tokens()
+    return {"authorize_url": authorize_url, "previous": _token_fingerprint(previous)}
 
 
 _OAUTH_RESULT_PAGE = """<!doctype html>
@@ -1123,8 +1172,19 @@ _OAUTH_RESULT_PAGE = """<!doctype html>
 
 
 def _oauth_result_page(*, ok: bool, message: str) -> HTMLResponse:
+    """The page the authorization server's redirect lands on.
+
+    `message` is escaped.  The first version formatted it in raw, and it
+    carries text this console did not write: `error_description` straight
+    from the redirect, and the token endpoint's own response body when the
+    exchange fails -- both chosen by whoever runs the remote server's
+    authorization server.  Measured when chapter 22 was rewritten: an
+    `<img onerror=...>` in `error_description` came back as live HTML, on the
+    console's own origin, where a script can call `POST /api/mcp` and add a
+    stdio server with any command it likes.
+    """
     title = "Connected" if ok else "Connection failed"
-    return HTMLResponse(_OAUTH_RESULT_PAGE.format(title=title, message=message))
+    return HTMLResponse(_OAUTH_RESULT_PAGE.format(title=title, message=html.escape(message)))
 
 
 @router.get("/api/mcp/oauth/callback")
@@ -1170,6 +1230,7 @@ async def mcp_oauth_callback(
     except (
         mcp_oauth_flow.OAuthFlowError,
         mcp_oauth_flow.OAuthTokenError,
+        OAuthStorageError,
         httpx2.HTTPError,
     ) as exc:
         return _oauth_result_page(ok=False, message=f"{pending.server_name}: {exc}")
@@ -1183,9 +1244,17 @@ async def mcp_oauth_status(request: Request, server_id: str) -> dict[str, Any]:
     successfully messaging back to a window it may not still have a handle
     to (a popup blocker, `noopener`, or the tab simply being closed early all
     break a `postMessage`-based handshake; polling a status a person can also
-    just reload the page and still see does not)."""
+    just reload the page and still see does not).
+
+    `token` is a fingerprint of the stored token.  "Is there a token?" alone
+    cannot tell a *new* token from the one already on file, and the first
+    version's Reconnect -- the button the runtime's own error message sends
+    people to when a session has to be renewed -- read the old token on its
+    first poll and reported "connected" before anyone had clicked anything.
+    Found when chapter 22 was rewritten.
+    """
     auth = _auth(request)
     record = _mcp_record(request, server_id)
     storage = OwnerTokenStorage(auth.owner, server=record["name"])
     tokens = await storage.get_tokens()
-    return {"connected": tokens is not None}
+    return {"connected": tokens is not None, "token": _token_fingerprint(tokens)}

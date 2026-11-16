@@ -435,8 +435,9 @@ async def test_the_full_state_to_callback_to_token_storage_chain(
         assert started.status_code == 200, started.text
         authorize_url = started.json()["authorize_url"]
 
+        assert started.json()["previous"] is None
         before = (await api.get(f"/api/mcp/{created['id']}/oauth/status")).json()
-        assert before == {"connected": False}
+        assert before == {"connected": False, "token": None}
 
         # A real network hop, to the stub authorization server -- unlike
         # `api`, which never leaves this process.
@@ -453,7 +454,8 @@ async def test_the_full_state_to_callback_to_token_storage_chain(
         assert "connected to gh" in callback.text
 
         after = (await api.get(f"/api/mcp/{created['id']}/oauth/status")).json()
-        assert after == {"connected": True}
+        assert after["connected"] is True
+        assert after["token"] is not None
 
     tokens = await OwnerTokenStorage(owner, server="gh").get_tokens()
     assert tokens is not None and tokens.access_token == "access-1"
@@ -495,3 +497,280 @@ async def test_a_second_use_of_the_same_callback_link_is_refused(
         second = await api.get("/api/mcp/oauth/callback", params=query)
         assert "unknown or has expired" in second.text
         assert auth.token_calls == 1, "the code must not be exchanged twice"
+
+
+# ---------------------------------------------------------------------------
+# Found when chapter 22 was rewritten
+# ---------------------------------------------------------------------------
+
+
+async def _connect_through_the_console(
+    api: httpx2.AsyncClient, auth: OAuthStub, server_id: str
+) -> None:
+    """start -> the browser at the authorization server -> callback."""
+    authorize_url = (await api.post("/api/mcp/oauth/start", json={"server_id": server_id})).json()[
+        "authorize_url"
+    ]
+    async with httpx2.AsyncClient() as browser:
+        response = await browser.get(authorize_url, follow_redirects=False)
+    params = parse_qs(urlparse(response.headers["location"]).query)
+    callback = await api.get(
+        "/api/mcp/oauth/callback", params={"code": params["code"][0], "state": params["state"][0]}
+    )
+    assert "connected to" in callback.text, callback.text
+
+
+async def test_a_server_connected_in_the_console_is_usable_in_a_turn(
+    tmp_path: Path, owner: Owner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chain the tests above stop short of: Connect in the console, then
+    a turn's own `resolve_mcp_configs` + `connect()` -- with the refusing
+    handlers a turn passes -- reaching a real MCP endpoint with that token.
+
+    The first version's tests ended at "the token is on disk".  Past that
+    point, every turn would have failed: chapter 21's `McpClient` lost the
+    `Owner` (fixed when chapter 21 was rewritten), and no test here went far
+    enough to see it.
+
+    The MCP endpoint and its authorization server are on different ports, and
+    only the endpoint's 401 says where the metadata is -- the case `begin()`
+    could not handle until it read that 401 (`_discover`)."""
+    from mcp_http_stub import HttpMcpStub
+    from minicodex.registry import McpRegistry, connect
+
+    async with (
+        OAuthStub(supports_dcr=False) as auth,
+        HttpMcpStub(require_auth=True, challenge=auth.prm_url, accepts=auth.is_live) as mcp,
+        _async_api(tmp_path, owner, monkeypatch) as api,
+    ):
+        auth.resource = mcp.url
+        created = (
+            await api.post(
+                "/api/mcp",
+                json={"name": "gh", "url": mcp.url, "oauth": True, "oauth_client_id": "preset"},
+            )
+        ).json()
+        await _connect_through_the_console(api, auth, created["id"])
+
+        record = api._transport.app.state.console.store.get("mcp.json", created["id"])  # type: ignore[attr-defined]
+        events: list[dict[str, Any]] = []
+        configs = await web_runtime.resolve_mcp_configs([record], events.append)
+        assert events == []
+        registry = McpRegistry()
+        clients = await connect(
+            configs,
+            registry,
+            owner=owner,
+            redirect_handler=web_runtime._oauth_redirect_refused,
+            callback_handler=web_runtime._oauth_callback_refused,
+        )
+        try:
+            assert registry.failures == {}
+            assert any("echo" in name for name in registry.handlers())
+        finally:
+            for client in clients:
+                await client.close()
+    assert mcp.authorized[-1] == "Bearer access-1"
+
+
+def test_the_callback_page_escapes_what_the_authorization_server_sent(
+    console: TestClient, tmp_path: Path
+) -> None:
+    """`error_description` comes from the redirect -- from whoever runs the
+    authorization server.  The first version put it into the page as HTML,
+    on the console's own origin."""
+    app_console = console.app.state.console  # type: ignore[attr-defined]
+    app_console.mcp_oauth.put(_dummy_pending("s-xss", created_at=time.time(), home=tmp_path))
+    page = console.get(
+        "/api/mcp/oauth/callback",
+        params={
+            "state": "s-xss",
+            "error": "access_denied",
+            "error_description": '<img src=x onerror="alert(1)">',
+        },
+    ).text
+    assert "<img" not in page
+    assert "&lt;img src=x onerror=&quot;alert(1)&quot;&gt;" in page
+
+
+def test_two_servers_cannot_share_a_name(console: TestClient) -> None:
+    """A remote server's token is stored under its name; two records with one
+    name shared one token."""
+    first = console.post("/api/mcp", json={"name": "gh", "url": "https://a.test/mcp"})
+    assert first.status_code == 200
+    second = console.post("/api/mcp", json={"name": "gh", "url": "https://b.test/mcp"})
+    assert second.status_code == 409
+    assert "already exists" in second.json()["detail"]
+
+
+async def test_deleting_a_server_forgets_its_token(
+    tmp_path: Path, owner: Owner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Measured when chapter 22 was rewritten: delete "gh", add a new "gh"
+    at another URL, and the new record read "Connected" -- and its first
+    request carried the old server's token."""
+    async with _async_api(tmp_path, owner, monkeypatch) as api:
+        old = (
+            await api.post(
+                "/api/mcp",
+                json={
+                    "name": "gh",
+                    "url": "https://a.test/mcp",
+                    "oauth": True,
+                    "oauth_client_id": "c",
+                },
+            )
+        ).json()
+        await OwnerTokenStorage(owner, server="gh").set_tokens(OAuthToken(access_token="gho_old"))
+        assert (await api.delete(f"/api/mcp/{old['id']}")).json() == {"ok": True}
+        assert await OwnerTokenStorage(owner, server="gh").get_tokens() is None
+
+        new = (
+            await api.post(
+                "/api/mcp",
+                json={
+                    "name": "gh",
+                    "url": "https://b.test/mcp",
+                    "oauth": True,
+                    "oauth_client_id": "c",
+                },
+            )
+        ).json()
+        status = (await api.get(f"/api/mcp/{new['id']}/oauth/status")).json()
+        assert status == {"connected": False, "token": None}
+
+
+async def test_reconnect_reports_a_new_token_not_the_old_one(
+    tmp_path: Path, owner: Owner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`start` says which token was on file before; the status after the
+    callback carries a different one.  The first version's status was only
+    `{"connected": true}`, which an old, dead token answers just as well."""
+    async with (
+        OAuthStub(supports_dcr=False) as auth,
+        _async_api(tmp_path, owner, monkeypatch) as api,
+    ):
+        created = (
+            await api.post(
+                "/api/mcp",
+                json={
+                    "name": "gh",
+                    "url": auth.resource_url,
+                    "oauth": True,
+                    "oauth_client_id": "p",
+                },
+            )
+        ).json()
+        await OwnerTokenStorage(owner, server="gh").set_tokens(OAuthToken(access_token="dead"))
+        status_before = (await api.get(f"/api/mcp/{created['id']}/oauth/status")).json()
+        started = (await api.post("/api/mcp/oauth/start", json={"server_id": created["id"]})).json()
+        assert started["previous"] == status_before["token"] is not None
+
+        async with httpx2.AsyncClient() as browser:
+            response = await browser.get(started["authorize_url"], follow_redirects=False)
+        params = parse_qs(urlparse(response.headers["location"]).query)
+        await api.get(
+            "/api/mcp/oauth/callback",
+            params={"code": params["code"][0], "state": params["state"][0]},
+        )
+        status_after = (await api.get(f"/api/mcp/{created['id']}/oauth/status")).json()
+    assert status_after["token"] not in (None, started["previous"])
+
+
+def test_a_record_saved_before_chapter_22_goes_out_with_its_kind(
+    console: TestClient,
+) -> None:
+    """`types.ts` promises the frontend a `kind` on every record; a stdio
+    record saved before chapter 22 has none on disk."""
+    store = console.app.state.console.store  # type: ignore[attr-defined]
+    store.add("mcp.json", {"name": "old", "command": ["true"], "enabled": True})
+    (record,) = console.get("/api/mcp").json()
+    assert record["kind"] == "stdio"
+
+
+async def test_a_token_file_that_cannot_be_written_is_a_failed_page_not_a_500(
+    tmp_path: Path, owner: Owner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chapter 21's rewrite made a broken token file an `OAuthStorageError`
+    rather than a silent overwrite; the callback has to say so in a page,
+    not answer the browser with an internal error."""
+    async with (
+        OAuthStub(supports_dcr=False) as auth,
+        _async_api(tmp_path, owner, monkeypatch) as api,
+    ):
+        created = (
+            await api.post(
+                "/api/mcp",
+                json={
+                    "name": "gh",
+                    "url": auth.resource_url,
+                    "oauth": True,
+                    "oauth_client_id": "p",
+                },
+            )
+        ).json()
+        authorize_url = (
+            await api.post("/api/mcp/oauth/start", json={"server_id": created["id"]})
+        ).json()["authorize_url"]
+        owner.mcp_tokens().write_text("{ not json", encoding="utf-8")
+        async with httpx2.AsyncClient() as browser:
+            response = await browser.get(authorize_url, follow_redirects=False)
+        params = parse_qs(urlparse(response.headers["location"]).query)
+        callback = await api.get(
+            "/api/mcp/oauth/callback",
+            params={"code": params["code"][0], "state": params["state"][0]},
+        )
+    assert callback.status_code == 200
+    assert "Connection failed" in callback.text
+    assert "not overwriting" in callback.text
+
+
+async def test_begin_follows_the_metadata_url_the_server_names_in_its_401(
+    tmp_path: Path,
+) -> None:
+    """The narrow version of the test above: `begin()` alone, against an MCP
+    endpoint whose metadata is only discoverable from its challenge.  The
+    first version guessed well-known paths on the endpoint's own origin and
+    built an authorize URL there."""
+    from mcp_http_stub import HttpMcpStub
+
+    async with (
+        OAuthStub(supports_dcr=False) as auth,
+        HttpMcpStub(require_auth=True, challenge=auth.prm_url) as mcp,
+    ):
+        auth.resource = mcp.url
+        config = RemoteServerConfig(
+            name="gh", url=mcp.url, oauth=RemoteOAuthConfig(client_id="preset")
+        )
+        authorize_url, _ = await begin(
+            config,
+            server_id="srv-1",
+            redirect_uri="http://console.test/api/mcp/oauth/callback",
+            owner=Owner(home=tmp_path / "home"),
+        )
+    assert authorize_url.startswith(f"{auth.base}/authorize?")
+
+
+async def test_one_unusable_record_is_reported_and_skipped_not_fatal_to_the_turn(
+    owner: Owner,
+) -> None:
+    """A record that cannot become a config -- here a hand-edited one with a
+    token *and* OAuth, the case `server_config` refuses a second time -- is
+    reported under its own name, and the other servers still connect.  The
+    first version raised out of `resolve_mcp_configs`, and every turn failed."""
+    records = [
+        {
+            "name": "broken",
+            "kind": "remote",
+            "url": "https://x.test/mcp",
+            "bearer_token": "t",
+            "oauth": {"client_id": "cid"},
+        },
+        {"name": "files", "command": ["true"]},
+    ]
+    events: list[dict[str, Any]] = []
+    configs = await web_runtime.resolve_mcp_configs(records, events.append)
+    assert [c.name for c in configs] == ["files"]
+    assert events[0]["name"] == "broken"
+    assert events[0]["status"] == "error"
+    assert "cannot be used" in events[0]["detail"]
