@@ -9,6 +9,7 @@ fsync, which only the threads table kept -- so the sequence lives once now.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -27,7 +28,13 @@ def atomic_write_json(path: Path, payload: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as handle:
+    # 0600 from the moment it exists: these files hold API keys, password
+    # hashes and session hashes, side by side for every account.  Created with
+    # the umask's mode before (0644, readable by every user on the machine).
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with contextlib.suppress(OSError):
+        os.chmod(tmp, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False))
         handle.flush()
         os.fsync(handle.fileno())

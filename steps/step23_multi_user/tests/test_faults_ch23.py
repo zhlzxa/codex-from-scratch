@@ -26,6 +26,7 @@ completion is a quota a failing loop does not have.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -81,7 +82,13 @@ def workspace(tmp_path: Path) -> Path:
 
 
 def _second_account(console: TestClient, key: str = "bob", **extra: Any) -> TestClient:
-    """Create another account and return a client signed in as it."""
+    """Create another account and return a client signed in as it.
+
+    The client is *not* entered as a context manager, so each request runs on
+    an event loop of its own that closes when the request does.  Fine for
+    asking routes questions; wrong for anything that starts a turn, which is a
+    background task and dies with that loop -- see
+    `test_the_operators_key_is_not_sent_to_a_url_another_account_chose`."""
     response = console.post(
         "/api/accounts", json={"key": key, "password": SECOND_PASSWORD, **extra}
     )
@@ -990,3 +997,151 @@ def test_F23_10_the_frontend_tests_run_in_ci(repo_root: Path) -> None:
 
     package = json.loads((repo_root / "frontend" / "package.json").read_text(encoding="utf-8"))
     assert "vitest" in package["scripts"]["test"]
+
+
+# ---------------------------------------------------------------------------
+# Found when chapter 23 was rewritten
+# ---------------------------------------------------------------------------
+
+
+def test_the_operators_key_is_not_sent_to_a_url_another_account_chose(
+    console: TestClient, workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Measured: a non-admin account adds an `openai` provider with no key and
+    its own `base_url`; the first version's `resolve_api_key` filled in the
+    server's `OPENAI_API_KEY`, and the account's server received it.
+
+    `mallory` is a `TestClient` used as a context manager on purpose: one that
+    is not runs each request on a loop of its own that closes afterwards, and
+    the turn -- a background task -- dies with it before it sends anything.
+    (The first draft of this test did exactly that, and passed against the
+    unfixed code.)"""
+    import http.server
+    import threading
+
+    seen: list[str] = []
+
+    class Capture(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            seen.append(self.headers.get("authorization") or "")
+            self.send_response(500)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Capture)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-the-operators-own-key")
+    created = console.post("/api/accounts", json={"key": "mallory", "password": SECOND_PASSWORD})
+    assert created.status_code == 200, created.text
+    try:
+        with TestClient(console.app) as mallory:
+            signed = mallory.post(
+                "/api/auth/login", json={"key": "mallory", "password": SECOND_PASSWORD}
+            )
+            assert signed.status_code == 200
+            provider = mallory.post(
+                "/api/providers",
+                json={
+                    "name": "mine",
+                    "provider": "openai",
+                    "base_url": f"http://127.0.0.1:{server.server_port}/v1",
+                    "model": "x",
+                },
+            ).json()
+            mallory.post(f"/api/providers/{provider['id']}/activate")
+            thread_id = _thread(mallory, workspace)
+            sent = mallory.post(f"/api/threads/{thread_id}/messages", json={"text": "hi"})
+            assert sent.status_code == 202
+            running = console.app.state.console.running  # type: ignore[attr-defined]
+            deadline = time.time() + 30
+            while running and time.time() < deadline:
+                time.sleep(0.05)
+            assert not running, "the turn did not finish"
+    finally:
+        server.shutdown()
+    assert seen, "the turn never reached the provider"
+    assert all("sk-the-operators-own-key" not in header for header in seen), seen
+
+
+def test_the_environment_key_goes_to_openai_and_nowhere_else(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from minicodex.web.runtime import resolve_api_key
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-env")
+    openai = {"provider": "openai", "base_url": "https://api.openai.com/v1"}
+    assert resolve_api_key(openai) == "sk-env"
+    for elsewhere in (
+        "http://api.openai.com/v1",  # not https
+        "https://api.openai.com.evil.example/v1",
+        "https://openai-proxy.example/v1",
+        "http://127.0.0.1:9/v1",
+    ):
+        assert resolve_api_key({"provider": "openai", "base_url": elsewhere}) is None, elsewhere
+    assert (
+        resolve_api_key({"provider": "openai", "base_url": "http://x/v1", "api_key": "own"})
+        == "own"
+    )
+
+
+def test_a_same_site_page_cannot_post_to_the_console(console: TestClient) -> None:
+    """`SameSite=Lax` ignores the port, so a page on another `localhost` port
+    sends the cookie with its POST -- and a POST with no body needs no CORS
+    preflight.  The first version checked `Origin` only on the socket."""
+    host = "testserver"
+    refused = console.post(
+        "/api/auth/sessions/revoke-all", headers={"origin": "http://localhost:3000", "host": host}
+    )
+    assert refused.status_code == 403
+    assert console.get("/api/auth/sessions").status_code == 200, "nothing was revoked"
+    # Reading is not changed by the check; the console's own page still writes.
+    assert (
+        console.get("/api/auth/sessions", headers={"origin": "http://localhost:3000"}).status_code
+        == 200
+    )
+    ok = console.post(
+        "/api/auth/sessions/revoke-all", headers={"origin": f"http://{host}", "host": host}
+    )
+    assert ok.status_code == 200
+
+
+def test_a_json_body_was_never_the_way_in() -> None:
+    """The negative half, measured rather than assumed: the only bodies a page
+    can send without a preflight are `text/plain` and forms, and FastAPI
+    refuses both for a route that takes a model.  Kept as a test so that a
+    route which starts reading `request.body()` itself does not quietly
+    remove the reason the check above is enough."""
+    import tempfile
+
+    from console_login import sign_in as _sign_in
+
+    tmp = Path(tempfile.mkdtemp())
+    with TestClient(create_app(tmp / "c", home=tmp / "h")) as client:
+        _sign_in(client)
+        body = json.dumps({"name": "x", "command": "true"})
+        for content_type in ("text/plain", "application/x-www-form-urlencoded"):
+            response = client.post("/api/mcp", content=body, headers={"content-type": content_type})
+            assert response.status_code == 422, content_type
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_the_consoles_files_are_not_readable_by_other_users(
+    console: TestClient, tmp_path: Path
+) -> None:
+    """`accounts.json` holds password hashes and `providers.json` API keys;
+    the first version created both with the umask's mode (0644)."""
+    old = os.umask(0o022)
+    try:
+        console.post(
+            "/api/providers",
+            json={"name": "p", "base_url": "https://x.test/v1", "model": "m", "api_key": "sk-x"},
+        )
+        _second_account(console, "carol")
+    finally:
+        os.umask(old)
+    data = tmp_path / "console"
+    for path in (data / "accounts.json", data / "tenants" / CONSOLE_ACCOUNT / "providers.json"):
+        assert path.stat().st_mode & 0o077 == 0, path

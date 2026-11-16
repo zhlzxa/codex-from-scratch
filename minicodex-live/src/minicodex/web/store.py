@@ -96,10 +96,11 @@ def adopt_legacy_records(data_dir: Path, owner_key: str) -> list[str]:
     of its data directory whenever it finds them would hand the *next* account
     whatever the previous one left behind.
 
-    A rename, not a copy, and it stops at the first target that already exists
-    rather than merging -- there is nothing here that knows how to reconcile
-    two `threads.json` files, and pretending otherwise is how one of them is
-    lost quietly.
+    A rename, not a copy, and a target that already exists is skipped rather
+    than merged into -- there is nothing here that knows how to reconcile two
+    `threads.json` files, and pretending otherwise is how one of them is lost
+    quietly.  The others are still moved: this docstring used to say it "stops
+    at the first" existing target, which the loop never did.
     """
     target = data_dir / "tenants" / owner_key
     moved: list[str] = []

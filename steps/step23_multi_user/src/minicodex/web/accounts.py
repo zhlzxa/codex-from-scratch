@@ -56,6 +56,7 @@ from typing import Any
 from minicodex.tenancy import Owner, OwnerError
 
 from .quota import Limits
+from .store import open_private
 
 # scrypt cost. 2**14 is the interactive-login figure from RFC 7914 §2 and
 # costs 128 * N * r = 16 MiB of memory per verification, which is the point --
@@ -282,7 +283,11 @@ class AccountStore:
     def _write(self, records: list[dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
+        # 0600, for the reason this module's docstring gives for scrypt: "an
+        # attacker with a stolen accounts.json pays per guess".  The first
+        # version made the file readable by every user on the machine, which
+        # is most of the way to stolen.  Found when chapter 23 was rewritten.
+        with open_private(tmp) as handle:
             handle.write(json.dumps(records, indent=2))
             handle.flush()
             os.fsync(handle.fileno())

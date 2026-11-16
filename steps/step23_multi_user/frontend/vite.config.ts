@@ -16,7 +16,10 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": { target: "http://127.0.0.1:8000", changeOrigin: true },
+      // No `changeOrigin`: it rewrites `Host` to the target and leaves
+      // `Origin` alone, and the server refuses a state-changing request whose
+      // `Origin` does not match its `Host` (chapter 23, rewritten).
+      "/api": { target: "http://127.0.0.1:8000" },
       "/ws": { target: "ws://127.0.0.1:8000", ws: true },
     },
   },

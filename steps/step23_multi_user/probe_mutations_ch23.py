@@ -219,6 +219,31 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "        return path.resolve().is_relative_to(root.expanduser().resolve())",
         "        return str(path.resolve()).startswith(str(root.expanduser().resolve()))",
     ),
+    # ---- added when chapter 23 was rewritten --------------------------------
+    (
+        "src/minicodex/web/runtime.py",
+        "the operator's OPENAI_API_KEY goes to whatever base_url a provider names",
+        '    if provider.get("provider") == "openai" and _is_openai(provider.get("base_url", "")):',
+        '    if provider.get("provider") == "openai":',
+    ),
+    (
+        "src/minicodex/web/auth.py",
+        "a cross-origin POST is let through as long as it carries the cookie",
+        '        if scope["type"] == "http" and scope.get("method") not in _SAFE_METHODS:',
+        "        if False:",
+    ),
+    (
+        "src/minicodex/web/store.py",
+        "a tenant's records (API keys included) are written readable by everyone",
+        "        with open_private(tmp) as handle:",
+        '        with open(tmp, "w", encoding="utf-8") as handle:',
+    ),
+    (
+        "src/minicodex/web/accounts.py",
+        "accounts.json is written readable by everyone",
+        "        with open_private(tmp) as handle:",
+        '        with open(tmp, "w", encoding="utf-8") as handle:',
+    ),
 ]
 
 ORIGINALS = {name: (ROOT / name).read_text(encoding="utf-8") for name, _, _, _ in MUTATIONS}
