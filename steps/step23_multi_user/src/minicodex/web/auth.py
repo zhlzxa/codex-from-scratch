@@ -25,9 +25,11 @@ output, the shell commands it runs and their results -- open to anybody who
 knows a thread id. That is not a hypothetical: `probe_ws_auth.py` in this step
 runs both middlewares against the same app and prints what each one does.
 
-**The socket also gets an `Origin` check, which the REST routes do not need.**
-A cookie is enough to stop cross-site form posts once it is `SameSite=Lax`,
-but the WebSocket handshake is not a fetch: it is exempt from CORS, so a page
+**The socket gets an `Origin` check, and so does every unsafe method.** The
+first version said the REST routes did not need one because a `SameSite=Lax`
+cookie stops cross-site form posts -- true for cross-*site*, and a page on
+another `localhost` port is same-site (see `AuthMiddleware`).  The WebSocket
+handshake is the sharper case: it is not a fetch: it is exempt from CORS, so a page
 on any origin can open `ws://your-console/ws/threads/...` and the browser will
 attach your cookies. Cross-site WebSocket hijacking is the name; checking that
 `Origin` matches `Host` is the defence, and it has to be here rather than in
@@ -71,6 +73,9 @@ PUBLIC_PATHS = frozenset(
 #: somewhere and a bundle of JavaScript is not a secret. What it can *do*
 #: without a session is nothing: every call it makes lands under `/api`.
 GUARDED_PREFIXES = ("/api", "/ws")
+
+#: Methods that do not change anything, so a cross-origin one needs no check.
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
 @dataclass(frozen=True)
@@ -182,6 +187,20 @@ class AuthMiddleware:
         if scope["type"] == "websocket" and not same_origin(headers):
             await _reject_socket(send, "cross-origin websocket handshake refused")
             return
+        # The same check for a request that changes something.  `SameSite=Lax`
+        # keeps the cookie off a *cross-site* POST, but "site" ignores the
+        # port: a page on `http://localhost:3000` is same-site with this
+        # console on `localhost:8000`, its POST carries the cookie, and a POST
+        # with no body is a "simple" request that needs no CORS preflight.
+        # The first version checked `Origin` only on the socket, so such a page
+        # could disable accounts, sign everybody out or cancel turns.  Found
+        # when chapter 23 was rewritten.  (A JSON body is safe already: FastAPI
+        # answers 422 to `text/plain` or a form, the only bodies a page can
+        # send without a preflight.)
+        if scope["type"] == "http" and scope.get("method") not in _SAFE_METHODS:
+            if not same_origin(headers):
+                await _reject_http(send, status=403, detail="cross-origin request refused")
+                return
 
         auth = resolve(headers, console.accounts, console.sessions, console.home)
         if auth is None:
@@ -198,12 +217,12 @@ class AuthMiddleware:
         await self.app(scope, receive, send)
 
 
-async def _reject_http(send: Any) -> None:
-    body = json.dumps({"detail": "not signed in"}).encode("utf-8")
+async def _reject_http(send: Any, *, status: int = 401, detail: str = "not signed in") -> None:
+    body = json.dumps({"detail": detail}).encode("utf-8")
     await send(
         {
             "type": "http.response.start",
-            "status": 401,
+            "status": status,
             "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode("ascii")),
@@ -245,9 +264,12 @@ def set_session_cookie(response: Any, token: str, *, secure: bool) -> None:
     `HttpOnly` keeps the token away from `document.cookie`, so an injected
     script on this origin cannot read it out and use it elsewhere. `Lax` is
     what makes a cross-site `POST /api/threads/{id}/messages` from an
-    attacker's page arrive without a cookie, which is this console's CSRF
-    defence -- the console has no token-in-a-form scheme and does not need one
-    while every state-changing route is a POST, PATCH or DELETE.
+    attacker's page arrive without a cookie -- half of this console's CSRF
+    defence.  Only half: "site" ignores the port, so a page on another
+    `localhost` port is same-site and its POST does carry the cookie.  The
+    other half is the `Origin` check `AuthMiddleware` makes on every unsafe
+    method (added when chapter 23 was rewritten; the first version of this
+    docstring called `Lax` the whole defence).
 
     `Secure` is conditional, and that is a real trade rather than laziness: set
     unconditionally, the cookie is discarded by the browser on plain

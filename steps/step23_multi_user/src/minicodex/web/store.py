@@ -19,6 +19,7 @@ and a permission that quietly reverts is worse than one that was never set.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import threading
@@ -29,6 +30,16 @@ from typing import Any
 
 from minicodex.model import OLLAMA_BASE_URL, OPENAI_BASE_URL
 from minicodex.policy import APPROVAL_POLICIES, SANDBOX_MODES
+
+
+def open_private(path: Path) -> Any:
+    """Open `path` for writing, created 0600 -- and 0600 again if it already
+    existed with a wider mode (a temporary file a crash left behind)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    return os.fdopen(fd, "w", encoding="utf-8")
+
 
 #: What the console offers on a fresh install, one entry per provider the CLI
 #: knows about.
@@ -102,10 +113,11 @@ def adopt_legacy_records(data_dir: Path, owner_key: str) -> list[str]:
     of its data directory whenever it finds them would hand the *next* account
     whatever the previous one left behind.
 
-    A rename, not a copy, and it stops at the first target that already exists
-    rather than merging -- there is nothing here that knows how to reconcile
-    two `threads.json` files, and pretending otherwise is how one of them is
-    lost quietly.
+    A rename, not a copy, and a target that already exists is skipped rather
+    than merged into -- there is nothing here that knows how to reconcile two
+    `threads.json` files, and pretending otherwise is how one of them is lost
+    quietly.  The others are still moved: the first version of this docstring
+    said it "stops at the first" existing target, which the loop never did.
     """
     target = data_dir / "tenants" / owner_key
     moved: list[str] = []
@@ -192,7 +204,11 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         payload = json.dumps(data, indent=2, ensure_ascii=False)
-        with open(tmp, "w", encoding="utf-8") as handle:
+        # 0600 from the moment it exists: `providers.json` holds API keys, and
+        # every account's records sit side by side under `tenants/`.  The
+        # first version created these with the umask's mode -- 0644, readable
+        # by every user on the machine.  Found when chapter 23 was rewritten.
+        with open_private(tmp) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())

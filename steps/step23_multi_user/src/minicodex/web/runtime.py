@@ -39,6 +39,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from minicodex import system_prompt
 from minicodex.agent import RunResult, Wiring
@@ -607,6 +608,23 @@ def resolve_api_key(provider: dict[str, Any]) -> str | None:
     """
     if provider.get("api_key"):
         return str(provider["api_key"])
-    if provider.get("provider") == "openai":
+    # The environment's key goes to OpenAI and nowhere else.  The first
+    # version handed it to whatever `base_url` the provider record named, and
+    # after chapter 23 a provider record is something *any account* writes:
+    # measured when the chapter was rewritten, a non-admin account pointed a
+    # provider at its own server and received the operator's
+    # `OPENAI_API_KEY` in the first request.  The same rule spares a
+    # single-user console from sending its OpenAI key to a third-party
+    # "OpenAI-compatible" endpoint because the key field was left blank.
+    if provider.get("provider") == "openai" and _is_openai(provider.get("base_url", "")):
         return os.environ.get("OPENAI_API_KEY")
     return None
+
+
+#: Where `OPENAI_API_KEY` may be sent.  https only, and the host exactly.
+OPENAI_HOSTS = frozenset({"api.openai.com"})
+
+
+def _is_openai(base_url: str) -> bool:
+    parts = urlsplit(base_url)
+    return parts.scheme == "https" and (parts.hostname or "") in OPENAI_HOSTS
